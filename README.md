@@ -64,6 +64,16 @@ Install it on a USB-debugging Android device with:
   'build/android/proj/build/ColorMusic/outputs/apk/debug/ColorMusic-debug.apk'
 ```
 
+### Direct APK installation
+
+ADB is optional. You can also install the release package directly:
+
+1. Download `ColorMusic-1.2-arm64-v8a.apk` from the [v1.2 release](https://github.com/ColFumice/ColorMusic/releases/tag/v1.2) on the Android device, or transfer the APK to the device over USB, cloud storage, or a messaging app.
+2. Open the APK in the device's file manager and confirm **Install**.
+3. If Android blocks the installation, enable **Allow from this source** for the file manager or browser when prompted, then retry.
+
+The package is signed as a debug APK for this release build. Android may ask you to uninstall a package signed with a different key before installing it.
+
 ## Project layout
 
 ```text
