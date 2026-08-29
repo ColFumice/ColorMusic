@@ -1,0 +1,37 @@
+
+#///////////////////////////
+# Cocos Creator Project
+#///////////////////////////
+
+/library/
+/temp/
+/local/
+/build/
+/profiles/
+/native/engine/android/**/*/assets
+
+# Local build products, diagnostics, and editor caches
+/.tooling/*
+!/.tooling/build-android.json
+/*.bin
+/*.log
+/logcat*.txt
+/native/engine/android/.gradle/
+/native/engine/android/.cxx/
+/native/engine/android/**/build/
+/native/engine/android/**/externalNativeBuild/
+
+#//////////////////////////
+# NPM
+#//////////////////////////
+node_modules/
+
+#//////////////////////////
+# VSCode
+#//////////////////////////
+.vscode/
+
+#//////////////////////////
+# WebStorm
+#//////////////////////////
+.idea/

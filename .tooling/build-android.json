@@ -1,0 +1,26 @@
+{
+  "platform": "android",
+  "debug": true,
+  "packages": {
+    "android": {
+      "packageName": "com.colormusic.game",
+      "sdkPath": "D:\\Android_SDK",
+      "ndkPath": "D:\\Android_SDK\\ndk\\23.2.8568313",
+      "javaHome": "D:\\JDK17\\jdk",
+      "apiLevel": 36,
+      "appABIs": [
+        "arm64-v8a"
+      ],
+      "orientation": {
+        "landscapeRight": true,
+        "landscapeLeft": true,
+        "portrait": false,
+        "upsideDown": false
+      },
+      "useDebugKeystore": true
+    }
+  },
+  "outputName": "android",
+  "buildMode": "normal",
+  "useSplashScreen": false
+}
