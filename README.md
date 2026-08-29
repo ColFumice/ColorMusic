@@ -96,7 +96,7 @@ native/engine/android/app/src/...   Android activity, bridge, and AudioTrack syn
 
 ## Versioning
 
-This repository represents release **1.2**. Earlier releases **1.0** and **1.1** are intentionally left for separate upload.
+The repository currently publishes releases **1.0**, **1.1**, and **1.2**. Releases 1.0 and 1.1 are preserved as the APK archives supplied for those versions; active source documentation follows the current 1.2 tree.
 
 ## License
 
