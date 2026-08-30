@@ -10,11 +10,15 @@ import android.util.Log;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.io.BufferedOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.RandomAccessFile;
 
 /**
  * AudioSynth —— 实时音频合成器（方案 A：AudioTrack 流式输出，无需第三方库）。
  *
- * 采样率 44100Hz、单声道、16bit PCM，独立渲染线程按 512 采样/块混合所有活跃音符。
+ * 使用设备原生输出采样率、双声道 16bit PCM，独立高优先级线程按小块低延迟输出。
  *
  * 音色模型（ARGB 四通道 → 音色）：
  *   R 通道 → 弦乐声部（锯齿波 + 低通 + 慢起音 + 颤音），增益 = r/255；
@@ -25,45 +29,85 @@ import java.util.List;
  * 自适应归一化：sum = r+g+b > 1 时整体 ×1/sum，保证不同颜色响度平衡。
  *
  * 持续音：noteOn 创建/原位更新一个持续音符（滑音保持相位连续），noteOff 释放。
- * 最大复音数默认 8（持续音符不受淘汰），超出时替换最旧的非持续音符。
+ * 最大复音数默认 8，超出时让最旧音符快速平滑退场。
  */
 public class AudioSynth {
 
     private static final String TAG = "ColorMusicSynth";
-    private static final int SAMPLE_RATE = 44100;
-    private static final int CHUNK = 512;
+    private static final int SAMPLE_RATE = resolveOutputSampleRate();
+    private static final int CHANNEL_MASK = AudioFormat.CHANNEL_OUT_STEREO;
+    private static final int BYTES_PER_FRAME = 4;
+    /** 128 帧在 48kHz 下约 2.7ms，缩短触摸到下一次送入 AudioTrack 的等待。 */
+    private static final int CHUNK = 128;
     private static final int MAX_VOICES_DEFAULT = 8;
+    /** 再短的点击也至少合成这一段，避免 noteOn/noteOff 落在同一音频块时完全无声。 */
+    private static final int MIN_TAP_SAMPLES = Math.max(1, SAMPLE_RATE * 12 / 1000);
     /** 末端使用约 8ms 的平滑窗，保证最后一个 PCM 采样精确回到零。 */
     private static final int DECLICK_SAMPLES = Math.max(2, SAMPLE_RATE * 8 / 1000);
     /** 波表长度（单周期采样点数）。 */
     public static final int WAVE_N = 256;
-    /** 三个通道的波表（0=R弦乐、1=G笛、2=B钢琴/铃），默认正弦波。 */
-    private static float[][] wavetables = new float[3][WAVE_N];
+
+    private static int resolveOutputSampleRate() {
+        try {
+            int nativeRate = AudioTrack.getNativeOutputSampleRate(AudioManager.STREAM_MUSIC);
+            if (nativeRate >= 8000 && nativeRate <= 192000) return nativeRate;
+        } catch (Exception ignored) { }
+        return 48000;
+    }
+    /** 单个通道的波形与周期倍率必须一起替换，音频线程才能始终读到一致状态。 */
+    private static final class WavetableState {
+        final float[] samples;
+        final float cycles;
+        WavetableState(float[] samples, float cycles) {
+            this.samples = samples;
+            this.cycles = cycles;
+        }
+    }
+    /** 三个通道的波表状态（0=R弦乐、1=G笛、2=B钢琴/铃）。 */
+    private static volatile WavetableState[] wavetableStates = new WavetableState[3];
 
     static {
         for (int ch = 0; ch < 3; ch++) {
+            float[] samples = new float[WAVE_N];
             for (int i = 0; i < WAVE_N; i++) {
-                wavetables[ch][i] = (float) Math.sin(2.0 * Math.PI * i / WAVE_N);
+                samples[i] = (float) Math.sin(2.0 * Math.PI * i / WAVE_N);
             }
+            wavetableStates[ch] = new WavetableState(samples, 1f);
         }
     }
 
-    /** 设置通道波表（0=R、1=G、2=B），长度须为 WAVE_N。 */
-    public static void setWavetable(int channel, float[] wave) {
-        if (channel < 0 || channel > 2 || wave == null) return;
+    /** 设置通道单周期波表及其周期倍率；整行一次替换，避免音频线程读到半更新波形。 */
+    public static void setWavetable(int channel, float[] wave, float cycles) {
+        if (channel < 0 || channel > 2 || wave == null || wave.length == 0) return;
         int n = Math.min(wave.length, WAVE_N);
-        for (int i = 0; i < n; i++) wavetables[channel][i] = wave[i];
-        for (int i = n; i < WAVE_N; i++) wavetables[channel][i] = wavetables[channel][i - n];
-        Log.i(TAG, "setWavetable ch=" + channel + " n=" + n);
+        float[] row = new float[WAVE_N];
+        for (int i = 0; i < WAVE_N; i++) row[i] = wave[i % n];
+        float safeCycles = Float.isNaN(cycles) ? 1f : Math.max(1f, Math.min(8f, cycles));
+        WavetableState[] next = wavetableStates.clone();
+        next[channel] = new WavetableState(row, safeCycles);
+        wavetableStates = next;
+        Log.i(TAG, "setWavetable ch=" + channel + " n=" + n + " cycles=" + safeCycles);
     }
 
     /** 波表读取：相位 0~1 → 波形采样（线性插值）。 */
     private static float wt(int ch, double ph) {
-        double f = (ph - Math.floor(ph)) * WAVE_N;
+        WavetableState state = wavetableStates[ch];
+        double scaledPhase = ph * state.cycles;
+        return sampleWavetable(state.samples, scaledPhase);
+    }
+
+    /** 混色时忽略各通道周期倍率，让 RGB 波形在同一基频上融合为一个音色。 */
+    private static float wtPitchLocked(int ch, double ph) {
+        return sampleWavetable(wavetableStates[ch].samples, ph);
+    }
+
+    private static float sampleWavetable(float[] samples, double ph) {
+        double scaledPhase = ph;
+        double f = (scaledPhase - Math.floor(scaledPhase)) * WAVE_N;
         int i0 = (int) f;
         int i1 = (i0 + 1) % WAVE_N;
-        float a = wavetables[ch][i0];
-        float b = wavetables[ch][i1];
+        float a = samples[i0];
+        float b = samples[i1];
         return a + (float) (f - i0) * (b - a);
     }
 
@@ -235,6 +279,10 @@ public class AudioSynth {
     private final Voice.FxChain outputChain = new Voice.FxChain();
     private int appliedOutputFxVersion = 0;
     private long outputSampleClock = 0;
+    private final Object recordingLock = new Object();
+    private BufferedOutputStream recordingStream;
+    private File recordingFile;
+    private long recordingBytes;
     /** 多指持续音：touchId → 持续音符（支持合奏） */
     private final java.util.Map<Integer, Voice> sustainedVoices = new java.util.HashMap<>();
 
@@ -264,6 +312,7 @@ public class AudioSynth {
 
     /** 停止渲染线程并释放 AudioTrack。 */
     public synchronized void stop() {
+        stopRecording();
         running = false;
         Thread t = renderThread;
         renderThread = null;
@@ -338,6 +387,83 @@ public class AudioSynth {
         return running;
     }
 
+    /** 将最终输出 PCM 录制为标准 WAV，返回文件路径；写入发生在音频线程，保持与实际听感一致。 */
+    public String startRecording(File directory, String fileName) {
+        if (directory == null) return "";
+        synchronized (recordingLock) {
+            stopRecordingLocked();
+            try {
+                if (!directory.exists() && !directory.mkdirs()) return "";
+                recordingFile = new File(directory, fileName);
+                recordingStream = new BufferedOutputStream(new FileOutputStream(recordingFile), 32768);
+                writeWavHeader(recordingStream, 0);
+                recordingBytes = 0;
+                Log.i(TAG, "recording started: " + recordingFile.getAbsolutePath());
+                return recordingFile.getAbsolutePath();
+            } catch (Exception e) {
+                Log.e(TAG, "startRecording failed", e);
+                stopRecordingLocked();
+                return "";
+            }
+        }
+    }
+
+    /** 停止录音并回填 WAV 长度字段，返回已完成文件路径。 */
+    public String stopRecording() {
+        synchronized (recordingLock) {
+            return stopRecordingLocked();
+        }
+    }
+
+    private String stopRecordingLocked() {
+        if (recordingStream == null) return recordingFile == null ? "" : recordingFile.getAbsolutePath();
+        final File done = recordingFile;
+        try {
+            recordingStream.flush();
+            recordingStream.close();
+            if (done != null) patchWavHeader(done, recordingBytes);
+        } catch (Exception e) {
+            Log.e(TAG, "stopRecording failed", e);
+        } finally {
+            recordingStream = null;
+            recordingFile = null;
+            recordingBytes = 0;
+        }
+        Log.i(TAG, "recording stopped: " + (done == null ? "" : done.getAbsolutePath()));
+        return done == null ? "" : done.getAbsolutePath();
+    }
+
+    private static void writeWavHeader(java.io.OutputStream out, long dataBytes) throws java.io.IOException {
+        byte[] h = new byte[44];
+        h[0] = 'R'; h[1] = 'I'; h[2] = 'F'; h[3] = 'F';
+        putLe32(h, 4, 36 + dataBytes);
+        h[8] = 'W'; h[9] = 'A'; h[10] = 'V'; h[11] = 'E';
+        h[12] = 'f'; h[13] = 'm'; h[14] = 't'; h[15] = ' ';
+        putLe32(h, 16, 16); putLe16(h, 20, (short) 1); putLe16(h, 22, (short) 2);
+        putLe32(h, 24, SAMPLE_RATE); putLe32(h, 28, SAMPLE_RATE * BYTES_PER_FRAME);
+        putLe16(h, 32, (short) BYTES_PER_FRAME); putLe16(h, 34, (short) 16);
+        h[36] = 'd'; h[37] = 'a'; h[38] = 't'; h[39] = 'a'; putLe32(h, 40, dataBytes);
+        out.write(h);
+    }
+
+    private static void patchWavHeader(File file, long dataBytes) throws java.io.IOException {
+        RandomAccessFile raf = new RandomAccessFile(file, "rw");
+        raf.seek(4); raf.write(intLe(36 + dataBytes));
+        raf.seek(40); raf.write(intLe(dataBytes));
+        raf.close();
+    }
+
+    private static byte[] intLe(long value) {
+        byte[] b = new byte[4]; putLe32(b, 0, value); return b;
+    }
+    private static void putLe16(byte[] b, int off, short value) {
+        b[off] = (byte) (value & 255); b[off + 1] = (byte) ((value >> 8) & 255);
+    }
+    private static void putLe32(byte[] b, int off, long value) {
+        b[off] = (byte) (value & 255); b[off + 1] = (byte) ((value >> 8) & 255);
+        b[off + 2] = (byte) ((value >> 16) & 255); b[off + 3] = (byte) ((value >> 24) & 255);
+    }
+
     private int activeVoiceCount() {
         int count = 0;
         for (Voice v : voices) if (!v.isDeClicking()) count++;
@@ -373,6 +499,7 @@ public class AudioSynth {
     private void renderLoop() {
         android.os.Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
         short[] buf = new short[CHUNK];
+        short[] stereoBuf = new short[CHUNK * 2];
         while (running) {
             synchronized (voiceLock) {
                 java.util.Arrays.fill(buf, (short) 0);
@@ -387,10 +514,36 @@ public class AudioSynth {
                 float dry = buf[i] / 32767f;
                 float wet = outputChain.process(dry, 440.0 / SAMPLE_RATE, outputSampleClock / (float) SAMPLE_RATE);
                 buf[i] = (short) ((float) Math.tanh(wet) * 0.95f * 32767f);
+                stereoBuf[i * 2] = buf[i];
+                stereoBuf[i * 2 + 1] = buf[i];
                 outputSampleClock++;
             }
+            writeRecordingChunk(stereoBuf);
             if (track != null) {
-                track.write(buf, 0, CHUNK);
+                if (Build.VERSION.SDK_INT >= 23) {
+                    track.write(stereoBuf, 0, stereoBuf.length, AudioTrack.WRITE_BLOCKING);
+                } else {
+                    track.write(stereoBuf, 0, stereoBuf.length);
+                }
+            }
+        }
+    }
+
+    private void writeRecordingChunk(short[] stereoBuf) {
+        synchronized (recordingLock) {
+            if (recordingStream == null) return;
+            try {
+                byte[] bytes = new byte[stereoBuf.length * 2];
+                for (int i = 0; i < stereoBuf.length; i++) {
+                    short sample = stereoBuf[i];
+                    bytes[i * 2] = (byte) (sample & 255);
+                    bytes[i * 2 + 1] = (byte) ((sample >> 8) & 255);
+                }
+                recordingStream.write(bytes);
+                recordingBytes += bytes.length;
+            } catch (Exception e) {
+                Log.e(TAG, "recording write failed", e);
+                stopRecordingLocked();
             }
         }
     }
@@ -414,30 +567,55 @@ public class AudioSynth {
 
     private static AudioTrack createTrack() {
         int minBuf = AudioTrack.getMinBufferSize(SAMPLE_RATE,
-                AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
-        int bufSize = Math.max(minBuf, SAMPLE_RATE / 10);
+                CHANNEL_MASK, AudioFormat.ENCODING_PCM_16BIT);
+        if (minBuf <= 0) minBuf = CHUNK * BYTES_PER_FRAME * 4;
+        // getMinBufferSize 已返回字节数；旧实现又乘 2 且强制约 100ms，导致音频长期排队。
+        int lowLatencyBytes = CHUNK * BYTES_PER_FRAME * 4;
+        int bufferBytes = Build.VERSION.SDK_INT >= 26 ? lowLatencyBytes : Math.max(minBuf, lowLatencyBytes);
         if (Build.VERSION.SDK_INT >= 23) {
-            AudioAttributes attrs = new AudioAttributes.Builder()
+            AudioAttributes.Builder attrsBuilder = new AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_GAME)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .build();
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION);
+            if (Build.VERSION.SDK_INT >= 26) {
+                attrsBuilder.setFlags(AudioAttributes.FLAG_LOW_LATENCY);
+            }
+            AudioAttributes attrs = attrsBuilder.build();
             AudioFormat fmt = new AudioFormat.Builder()
                     .setSampleRate(SAMPLE_RATE)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .setChannelMask(CHANNEL_MASK)
                     .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                     .build();
-            return new AudioTrack.Builder()
+            AudioTrack.Builder builder = new AudioTrack.Builder()
                     .setAudioAttributes(attrs)
                     .setAudioFormat(fmt)
-                    .setBufferSizeInBytes(bufSize * 2)
-                    .setTransferMode(AudioTrack.MODE_STREAM)
-                    .build();
+                    .setBufferSizeInBytes(bufferBytes)
+                    .setTransferMode(AudioTrack.MODE_STREAM);
+            if (Build.VERSION.SDK_INT >= 26) {
+                builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY);
+            }
+            AudioTrack result = builder.build();
+            int performanceMode = Build.VERSION.SDK_INT >= 26 ? result.getPerformanceMode() : -1;
+            // FastMixer 可用时排队约 10ms；被厂商策略拒绝时使用系统最小稳定缓冲，避免欠载断音。
+            int targetFrames = performanceMode == AudioTrack.PERFORMANCE_MODE_LOW_LATENCY
+                    ? CHUNK * 4
+                    : Math.max(CHUNK * 4, minBuf / BYTES_PER_FRAME);
+            result.setBufferSizeInFrames(targetFrames);
+            if (Build.VERSION.SDK_INT >= 31) {
+                result.setStartThresholdInFrames(Math.min(CHUNK, result.getBufferCapacityInFrames()));
+            }
+            Log.i(TAG, "AudioTrack rate=" + SAMPLE_RATE
+                    + " chunk=" + CHUNK
+                    + " minBytes=" + minBuf
+                    + " capacityFrames=" + result.getBufferCapacityInFrames()
+                    + " bufferFrames=" + result.getBufferSizeInFrames()
+                    + " performanceMode=" + performanceMode);
+            return result;
         } else {
             @SuppressWarnings("deprecation")
             AudioTrack t = new AudioTrack(
                     AudioManager.STREAM_MUSIC, SAMPLE_RATE,
-                    AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT,
-                    bufSize * 2, AudioTrack.MODE_STREAM);
+                    CHANNEL_MASK, AudioFormat.ENCODING_PCM_16BIT,
+                    bufferBytes, AudioTrack.MODE_STREAM);
             return t;
         }
     }
@@ -461,6 +639,7 @@ public class AudioSynth {
         private int remaining;
         private boolean sustained;
         private boolean releasing = false;
+        private boolean releasePending = false;
         private boolean deClicking = false;
         private float releaseStartLevel = 1f;
         private float adsrReleaseStartLevel = 1f;
@@ -499,6 +678,12 @@ public class AudioSynth {
 
         // 声部增益
         private float gStr, gFlu, gBell;
+        private float targetGStr, targetGFlu, targetGBell;
+        private float mixLockBlend, targetMixLockBlend;
+        private float targetSumNorm = 1f;
+        private boolean voiceMixInitialized = false;
+        /** 约 10ms 的参数交叉渐变，避免试听按钮松开时波形/增益瞬变。 */
+        private static final float VOICE_MIX_SMOOTH = (float) (1.0 - Math.exp(-1.0 / (0.010 * SAMPLE_RATE)));
         // 释放起点（释放包络从 1 平滑淡出，避免瞬间切零的爆破声）
         private int releaseStartElapsed = -1;
 
@@ -577,11 +762,25 @@ public class AudioSynth {
             float even = pielouEvenness(r & 0xff, g & 0xff, b & 0xff);
 
             // 声部增益（颜色通道 → 声部混合比例）
-            gStr = r01;
-            gFlu = g01;
-            gBell = b01;
+            targetGStr = r01;
+            targetGFlu = g01;
+            targetGBell = b01;
+            float strongest = Math.max(targetGStr, Math.max(targetGFlu, targetGBell));
+            float mixThreshold = Math.max(0.02f, strongest * 0.08f);
+            int audibleChannels = (targetGStr >= mixThreshold ? 1 : 0)
+                    + (targetGFlu >= mixThreshold ? 1 : 0)
+                    + (targetGBell >= mixThreshold ? 1 : 0);
+            targetMixLockBlend = audibleChannels >= 2 ? 1f : 0f;
             // 自适应归一化：避免颜色特别亮时爆音
-            sumNorm = 1f / Math.max(1f, r01 + g01 + b01);
+            targetSumNorm = 1f / Math.max(1f, r01 + g01 + b01);
+            if (!voiceMixInitialized) {
+                gStr = targetGStr;
+                gFlu = targetGFlu;
+                gBell = targetGBell;
+                sumNorm = targetSumNorm;
+                mixLockBlend = targetMixLockBlend;
+                voiceMixInitialized = true;
+            }
 
             // 全局质感：平均值大（亮色）→ 清脆（高截止、少失真）；平均值小（暗色）→ 浊厚（低截止、多失真）
             float cutoff = 1000f + avg * 17000f;
@@ -611,8 +810,10 @@ public class AudioSynth {
             decayScale = 0.6f + 1.2f * (1f - avg) + 0.5f * (1f - even) + 0.3f * b01;
             delayMix = 0f; // 基础回声并入"混响/延迟"效果器槽位（由用户配置）
 
-            // 音头力度（新 alpha=均匀度）：均匀（灰）→ 快起音
-            attack = 0.2f + (0.005f - 0.2f) * even;
+            // 直接触摸使用 4~18ms 快速起音；测试短音仍保留原来的表现范围。
+            attack = sustained
+                    ? 0.018f + (0.004f - 0.018f) * even
+                    : 0.2f + (0.005f - 0.2f) * even;
             release = (0.15f + (1f - even) * 0.25f) * decayScale;
             vibratoRate = 5f + even * 2f;
 
@@ -805,7 +1006,7 @@ public class AudioSynth {
                 // 释放段
                 float rt = (elapsed - base) / (adsrRelDur * SAMPLE_RATE);
                 if (rt >= 1f) return 0f;
-                return adsrReleaseStartLevel * (1f - rt) * (1f - rt);
+                return adsrReleaseStartLevel * cosineRelease(rt);
             }
             if (t < adsrAtkDur) return t / adsrAtkDur;
             if (t < adsrAtkDur + adsrDecDur) {
@@ -824,10 +1025,19 @@ public class AudioSynth {
         }
 
         void release() {
-            if (releasing) return;
+            if (releasing || releasePending) return;
+            if (elapsed < MIN_TAP_SAMPLES) {
+                releasePending = true;
+                return;
+            }
+            beginRelease();
+        }
+
+        private void beginRelease() {
             float t = (float) elapsed / SAMPLE_RATE;
             releaseStartLevel = overallEnv(t);
             adsrReleaseStartLevel = adsrEnv(t);
+            releasePending = false;
             releasing = true;
             releaseStartElapsed = elapsed; // 记录释放起点（包络从此平滑淡出）
             int relSamples = (int) (release * SAMPLE_RATE) + 1;
@@ -847,17 +1057,19 @@ public class AudioSynth {
 
         /** 向 buf 中混合本音符的采样。 */
         void render(short[] buf, int count) {
+            if (releasePending && elapsed >= MIN_TAP_SAMPLES) beginRelease();
             int n = Math.min(count, remaining);
             for (int i = 0; i < n; i++) {
                 float t = (float) elapsed / SAMPLE_RATE;
+                smoothVoiceMix();
 
                 // 三个声部（各带自己的包络特征；先经各自通道的全局效果器塑形，再按通道增益混合）
                 float string = stringPart(t);
                 float flute = flutePart(t);
                 float bell = bellPart(t);
-                if (gStr > 0.0005f) string = globalFx[0].process(string, step, t);
-                if (gFlu > 0.0005f) flute = globalFx[1].process(flute, step, t);
-                if (gBell > 0.0005f) bell = globalFx[2].process(bell, step, t);
+                if (Math.max(gStr, targetGStr) > 0.0005f) string = globalFx[0].process(string, step, t);
+                if (Math.max(gFlu, targetGFlu) > 0.0005f) flute = globalFx[1].process(flute, step, t);
+                if (Math.max(gBell, targetGBell) > 0.0005f) bell = globalFx[2].process(bell, step, t);
                 float base = (string * gStr + flute * gFlu + bell * gBell) * sumNorm * pitchGain;
 
                 // 鼓组：snare/kick 与基础音色按权重叠加（互斥，取大者；黑/白鼓元素可配置）
@@ -1014,6 +1226,14 @@ public class AudioSynth {
             remaining -= n;
         }
 
+        private void smoothVoiceMix() {
+            gStr += (targetGStr - gStr) * VOICE_MIX_SMOOTH;
+            gFlu += (targetGFlu - gFlu) * VOICE_MIX_SMOOTH;
+            gBell += (targetGBell - gBell) * VOICE_MIX_SMOOTH;
+            sumNorm += (targetSumNorm - sumNorm) * VOICE_MIX_SMOOTH;
+            mixLockBlend += (targetMixLockBlend - mixLockBlend) * VOICE_MIX_SMOOTH;
+        }
+
         /** 军鼓：短促噪声（带通感）+ 180Hz 音头，快速衰减。 */
         private float snareSound(float t) {
             float decay = (float) Math.exp(-t * 26f);
@@ -1070,16 +1290,16 @@ public class AudioSynth {
         private float stringPart(float t) {
             float raw = presenceEnhancedWave(0);
             stringLpState += stringLpCoef * (raw - stringLpState);
-            float atk = Math.min(1f, t / 0.18f); // 慢起音（弓触弦渐入）
+            float atk = Math.min(1f, t / (sustained ? 0.018f : 0.18f));
             return (float) stringLpState * atk;
         }
 
         /** 笛声部：G 通道波表 + 起音呼吸噪声 + 轻微颤音。 */
         private float flutePart(float t) {
             float tone = presenceEnhancedWave(1);
-            // 轻微空气柱颤音（AM，4.5Hz 左右，很浅）
-            float trem = 1f + 0.012f * (float) Math.sin(vibratoPhase * 0.7);
-            float atk = Math.min(1f, t / 0.05f);
+            // 混色必须保持稳定，避免笛声部的振幅颤音让整体产生拍频感。
+            float trem = 1f + (1f - mixLockBlend) * 0.012f * (float) Math.sin(vibratoPhase * 0.7);
+            float atk = Math.min(1f, t / (sustained ? 0.012f : 0.05f));
             return tone * atk * trem;
         }
 
@@ -1097,10 +1317,21 @@ public class AudioSynth {
         }
 
         private float presenceEnhancedWave(int channel) {
-            float fundamental = wt(channel, phase);
+            float fundamental = voiceWave(channel, phase);
             if (lowPresence <= 0.0001f) return fundamental;
-            float harmonics = wt(channel, phase * 2.0) * 0.30f + wt(channel, phase * 3.0) * 0.10f;
+            float harmonics = voiceWave(channel, phase * 2.0) * 0.30f
+                    + voiceWave(channel, phase * 3.0) * 0.10f;
             return (fundamental + harmonics * lowPresence) / (1f + 0.12f * lowPresence);
+        }
+
+        private float voiceWave(int channel, double ph) {
+            if (mixLockBlend <= 0.0001f) return wt(channel, ph);
+            if (mixLockBlend >= 0.9999f) return wtPitchLocked(channel, ph);
+            float solo = wt(channel, ph);
+            float mixed = wtPitchLocked(channel, ph);
+            // 等功率交叉淡化，避免波长倍率切换时在任意相位产生阶跃。
+            float angle = mixLockBlend * (float) Math.PI * 0.5f;
+            return solo * (float) Math.cos(angle) + mixed * (float) Math.sin(angle);
         }
 
         /** 总包络（attack 由 alpha 控制；release 从释放起点平滑淡出，避免爆破声）。 */
@@ -1110,7 +1341,7 @@ public class AudioSynth {
                     float base = releaseStartElapsed >= 0 ? releaseStartElapsed : elapsed;
                     float rt = (elapsed - base) / (release * SAMPLE_RATE);
                     if (rt >= 1f) return 0f;
-                    return releaseStartLevel * (1f - rt) * (1f - rt);
+                    return releaseStartLevel * cosineRelease(rt);
                 }
                 if (t < attack) return t / attack;
                 return 1f;
@@ -1121,6 +1352,12 @@ public class AudioSynth {
             if (t < sustainEnd) return atk;
             float rt = (t - sustainEnd) / release;
             return atk * Math.max(0f, 1f - rt * rt);
+        }
+
+        /** 起点和终点斜率都为零，避免任意波形相位下释放产生宽频瞬态。 */
+        private static float cosineRelease(float progress) {
+            float p = Math.max(0f, Math.min(1f, progress));
+            return 0.5f + 0.5f * (float) Math.cos(Math.PI * p);
         }
 
         private float nextNoise() {

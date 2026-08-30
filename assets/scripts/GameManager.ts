@@ -11,8 +11,8 @@
  */
 import {
     _decorator, Component, Node, Sprite, SpriteFrame, UITransform, Button, Label, Graphics,
-    Color, Vec3, UIOpacity, assetManager, ImageAsset, Texture2D, game, Game, tween, EventTouch,
-    Layers, sys, profiler, input, Input, EventAcceleration, Mask, director,
+    Color, Vec3, UIOpacity, assetManager, ImageAsset, Texture2D, game, Game, tween, Tween, EventTouch,
+    Layers, sys, profiler, input, Input, EventAcceleration, Mask, director, EditBox,
 } from 'cc';
 import { ImageStore } from './ImageStore';
 import { NativeBridge, WebSynth, PickedImageInfo, JS_SYNTH_READY_FLAG } from './NativeBridge';
@@ -52,6 +52,31 @@ const CUSTOM_INST = { id: 'custom', label: '自定义' };
 /** 旋转过渡补间时长（秒），≤2 秒。 */
 const ROT_TWEEN = 1.0;
 
+interface AudioClipMeta {
+    id: string;
+    name: string;
+    path: string;
+    duration: number;
+    enabled: boolean;
+    volume: number;
+    trimStart: number;
+    trimEnd: number;
+}
+
+interface StyleSnapshot {
+    id: string;
+    name: string;
+    kind: 'style' | 'flow';
+    createdAt: number;
+    waves: { baseWave: number[]; amplitude: number; cycles: number; instId: string }[];
+    grid: GridState;
+    fxSlots: FxSlot[];
+    outputFxSlots: FxSlot[];
+    drumBlackId: string;
+    drumWhiteId: string;
+    flowNodes?: Array<{ styleId: string; delaySec: number }>;
+}
+
 @ccclass('GameManager')
 export class GameManager extends Component {
     private canvas!: Node;
@@ -66,6 +91,33 @@ export class GameManager extends Component {
     private waveBtn!: Node;
     private mainMenuBtn!: Node;
     private languageBtn!: Node;
+    private recordBtn!: Node;
+    private mixerBtn!: Node;
+    private playOnceBtn!: Node;
+    private playLoopBtn!: Node;
+    private styleBtn!: Node;
+    private consoleButtons: Node[] = [];
+    private edgeMode: 'idle' | 'record' | 'play' | 'both' = 'idle';
+    private styleTransition = false;
+    private isRecording = false;
+    private recordingPath = '';
+    private recordingStartedAt = 0;
+    private recordedClips: AudioClipMeta[] = [];
+    private audioPanel: Node | null = null;
+    private stylePanel: Node | null = null;
+    private audioPanelOpen = false;
+    private stylePanelOpen = false;
+    private clipRows: Node[] = [];
+    private styles: StyleSnapshot[] = [];
+    private styleRows: Node[] = [];
+    private expandedStyleId = '';
+    private flowEditorPanel: Node | null = null;
+    private flowEditorNodes: Array<{ styleId: string; delaySec: number }> = [];
+    private flowEditorDynamic: Node[] = [];
+    private activeStyleFlow: StyleSnapshot | null = null;
+    private styleFlowToken = 0;
+    private activePlaybackLoop = false;
+    private clipsPlaying = false;
     private mainMenuOpen = false;
     private mainMenuButtonPositions: Array<[number, number]> = [];
     private mainMenuCollapsedPosition: [number, number] = [0, 0];
@@ -112,6 +164,8 @@ export class GameManager extends Component {
     private waveTouchIds = new Map<number, number>(); // areaIndex → touchId
     private waveAxisTouchIds = new Map<string, number>();
     private waveAxisLastNativeMs = new Map<string, number>();
+    /** 同时按住多个通道试听时共用一个音符，仅混合音色，不叠加独立音高。 */
+    private previewChannels = new Set<number>();
     private imageSprite!: Sprite;
     private imageTransform!: UITransform;
     private imageVisualTransform!: UITransform;
@@ -120,9 +174,12 @@ export class GameManager extends Component {
     private placeholderGfx!: Graphics;
     private placeholderLabelNode!: Node;
     private placeholderLabel!: Label;
-    private ripple!: Node;
-    private rippleGfx!: Graphics;
-    private rippleOpacity!: UIOpacity;
+    /** 每根演奏手指拥有独立光点，避免多指位置/颜色/动画互相覆盖。 */
+    private touchRipples = new Map<number, {
+        node: Node;
+        gfx: Graphics;
+        opacity: UIOpacity;
+    }>();
     private infoLabel!: Label;
     private infoText = '';
     private infoColor = new Color(220, 225, 235, 255);
@@ -186,6 +243,8 @@ export class GameManager extends Component {
 
         this.canvas = this.node.parent ?? this.node;
         this.canvasTransform = this.canvas.getComponent(UITransform)!;
+        this.recordedClips = this.loadAudioClips();
+        this.styles = this.loadStyles();
         // 必须在主 UI 构建前创建不透明遮罩，避免异步加载幕布图片时漏出一帧游戏界面。
         this.prepareSplashCover();
         console.warn('[CM] canvas=', this.canvas.name,
@@ -200,6 +259,12 @@ export class GameManager extends Component {
         this.refreshSynthStatus();
         // 启动幕布：全屏放映 Neuro 标志约 1.33s 后淡出进入游戏界面
         this.showSplash();
+        const debugPanel = NativeBridge.consumeDebugPanel();
+        if (debugPanel) this.scheduleOnce(() => {
+            if (debugPanel === 'mixer') this.openAudioPanel();
+            else if (debugPanel === 'style') this.openStylePanel();
+            else if (debugPanel === 'flow') { if (!this.styles.some((s) => s.kind === 'style')) this.saveCurrentStyle(); this.openStylePanel(); this.scheduleOnce(() => this.openStyleFlowEditor(), .15); }
+        }, 1.7);
 
         // 陀螺仪：横竖屏判定（锁横屏的 Activity 下传感器仍能反映物理姿态）
         try { input.setAccelerometerInterval(100); input.setAccelerometerEnabled(true); } catch (e) { /* 忽略 */ }
@@ -220,6 +285,18 @@ export class GameManager extends Component {
     /** 应用进入后台：标记，用于区分"启动时的 SHOW"与"从后台恢复的 SHOW"。 */
     private onAppHide() {
         this.appWasHidden = true;
+        if (this.isRecording) {
+            NativeBridge.stopRecording();
+            this.isRecording = false;
+            this.setEdgeMode(this.activePlaybackLoop ? 'play' : 'idle');
+        }
+        if (this.clipsPlaying) {
+            NativeBridge.stopAudioFiles();
+            this.styleFlowToken++;
+            this.activePlaybackLoop = false;
+            this.clipsPlaying = false;
+        }
+        this.setEdgeMode('idle');
     }
 
     /** 应用恢复（如选图返回）：重启加速度计并重新校零（修复选图返回后旋转失效）。 */
@@ -293,16 +370,6 @@ export class GameManager extends Component {
         img.addChild(ph);
         this.placeholder = ph;
 
-        // 触摸光斑
-        const rp = new Node('Ripple');
-        rp.layer = Layers.Enum.UI_2D;
-        rp.addComponent(UITransform).setContentSize(160, 160);
-        this.rippleGfx = rp.addComponent(Graphics);
-        this.rippleOpacity = rp.addComponent(UIOpacity);
-        this.rippleOpacity.opacity = 0;
-        img.addChild(rp);
-        this.ripple = rp;
-
         // 演奏网格覆盖层：不拦截常规触摸；边缘缩放手势由 ImageDisplay 统一处理。
         const grid = new Node('PlayGrid');
         grid.layer = Layers.Enum.UI_2D;
@@ -333,6 +400,7 @@ export class GameManager extends Component {
         this.buildSettingsMenu();
         this.buildMainMenuButton();
         this.buildLanguageButton();
+        this.buildConsoleButtons();
         for (const button of [this.pickBtn, this.testBtn, this.calibBtn, this.guideBtn, this.waveBtn]) {
             button.getComponent(UIOpacity)!.opacity = 0;
             button.setScale(.001, .001, 1);
@@ -355,6 +423,42 @@ export class GameManager extends Component {
         root.addChild(info);
         this.infoNode = info;
         this.infoNode.active = this.gridState.showToneInfo;
+    }
+
+    /** 右上角五个常驻圆形控制台按钮：录音、混音、单次、循环、样式。 */
+    private buildConsoleButtons() {
+        this.recordBtn = this.makeConsoleButton('RecordButton', '●', () => this.toggleRecording(), new Color(235, 55, 65, 255));
+        this.mixerBtn = this.makeConsoleButton('MixerButton', '', () => this.openAudioPanel(), new Color(255, 255, 255, 255));
+        const speakerIcon = new Node('MixerSpeakerIcon'); speakerIcon.layer = Layers.Enum.UI_2D; speakerIcon.addComponent(UITransform).setContentSize(24, 22); this.mixerBtn.addChild(speakerIcon);
+        const speaker = speakerIcon.addComponent(Graphics); speaker.fillColor = new Color(255, 255, 255, 255); speaker.strokeColor = new Color(255, 255, 255, 255); speaker.lineWidth = 1.6;
+        speaker.rect(-10, -3, 3, 6); speaker.fill(); speaker.moveTo(-7, -3); speaker.lineTo(-3, -6); speaker.lineTo(-3, 6); speaker.lineTo(-7, 3); speaker.close(); speaker.fill();
+        speaker.moveTo(-1, -4); speaker.bezierCurveTo(1.5, -2.5, 1.5, 2.5, -1, 4); speaker.stroke();
+        speaker.moveTo(3, -7); speaker.bezierCurveTo(6.5, -4, 6.5, 4, 3, 7); speaker.stroke();
+        this.playOnceBtn = this.makeConsoleButton('PlayOnceButton', '▶', () => this.toggleClipPlayback(false), new Color(255, 255, 255, 255));
+        this.playLoopBtn = this.makeConsoleButton('PlayLoopButton', '▶▶', () => this.toggleClipPlayback(true), new Color(255, 255, 255, 255));
+        this.styleBtn = this.makeConsoleButton('StyleButton', '', () => this.openStylePanel(), new Color(255, 255, 255, 255));
+        const styleIcon = new Node('StyleButtonLines'); styleIcon.layer = Layers.Enum.UI_2D; styleIcon.addComponent(UITransform).setContentSize(20, 20); this.styleBtn.addChild(styleIcon);
+        const styleGlyph = styleIcon.addComponent(Graphics);
+        styleGlyph.lineWidth = 1.5; styleGlyph.strokeColor = new Color(255, 255, 255, 255);
+        for (const y of [-6, 0, 6]) { styleGlyph.moveTo(-7, y); styleGlyph.lineTo(7, y); styleGlyph.stroke(); }
+        this.consoleButtons = [this.recordBtn, this.mixerBtn, this.playOnceBtn, this.playLoopBtn, this.styleBtn];
+    }
+
+    private makeConsoleButton(name: string, glyph: string, cb: () => void, glyphColor: Color): Node {
+        const node = new Node(name);
+        node.layer = Layers.Enum.UI_2D;
+        node.addComponent(UITransform).setContentSize(34, 34);
+        const button = node.addComponent(Button);
+        button.transition = Button.Transition.SCALE;
+        button.zoomScale = 1.08;
+        const bg = node.addComponent(Graphics);
+        bg.circle(0, 0, 15.5); bg.fillColor = new Color(0, 0, 0, 255); bg.fill();
+        const labelNode = this.makeLabel(name + 'Glyph', glyph, glyph === '▶▶' ? 9 : 16, 18, glyphColor, 30, 30);
+        node.addChild(labelNode);
+        node.addComponent(UIOpacity).opacity = 204;
+        this.uiRoot.addChild(node);
+        node.on(Button.EventType.CLICK, cb, this);
+        return node;
     }
 
     private drawPlaceholderBorder() {
@@ -456,7 +560,7 @@ export class GameManager extends Component {
         g.fillColor = new Color(0, 0, 0, 245); g.fill();
         g.lineWidth = 1.5; g.strokeColor = new Color(255, 255, 255, 255); g.stroke();
         menu.addComponent(UIOpacity).opacity = 204;
-        const labelNode = this.makeLabel('MainMenuGlyph', '三', 14, 17, new Color(255, 255, 255, 255), 28, 28);
+        const labelNode = this.makeLabel('MainMenuGlyph', '∏', 17, 20, new Color(255, 255, 255, 255), 28, 28);
         menu.addChild(labelNode);
         this.uiRoot.addChild(menu);
         menu.on(Button.EventType.CLICK, () => this.toggleMainMenu(), this);
@@ -505,6 +609,9 @@ export class GameManager extends Component {
                 if (NativeBridge.isAndroidNative) NativeBridge.noteOff(id); else this.webSynth?.noteOff(id);
             }
             this.activeTouches.clear();
+            this.clearTouchRipples();
+            if (this.isRecording) { NativeBridge.stopRecording(); this.isRecording = false; }
+            NativeBridge.stopAudioFiles();
             toggleLanguage();
             director.loadScene('Main');
         }, this);
@@ -999,7 +1106,7 @@ export class GameManager extends Component {
             const waveGfx = waveAxis.addComponent(Graphics);
             const area = { ch: d.ch, node: areaNode, gfx: areaGfx, transform: ut, labelNode: lbl, points: [], wave, baseWave, amplitude, cycles, ampAxis, waveAxis, ampGfx, waveGfx };
             this.waveAreas.push(area);
-            this.sendWaveToNative(d.ch, wave);
+            this.sendWaveToNative(d.ch, baseWave, amplitude, cycles);
 
             // 每区单指绘制；START/MOVE/END 三段式
             areaNode.on(Node.EventType.TOUCH_START, (e: EventTouch) => this.onWaveAreaTouch(0, d.ch, e), this);
@@ -1159,7 +1266,7 @@ export class GameManager extends Component {
         const a = this.waveAreas[ch];
         a.baseWave = wave.slice(); a.amplitude = 1; a.cycles = 1; a.wave = wave.slice();
         this.saveWaveState(a);
-        this.sendWaveToNative(ch, a.wave);
+        this.sendWaveToNative(ch, a.baseWave, a.amplitude, a.cycles);
         this.redrawWaveArea(a);
         // 关联全局效果器到预设（按乐器音色设定该通道的全局效果器插件与参数）
         this.applyInstGlobalFx(ch, id);
@@ -1216,7 +1323,7 @@ export class GameManager extends Component {
                 a.amplitude = snap.amplitudes[ch] ?? 1;
                 a.cycles = snap.cycles[ch] ?? 1;
                 this.saveWaveState(a);
-                this.sendWaveToNative(ch, w);
+                this.sendWaveToNative(ch, a.baseWave, a.amplitude, a.cycles);
                 this.redrawWaveArea(a);
                 this.instIds[ch] = snap.instIds[ch] ?? CUSTOM_INST.id;
                 saveStr('cm_inst_' + ch, this.instIds[ch]);
@@ -1239,7 +1346,7 @@ export class GameManager extends Component {
             const w = this.sineWave();
             a.baseWave = w.slice(); a.amplitude = 1; a.cycles = 1; a.wave = w;
             this.saveWaveState(a);
-            this.sendWaveToNative(ch, w);
+            this.sendWaveToNative(ch, a.baseWave, a.amplitude, a.cycles);
             this.redrawWaveArea(a);
             this.markInstCustom(ch);
         }
@@ -1343,8 +1450,13 @@ export class GameManager extends Component {
             }
         }
         this.updateGridEdgeLabels(verticalLines, horizontalLines, w, h);
-        // 约 0.3mm 的屏幕边缘保护线：固定白色、不透明。
-        g.lineWidth = 1.6; g.strokeColor = new Color(255, 255, 255, 255); g.rect(-w / 2 + .8, -h / 2 + .8, w - 1.6, h - 1.6); g.stroke();
+        // 约 0.3mm 的屏幕边缘状态线：录音红、播放绿、同时进行橙色，其余白色。
+        const edge = this.styleTransition ? new Color(70, 130, 255, 255)
+            : this.edgeMode === 'both' ? new Color(255, 150, 45, 255)
+            : this.edgeMode === 'record' ? new Color(245, 55, 65, 255)
+                : this.edgeMode === 'play' ? new Color(60, 220, 110, 255)
+                    : new Color(255, 255, 255, 255);
+        g.lineWidth = 1.6; g.strokeColor = edge; g.rect(-w / 2 + .8, -h / 2 + .8, w - 1.6, h - 1.6); g.stroke();
     }
 
     private edgeLabel(pool: Node[], index: number, name: string): Node {
@@ -1442,7 +1554,7 @@ export class GameManager extends Component {
         this.guideEntries = [
             {
                 title: '快速开始',
-                content: '一.开始演奏\n1. 点击右上角“三”菜单，选择“选择图片”。\n2. 选图后，图片会铺满播放区并自动保持原始比例。\n3. 在图片上按住即可持续发声，松开停止；拖动可连续滑音。\n\n二.坐标含义\n1. 水平方向对应音高：左侧较低，右侧较高。\n2. 竖直方向对应音量：下方较小，上方较大。\n3. 同一个网格格子内，音高与音量保持不变。\n\n三.设备姿态\n1. 横竖屏会随设备姿态自动切换。\n2. 图片按比例旋转，不会被横向或纵向拉伸。',
+                content: '一.开始演奏\n1. 点击右上角“∏”菜单，选择“选择图片”。\n2. 选图后，图片会铺满播放区并自动保持原始比例。\n3. 在图片上按住即可持续发声，松开停止；拖动可连续滑音。\n4. 多指演奏时，每根手指都有独立触点提示并控制独立音符。\n\n二.坐标含义\n1. 水平方向对应音高：左侧较低，右侧较高。\n2. 竖直方向对应音量：下方较小，上方较大。\n3. 同一个网格格子内，音高与音量保持不变。\n\n三.设备姿态\n1. 横竖屏会随设备姿态自动切换。\n2. 图片按比例旋转，不会被横向或纵向拉伸。',
             },
             {
                 title: '网格',
@@ -1458,15 +1570,23 @@ export class GameManager extends Component {
             },
             {
                 title: '波表编辑器',
-                content: '一.打开与布局\n1. 通过“设置→波表”进入，横屏为横向三栏，竖屏为纵向三栏。\n2. 三个绘制框分别对应 R、G、B 声部，绘制框外的坐标轴不会遮挡波形。\n\n二.绘制与试听\n1. 在绘制框内拖动绘制基础波形，松手后自动重建并保存。\n2. 左侧振幅轴控制振幅，波形会实时显示；下方波长轴控制重复次数，缩短波长时波形会重复排列。\n3. 每个 RGB 声部可独立试听，三个声部使用相同基准音高，按住多久就播放多久。\n4. “随机生成”会依次随机波形、效果器槽位以及各效果器参数。\n\n三.音色管理\n1. 可从预设下拉菜单选择乐器音色，也可选择“自定义”。\n2. 每个颜色最多串联四个全局效果器；加号可继续添加槽位。\n3. “撤回”用于恢复最近一次绘制、预设或随机操作。\n\n四.黑鼓与白鼓\n1. 像素的 R、G、B 全部低于 55 时进入黑鼓区域，纯黑触发最强。\n2. 像素的 R、G、B 全部高于 200 时进入白鼓区域，纯白触发最强。\n3. 两个鼓槽可分别选择 kick、snare、clap、hihat、tom、maracas 等 808 鼓元素。',
+                    content: '一.打开与布局\n1. 通过“设置→波表”进入，横屏为横向三栏，竖屏为纵向三栏。\n2. 三个绘制框分别对应 R、G、B 声部，绘制框外的坐标轴不会遮挡波形。\n\n二.绘制与试听\n1. 在绘制框内拖动绘制基础波形，松手后自动重建并保存。\n2. 左侧振幅轴控制振幅，波形会实时显示；下方波长轴控制重复次数，波长越短，实际音高越高。\n3. 每个 RGB 声部可独立试听，提示栏会显示当前波长对应的实际音高，按住多久就播放多久。\n4. “随机生成”会依次随机波形、效果器槽位以及各效果器参数。\n\n三.音色管理\n1. 可从预设下拉菜单选择乐器音色，也可选择“自定义”。\n2. 每个颜色最多串联四个全局效果器；加号可继续添加槽位。\n3. “撤回”用于恢复最近一次绘制、预设或随机操作。\n\n四.黑鼓与白鼓\n1. 像素的 R、G、B 全部低于 55 时进入黑鼓区域，纯黑触发最强。\n2. 像素的 R、G、B 全部高于 200 时进入白鼓区域，纯白触发最强。\n3. 两个鼓槽可分别选择 kick、snare、clap、hihat、tom、maracas 等 808 鼓元素。',
             },
             {
                 title: '效果器',
                 content: '一.RGB 全局效果器\n1. 在波表编辑器中分别塑造红、绿、蓝声部。\n2. 每个声部最多四个串联槽位，效果器按从上到下的顺序处理。\n3. 点击槽内文本进入参数设置，点击加号添加下一个效果器。\n\n二.输出效果器\n1. 通过“设置→输出效果器”处理 RGB 混音后的最终声音。\n2. 输出端最多四个槽位，适合做总音量、空间感、动态和最终染色。\n3. 支持重置、随机和撤回，调整后立即作用于游玩声音。\n\n三.使用建议\n1. 先调整单个 RGB 声部，再用输出效果器做整体统一。\n2. 多个高增益效果器串联可能造成削波，应适当降低参数或输出音量。',
             },
             {
+                title: '录音与混音',
+                content: '一.主界面控制台\n1. 红点开始或结束录音；小喇叭打开混音台；单三角播放一次；双三角循环播放。\n2. 录音时屏幕边框为红色，播放时为绿色，同时录音与播放时为橙色。\n3. 单次播放会在所有已启用片段结束后停止；循环播放以最长片段为一轮。\n\n二.混音台\n1. 最多保存 13 个音频片段，点击名称可重命名，左侧圆点控制启用或静音。\n2. 音量滑块调整片段增益；“始”和“末”可精确输入裁剪时间，中间双向滑块可快速裁剪头尾。\n3. 每栏右侧依次提供试听、克隆、删除和导出。克隆会复制当前片段设置。\n4. 导出时可选择无损 WAV 或便于分享的 MP3，MP3 使用 LAME 转换。',
+            },
+            {
+                title: '样式管理',
+                content: '一.样式\n1. 点击控制台的横线图标进入样式管理；保存内容包括波表、网格和效果器设置，不包含录音片段。\n2. 绿色边框表示样式，蓝色边框表示样式流；点击名称重命名，展开按钮显示预览。\n3. 样式预览按 R、G、B 左中右排列；每栏可导出、载入或删除。导出后可从中央提示直接查看目录。\n\n二.样式流\n1. 新样式流默认有 5 个节点，最多 13 个；每个节点选择一个已有样式并设置切换时间。\n2. 样式流随循环播放运行，切换时屏幕边框会在 1.3 秒内过渡为蓝色再恢复。\n\n三.文件管理\n1. 导入可从设备中选择样式数据包；导出的数据包保存在游戏文件根目录。\n2. “清空样式栏”和“清空数据包”都会连续询问两次，确认后操作不可撤回。',
+            },
+            {
                 title: '菜单与校准',
-                content: '一.右上角菜单\n1. 点击圆形“三”按钮呼出“选择图片、测试音、校准、游玩说明、设置”。\n2. 再次点击菜单按钮，或点击菜单外的播放区域，可收起选项。\n3. 选择图片、波表、网格和输出效果器后会进入对应设置界面。\n\n二.测试音\n1. 按住“测试音”按钮试听基准音，松开立即停止，不使用固定时长。\n2. 测试音仅用于确认合成器输出，不会改变图片演奏参数。\n\n三.设备校准\n1. 当图片方向与设备姿态不一致时点击“校准”。\n2. 保持设备处于希望的横屏或竖屏方向，等待校准完成。\n3. 设备旋转后界面会平滑切换，控件大小保持不变。',
+                content: '一.右上角菜单\n1. 点击圆形“∏”按钮呼出“选择图片、测试音、校准、游玩说明、设置”。\n2. 再次点击菜单按钮，或点击菜单外的播放区域，可收起选项。\n3. 选择图片、波表、网格和输出效果器后会进入对应设置界面。\n\n二.测试音\n1. 按住“测试音”按钮试听基准音，松开立即停止，不使用固定时长。\n2. 测试音仅用于确认合成器输出，不会改变图片演奏参数。\n\n三.设备校准\n1. 当图片方向与设备姿态不一致时点击“校准”。\n2. 保持设备处于希望的横屏或竖屏方向，等待校准完成。\n3. 设备旋转后界面会平滑切换，控件大小保持不变。',
             },
         ];
         if (isEnglish()) {
@@ -1489,11 +1609,19 @@ export class GameManager extends Component {
                 },
                 {
                     title: 'Wavetable Editor',
-                    content: 'I. Layout\n1. Open Settings → Wavetable. RGB panels run left-to-right in landscape and top-to-bottom in portrait.\n2. Each frame edits one RGB voice; amplitude and wavelength axes remain outside the frame.\n\nII. Drawing and Preview\n1. Drag inside a frame to draw its base waveform; release to rebuild and autosave it.\n2. The left axis changes amplitude. The bottom axis changes wavelength and repeats shorter waves.\n3. RGB previews use the same reference pitch and last exactly as long as you hold.\n4. Randomize generates waves, effect choices and effect parameters in sequence.\n\nIII. Timbre and Drums\n1. Choose a preset instrument or Custom. Each color supports up to four serial global effects.\n2. Undo restores the latest drawing, preset or random operation.\n3. All RGB values below 55 enter the black-drum region; pure black is strongest.\n4. All RGB values above 200 enter the white-drum region; pure white is strongest.\n5. Each drum slot can use Kick, Snare, Clap, Hi-hat, Tom or Maracas.',
+                    content: 'I. Layout\n1. Open Settings → Wavetable. RGB panels run left-to-right in landscape and top-to-bottom in portrait.\n2. Each frame edits one RGB voice; amplitude and wavelength axes remain outside the frame.\n\nII. Drawing and Preview\n1. Drag inside a frame to draw its base waveform; release to rebuild and autosave it.\n2. The left axis changes amplitude. The bottom axis changes wavelength; shorter wavelengths produce higher audible pitches.\n3. Each RGB voice can be previewed independently, and the status line shows its current audible pitch. Playback lasts exactly as long as you hold.\n4. Randomize generates waves, effect choices and effect parameters in sequence.\n\nIII. Timbre and Drums\n1. Choose a preset instrument or Custom. Each color supports up to four serial global effects.\n2. Undo restores the latest drawing, preset or random operation.\n3. All RGB values below 55 enter the black-drum region; pure black is strongest.\n4. All RGB values above 200 enter the white-drum region; pure white is strongest.\n5. Each drum slot can use Kick, Snare, Clap, Hi-hat, Tom or Maracas.',
                 },
                 {
                     title: 'Effects',
                     content: 'I. RGB Global Effects\n1. Shape the red, green and blue voices independently in the wavetable editor.\n2. Each voice supports four serial slots processed from top to bottom.\n3. Tap slot text to edit parameters; tap + to reveal the next slot.\n\nII. Output Effects\n1. Settings → Output FX processes the final sound after RGB mixing.\n2. Four serial slots can shape overall space, dynamics and color.\n3. Reset, Randomize and Undo apply immediately to performance audio.\n\nIII. Tips\n1. Shape individual voices first, then use Output FX to unify the mix.\n2. Several high-gain effects in series can clip; reduce effect intensity or output level when needed.',
+                },
+                {
+                    title: 'Recording & Mixer',
+                    content: 'I. Console Controls\n1. The red dot starts or stops recording; the speaker opens the mixer; the single triangle plays once; the double triangle loops.\n2. The screen border is red while recording, green while playing, and orange when both are active.\n3. Play Once stops after all enabled clips finish. Loop Playback uses the longest enabled clip as one cycle.\n\nII. Mixer\n1. Store up to 13 clips. Tap a name to rename it; use the left dot to enable or mute it.\n2. The volume slider changes clip gain. Start and End accept exact trim times, while the dual-handle range provides quick trimming.\n3. Row actions provide preview, clone, delete and export. Choose lossless WAV or shareable MP3 when exporting; MP3 uses LAME conversion.',
+                },
+                {
+                    title: 'Style Manager',
+                    content: 'I. Styles\n1. Open Style Manager with the console lines icon. A style stores wavetable, grid and effect settings, but not recorded clips.\n2. Green borders identify styles and blue borders identify flows. Tap names to rename and expand rows for previews.\n3. RGB previews run left, center and right. Each row can export, load or delete; after export, View Folder opens the package directory.\n\nII. Style Flows\n1. A new flow starts with five nodes and supports up to 13. Each node selects an owned style and a switch delay.\n2. Flows run with loop playback. A style switch flashes the border blue and restores it within 1.3 seconds.\n\nIII. Files\n1. Import selects a style package from the device. Exported packages are stored in the game file root.\n2. Clear Style List and Clear Packages both require two confirmations and cannot be undone.',
                 },
                 {
                     title: 'Menu & Calibration',
@@ -1685,7 +1813,7 @@ export class GameManager extends Component {
         const now = Date.now();
         const lastNative = this.waveAxisLastNativeMs.get(key) ?? 0;
         if (phase === 2 || now - lastNative >= 50) {
-            this.sendWaveToNative(ch, area.wave);
+            this.sendWaveToNative(ch, area.baseWave, area.amplitude, area.cycles);
             this.waveAxisLastNativeMs.set(key, now);
         }
         if (phase === 2) {
@@ -1708,20 +1836,40 @@ export class GameManager extends Component {
     }
 
     private attachChannelPreview(node: Node, ch: number) {
-        const touchId = -9100 - ch;
-        const previewFreq = 329.63;
-        const cols = [[255, 0, 0], [0, 255, 0], [0, 0, 255]];
         node.on(Node.EventType.TOUCH_START, (e: EventTouch) => {
             e.propagationStopped = true;
-            const c = cols[ch];
-            if (NativeBridge.isAndroidNative) NativeBridge.noteOn(touchId, c[0], c[1], c[2], 255, previewFreq, .7);
-            else { this.webSynth = this.webSynth ?? new WebSynth(); this.webSynth.noteOn(touchId, c[0], c[1], c[2], 255, previewFreq, .7); }
-            this.setInfo(isEnglish()
-                ? `Preview ${'RGB'[ch]}: ${previewFreq.toFixed(1)} Hz (release to stop)`
-                : `试听 ${'RGB'[ch]}：${previewFreq.toFixed(1)}Hz（松开停止）`, new Color(220, 225, 235, 255));
+            this.previewChannels.add(ch);
+            this.updateChannelPreview();
         }, this);
-        const stop = (e: EventTouch) => { e.propagationStopped = true; if (NativeBridge.isAndroidNative) NativeBridge.noteOff(touchId); else this.webSynth?.noteOff(touchId); };
+        const stop = (e: EventTouch) => {
+            e.propagationStopped = true;
+            this.previewChannels.delete(ch);
+            this.updateChannelPreview();
+        };
         node.on(Node.EventType.TOUCH_END, stop, this); node.on(Node.EventType.TOUCH_CANCEL, stop, this);
+    }
+
+    private updateChannelPreview() {
+        const touchId = -9100;
+        const previewFreq = 329.63;
+        if (this.previewChannels.size === 0) {
+            if (NativeBridge.isAndroidNative) NativeBridge.noteOff(touchId); else this.webSynth?.noteOff(touchId);
+            return;
+        }
+        const rgb = [0, 0, 0];
+        for (const ch of this.previewChannels) rgb[ch] = 255;
+        if (NativeBridge.isAndroidNative) NativeBridge.noteOn(touchId, rgb[0], rgb[1], rgb[2], 255, previewFreq, .7);
+        else {
+            this.webSynth = this.webSynth ?? new WebSynth();
+            this.webSynth.noteOn(touchId, rgb[0], rgb[1], rgb[2], 255, previewFreq, .7);
+        }
+        const channels = Array.from(this.previewChannels).sort().map((ch) => 'RGB'[ch]).join('+');
+        const audibleFreq = this.previewChannels.size === 1
+            ? previewFreq * (this.waveAreas[Array.from(this.previewChannels)[0]]?.cycles ?? 1)
+            : previewFreq;
+        this.setInfo(isEnglish()
+            ? `Preview ${channels}: ${audibleFreq.toFixed(1)} Hz (release to stop)`
+            : `试听 ${channels}：${audibleFreq.toFixed(1)}Hz（松开停止）`, new Color(220, 225, 235, 255));
     }
 
     /** 绘制区触摸：phase 0=START 1=MOVE 2=END/CANCEL。 */
@@ -1750,7 +1898,7 @@ export class GameManager extends Component {
         this.pushUndo();
         this.rebuildWaveFromPoints(area);
         this.saveWaveState(area);
-        this.sendWaveToNative(ch, area.wave);
+        this.sendWaveToNative(ch, area.baseWave, area.amplitude, area.cycles);
         this.redrawWaveArea(area);
         this.markInstCustom(ch);
     }
@@ -1905,7 +2053,7 @@ export class GameManager extends Component {
             const w = idx === 0 ? this.sineWave() : idx === 1 ? this.randomWave() : this.classicWave();
             a.baseWave = w.slice(); a.amplitude = 1; a.cycles = 1; a.wave = w;
             this.saveWaveState(a);
-            this.sendWaveToNative(a.ch, a.wave);
+            this.sendWaveToNative(a.ch, a.baseWave, a.amplitude, a.cycles);
             this.redrawWaveArea(a);
             this.markInstCustom(a.ch);
         }
@@ -2045,11 +2193,12 @@ export class GameManager extends Component {
         } catch (e) { /* 忽略 */ }
     }
 
-    /** 把某通道波形发给原生合成器（setWavetable）。 */
-    private sendWaveToNative(ch: number, wave: number[]) {
+    /** 把单周期波形与周期倍率分别发给原生合成器，避免非整数周期在表边界产生跳变失真。 */
+    private sendWaveToNative(ch: number, baseWave: number[], amplitude = 1, cycles = 1) {
         try {
             if (NativeBridge.isAndroidNative && NativeBridge.synthReady) {
-                NativeBridge.setWavetable(ch, wave);
+                const wave = baseWave.map((v) => Math.max(-1, Math.min(1, v * amplitude)));
+                NativeBridge.setWavetable(ch, wave, cycles);
             }
         } catch (e) {
             console.error('[CM] setWavetable 异常:', e);
@@ -2060,6 +2209,7 @@ export class GameManager extends Component {
 
     private registerNativeCallbacks() {
         NativeBridge.registerImageCallback((info) => this.onNativeImage(info));
+        NativeBridge.registerUtilityCallbacks();
 
         const self = this;
         const checkTimer = setInterval(() => {
@@ -2083,7 +2233,11 @@ export class GameManager extends Component {
     /** 启动时把本地保存的三通道波表推给原生合成器（即使从未打开过编辑器也生效）。 */
     private pushWavesToNative() {
         for (let ch = 0; ch < 3; ch++) {
-            this.sendWaveToNative(ch, this.loadWave(ch));
+            const storedWave = this.loadWave(ch);
+            const baseWave = this.loadBaseWave(ch, storedWave);
+            const amplitude = this.loadWaveScalar(ch, 'amp', 1);
+            const cycles = this.loadWaveScalar(ch, 'cycles', 1);
+            this.sendWaveToNative(ch, baseWave, amplitude, cycles);
         }
         this.pushFxToNative();
         this.pushOutputFxToNative();
@@ -2102,6 +2256,459 @@ export class GameManager extends Component {
             this.pickWeb();
         }
     }
+
+    private toggleRecording() {
+        if (this.isRecording) {
+            const path = NativeBridge.stopRecording();
+            this.isRecording = false;
+            this.recordingPath = path || this.recordingPath;
+            if (this.recordingPath) {
+                if (this.recordedClips.length >= 13) {
+                    this.setInfo(isEnglish() ? 'Maximum 13 audio clips' : '最多支持 13 个音频片段', new Color(255, 190, 120, 255));
+                    this.setEdgeMode(this.clipsPlaying ? 'play' : 'idle');
+                    this.updateConsoleGlyphs();
+                    return;
+                }
+                const clip: AudioClipMeta = {
+                    id: `clip_${Date.now()}`, name: '新音频', path: this.recordingPath,
+                    duration: Math.max(.1, (Date.now() - this.recordingStartedAt) / 1000), enabled: true, volume: 1, trimStart: 0, trimEnd: 0,
+                };
+                this.recordedClips.unshift(clip);
+                this.saveAudioClips();
+            }
+            this.setEdgeMode(this.activePlaybackLoop ? 'play' : 'idle');
+            this.setInfo(isEnglish() ? 'Recording stopped' : '录音已结束', new Color(220, 225, 235, 255));
+        } else {
+            const fileName = `audio_${Date.now()}.wav`;
+            this.recordingPath = NativeBridge.startRecording(fileName);
+            if (!this.recordingPath) {
+                this.setInfo(isEnglish() ? 'Unable to start recording' : '无法开始录音', new Color(255, 150, 150, 255));
+                return;
+            }
+            this.recordingStartedAt = Date.now();
+            this.isRecording = true;
+            this.setEdgeMode(this.activePlaybackLoop ? 'both' : 'record');
+            this.setInfo(isEnglish() ? 'Recording… tap the red button to stop' : '正在录音…再次点击红点结束', new Color(255, 140, 150, 255));
+        }
+        this.updateConsoleGlyphs();
+    }
+
+    private toggleClipPlayback(loop: boolean) {
+        const clips = this.recordedClips.filter((c) => c.enabled && c.path);
+        if (!clips.length) {
+            this.setInfo(isEnglish() ? 'No enabled recordings' : '没有可播放的已勾选音频', new Color(255, 190, 120, 255));
+            return;
+        }
+        if (this.clipsPlaying) {
+            NativeBridge.stopAudioFiles();
+            this.activePlaybackLoop = false;
+            this.clipsPlaying = false;
+            this.setEdgeMode(this.isRecording ? 'record' : 'idle');
+            this.setInfo(isEnglish() ? 'Playback stopped' : '播放已停止', new Color(220, 225, 235, 255));
+        } else {
+            NativeBridge.playAudioFiles(clips, loop);
+            this.activePlaybackLoop = loop;
+            this.clipsPlaying = true;
+            if (loop) this.startStyleFlow();
+            this.setEdgeMode(this.isRecording ? 'both' : 'play');
+            this.setInfo(loop
+                ? (isEnglish() ? 'Loop playback started' : '循环播放已开始')
+                : (isEnglish() ? 'Playback started' : '单次播放已开始'), new Color(220, 225, 235, 255));
+            if (!loop) this.scheduleOnce(() => {
+                if (!this.clipsPlaying || this.activePlaybackLoop) return;
+                this.clipsPlaying = false;
+                this.activePlaybackLoop = false;
+                this.setEdgeMode(this.isRecording ? 'record' : 'idle');
+                this.updateConsoleGlyphs();
+            }, this.recordedClips.filter((c) => c.enabled)
+                .reduce((m, c) => Math.max(m, Math.max(.1, (c.trimEnd || c.duration) - c.trimStart)), .1) + .08);
+        }
+        this.updateConsoleGlyphs();
+    }
+
+    private setEdgeMode(mode: 'idle' | 'record' | 'play' | 'both') {
+        this.edgeMode = mode;
+        if (this.gridGfx) this.redrawPlayGrid();
+    }
+
+    private updateConsoleGlyphs() {
+        const recordGlyph = this.recordBtn?.getChildByName('RecordButtonGlyph')?.getComponent(Label);
+        if (recordGlyph) recordGlyph.color = this.isRecording ? new Color(255, 90, 100, 255) : new Color(235, 55, 65, 255);
+    }
+
+    private loadAudioClips(): AudioClipMeta[] {
+        try { const raw = sys.localStorage.getItem('cm_audio_clips'); const v = raw ? JSON.parse(raw) : []; return Array.isArray(v) ? v : []; } catch (e) { return []; }
+    }
+    private saveAudioClips() { try { sys.localStorage.setItem('cm_audio_clips', JSON.stringify(this.recordedClips.slice(0, 13))); } catch (e) { /* ignore */ } }
+
+    private openAudioPanel() {
+        if (this.stylePanelOpen) this.closeStylePanel();
+        const created = !this.audioPanel;
+        if (created) this.buildAudioPanel();
+        this.audioPanel!.active = true;
+        this.audioPanelOpen = true;
+        this.audioPanel!.setSiblingIndex(this.uiRoot.children.length - 1);
+        this.layoutAudioPanel(); this.rebuildAudioRows();
+    }
+
+    private buildAudioPanel() {
+        const panel = new Node('AudioMixerPanel'); panel.layer = Layers.Enum.UI_2D;
+        panel.addComponent(UITransform).setContentSize(1400, 860); const initialBg = panel.addComponent(Graphics);
+        initialBg.rect(-700, -430, 1400, 860); initialBg.fillColor = new Color(8, 12, 24, 255); initialBg.fill();
+        const title = this.makeLabel('AudioMixerTitle', isEnglish() ? 'Audio Mixer' : '混音台', 30, 38, new Color(240, 244, 252, 255), 700, 50); panel.addChild(title);
+        const close = this.makePanelButton(panel, isEnglish() ? 'Close' : '关闭', 0, 0, 110, 42, () => this.closeAudioPanel(), new Color(45, 58, 88, 255)); close.name = 'AudioClose';
+        const swallow = (e: EventTouch) => { e.propagationStopped = true; };
+        panel.on(Node.EventType.TOUCH_START, swallow, this); panel.on(Node.EventType.TOUCH_MOVE, swallow, this); panel.on(Node.EventType.TOUCH_END, swallow, this);
+        this.uiRoot.addChild(panel); panel.active = false;
+        initialBg.clear(); initialBg.rect(-700, -430, 1400, 860); initialBg.fillColor = new Color(8, 12, 24, 255); initialBg.fill();
+        this.audioPanel = panel;
+    }
+
+    private layoutAudioPanel() {
+        if (!this.audioPanel) return;
+        const view = this.userViewport(false); const panel = this.audioPanel;
+        panel.getComponent(UITransform)!.setContentSize(view.w, view.h);
+        const g = panel.getComponent(Graphics)!; g.clear(); g.rect(-view.w / 2, -view.h / 2, view.w, view.h); g.fillColor = new Color(8, 12, 24, 255); g.fill();
+        g.lineWidth = 1.5; g.strokeColor = new Color(95, 125, 165, 255); g.rect(-view.w / 2 + 1, -view.h / 2 + 1, view.w - 2, view.h - 2); g.stroke();
+        panel.getChildByName('AudioMixerTitle')?.setPosition(0, view.h / 2 - 34);
+        panel.getChildByName('AudioClose')?.setPosition(view.w / 2 - 68, view.h / 2 - 34);
+        this.redrawPanelButtons(panel);
+    }
+
+    private closeAudioPanel() { if (this.audioPanel) { this.audioPanel.active = false; this.audioPanelOpen = false; } }
+
+    private rebuildAudioRows() {
+        if (!this.audioPanel) return;
+        for (const row of this.clipRows) row.destroy();
+        this.clipRows = [];
+        const panel = this.audioPanel;
+        const view = this.userViewport(false); const rowW = view.w - 40;
+        this.recordedClips.slice(0, 13).forEach((clip, i) => {
+            const row = new Node(`ClipRow${clip.id}`); row.layer = Layers.Enum.UI_2D; row.addComponent(UITransform).setContentSize(rowW, 48); row.setPosition(0, view.h / 2 - 92 - i * 58);
+            const rg = row.addComponent(Graphics); rg.roundRect(-rowW / 2, -23, rowW, 46, 6); rg.fillColor = new Color(22, 30, 48, 255); rg.fill(); rg.lineWidth = 1; rg.strokeColor = new Color(60, 80, 110, 255); rg.stroke();
+            const left = -rowW / 2;
+            const dot = this.makePanelButton(row, clip.enabled ? '●' : '○', left + 25, 0, 38, 34, () => { clip.enabled = !clip.enabled; this.saveAudioClips(); this.rebuildAudioRows(); }, clip.enabled ? new Color(40, 150, 80, 255) : new Color(55, 65, 80, 255));
+            const dotLabel = dot.getChildByName('Text')?.getComponent(Label);
+            if (dotLabel) dotLabel.fontSize = 22;
+            this.makePanelButton(row, clip.name, left + 185, 0, 260, 34, () => this.renameAudioClip(clip), new Color(30, 40, 62, 255));
+            const sliderNode = new Node('Volume'); sliderNode.layer = Layers.Enum.UI_2D;
+            const volumeWidth = 180; const sliderTransform = sliderNode.addComponent(UITransform); sliderTransform.setContentSize(volumeWidth, 36); sliderNode.setPosition(left + 425, 0);
+            const sliderGfx = sliderNode.addComponent(Graphics);
+            const drawVolume = () => {
+                sliderGfx.clear(); sliderGfx.roundRect(-volumeWidth / 2, -4, volumeWidth, 8, 4); sliderGfx.fillColor = new Color(55, 65, 82, 255); sliderGfx.fill();
+                sliderGfx.roundRect(-volumeWidth / 2, -4, volumeWidth * clip.volume, 8, 4); sliderGfx.fillColor = new Color(70, 190, 120, 255); sliderGfx.fill();
+                sliderGfx.circle(-volumeWidth / 2 + volumeWidth * clip.volume, 0, 8); sliderGfx.fillColor = new Color(240, 245, 252, 255); sliderGfx.fill();
+            };
+            const updateVolume = (e: EventTouch) => { const p = e.getUILocation(); const local = sliderTransform.convertToNodeSpaceAR(new Vec3(p.x, p.y, 0)); clip.volume = Math.max(0, Math.min(1, (local.x + volumeWidth / 2) / volumeWidth)); drawVolume(); this.saveAudioClips(); e.propagationStopped = true; };
+            sliderNode.on(Node.EventType.TOUCH_START, updateVolume, this); sliderNode.on(Node.EventType.TOUCH_MOVE, updateVolume, this); drawVolume(); row.addChild(sliderNode);
+            const duration = Math.max(.1, clip.duration || 0); const end = clip.trimEnd > clip.trimStart ? clip.trimEnd : duration;
+            const startButton = this.makePanelButton(row, `始 ${clip.trimStart.toFixed(1)}s`, left + 580, 0, 100, 34, () => this.editClipTrim(clip, true), new Color(42, 62, 88, 255));
+            const endButton = this.makePanelButton(row, `末 ${end.toFixed(1)}s`, left + 945, 0, 100, 34, () => this.editClipTrim(clip, false), new Color(42, 62, 88, 255));
+            const refreshTrimLabels = () => {
+                const currentEnd = clip.trimEnd > clip.trimStart ? clip.trimEnd : duration;
+                const startLabel = startButton.getChildByName('Text')?.getComponent(Label); if (startLabel) startLabel.string = `始 ${clip.trimStart.toFixed(1)}s`;
+                const endLabel = endButton.getChildByName('Text')?.getComponent(Label); if (endLabel) endLabel.string = `末 ${currentEnd.toFixed(1)}s`;
+            };
+            this.makeTrimRangeSlider(row, clip, left + 760, 0, 210, refreshTrimLabels);
+            const right = rowW / 2;
+            this.makePanelButton(row, '▶', right - 260, 0, 42, 34, () => NativeBridge.playAudioFiles([clip], false), new Color(42, 72, 115, 255));
+            this.makeCloneButton(row, right - 208, 0, () => this.cloneAudioClip(clip));
+            this.makePanelButton(row, '×', right - 156, 0, 42, 34, () => { this.recordedClips = this.recordedClips.filter((c) => c.id !== clip.id); this.saveAudioClips(); this.rebuildAudioRows(); }, new Color(110, 45, 55, 255));
+            this.makePanelButton(row, '→', right - 104, 0, 42, 34, () => this.exportAudioClip(clip), new Color(42, 72, 115, 255));
+            panel.addChild(row); this.clipRows.push(row);
+        });
+    }
+
+    private renameAudioClip(clip: AudioClipMeta) { NativeBridge.promptText('重命名音频', clip.name, (value) => { if (value.trim()) clip.name = value.trim(); this.saveAudioClips(); this.rebuildAudioRows(); }); }
+    private editClipTrim(clip: AudioClipMeta, start: boolean) { const duration = Math.max(.1, clip.duration); const initial = start ? clip.trimStart : (clip.trimEnd || duration); NativeBridge.promptText(start ? '首端裁剪（秒）' : '末端裁剪（秒）', initial.toFixed(2), (value) => { const n = Number(value); if (!Number.isFinite(n)) return; if (start) clip.trimStart = Math.max(0, Math.min(n, (clip.trimEnd || duration) - .05)); else clip.trimEnd = Math.max(clip.trimStart + .05, Math.min(n, duration)); this.saveAudioClips(); this.rebuildAudioRows(); }); }
+
+    private makeTrimRangeSlider(parent: Node, clip: AudioClipMeta, x: number, y: number, width: number, refreshLabels: () => void) {
+        const node = new Node('TrimRange'); node.layer = Layers.Enum.UI_2D; const transform = node.addComponent(UITransform); transform.setContentSize(width, 36); node.setPosition(x, y); const g = node.addComponent(Graphics); let activeHandle: 'start' | 'end' = 'start';
+        const duration = Math.max(.1, clip.duration || 0);
+        const normalized = () => ({ start: Math.max(0, Math.min(1, clip.trimStart / duration)), end: Math.max(0, Math.min(1, (clip.trimEnd > clip.trimStart ? clip.trimEnd : duration) / duration)) });
+        const draw = () => {
+            const value = normalized(); const startX = -width / 2 + value.start * width; const endX = -width / 2 + value.end * width;
+            g.clear(); g.roundRect(-width / 2, -8, width, 16, 4); g.fillColor = new Color(35, 45, 62, 255); g.fill(); g.lineWidth = 1; g.strokeColor = new Color(105, 125, 155, 255); g.stroke();
+            g.roundRect(startX, -7, Math.max(2, endX - startX), 14, 3); g.fillColor = new Color(70, 175, 120, 255); g.fill();
+            g.rect(startX - 5, -13, 10, 26); g.fillColor = new Color(238, 244, 252, 255); g.fill(); g.rect(endX - 5, -13, 10, 26); g.fill();
+        };
+        const moveHandle = (e: EventTouch) => {
+            const p = e.getUILocation(); const local = transform.convertToNodeSpaceAR(new Vec3(p.x, p.y, 0)); const value = Math.max(0, Math.min(1, (local.x + width / 2) / width)); const current = normalized(); const minGap = Math.min(.5, .05 / duration);
+            if (activeHandle === 'start') clip.trimStart = Math.min(value, current.end - minGap) * duration;
+            else clip.trimEnd = Math.max(value, current.start + minGap) * duration;
+            refreshLabels(); draw(); e.propagationStopped = true;
+        };
+        node.on(Node.EventType.TOUCH_START, (e: EventTouch) => { const p = e.getUILocation(); const local = transform.convertToNodeSpaceAR(new Vec3(p.x, p.y, 0)); const value = (local.x + width / 2) / width; const current = normalized(); activeHandle = Math.abs(value - current.start) <= Math.abs(value - current.end) ? 'start' : 'end'; moveHandle(e); }, this);
+        node.on(Node.EventType.TOUCH_MOVE, moveHandle, this);
+        const finish = (e: EventTouch) => { this.saveAudioClips(); e.propagationStopped = true; };
+        node.on(Node.EventType.TOUCH_END, finish, this); node.on(Node.EventType.TOUCH_CANCEL, finish, this); parent.addChild(node); draw();
+    }
+    private cloneAudioClip(clip: AudioClipMeta) { if (this.recordedClips.length >= 13) { this.setInfo('最多支持 13 个音频片段', new Color(255, 190, 120, 255)); return; } this.recordedClips.unshift({ ...clip, id: `clip_${Date.now()}`, name: `${clip.name} 副本` }); this.saveAudioClips(); this.rebuildAudioRows(); }
+    private makeCloneButton(parent: Node, x: number, y: number, cb: () => void) { const b = this.makePanelButton(parent, '', x, y, 42, 34, cb, new Color(42, 72, 115, 255)); const icon = new Node('CloneIcon'); icon.layer = Layers.Enum.UI_2D; icon.addComponent(UITransform).setContentSize(24, 24); b.addChild(icon); const g = icon.addComponent(Graphics); g.lineWidth = 1.5; g.strokeColor = new Color(255, 255, 255, 255); g.rect(-8, -8, 12, 12); g.stroke(); g.rect(-3, -3, 12, 12); g.stroke(); return b; }
+
+    private exportAudioClip(clip: AudioClipMeta) {
+        if (NativeBridge.isAndroidNative) {
+            NativeBridge.chooseAudioExportFormat(format => {
+                if (!format) return;
+                const path = NativeBridge.exportAudio(clip.path, clip.name, format);
+                const failed = !path || path.startsWith('ERROR:');
+                if (failed) this.setInfo(path.replace(/^ERROR:/, '') || '音频导出失败', new Color(255, 150, 150, 255));
+                else this.showCenterMessage('导出成功，音频已保存至游戏文件根目录');
+            });
+            return;
+        }
+        this.setInfo('浏览器预览不支持导出原生录音', new Color(255, 190, 120, 255));
+    }
+
+    private makePanelButton(parent: Node, text: string, x: number, y: number, w: number, h: number, cb: () => void, color: Color): Node {
+        const node = new Node(`PanelButton-${text}-${Math.random()}`); node.layer = Layers.Enum.UI_2D; node.addComponent(UITransform).setContentSize(w, h); const button = node.addComponent(Button); button.transition = Button.Transition.SCALE; node.addComponent(Graphics); (node as any).__panelButtonStyle = { w, h, color: new Color(color.r, color.g, color.b, color.a) }; this.redrawPanelButton(node); const label = this.makeLabel('Text', text, Math.max(14, Math.min(22, h * .48)), h, new Color(245, 248, 255, 255), w, h); node.addChild(label); node.setPosition(x, y); node.on(Button.EventType.CLICK, cb, this); parent.addChild(node); return node;
+    }
+
+    private redrawPanelButton(node: Node) {
+        const style = (node as any).__panelButtonStyle as { w: number; h: number; color: Color } | undefined;
+        const g = node.getComponent(Graphics); if (!style || !g) return;
+        g.clear(); g.roundRect(-style.w / 2, -style.h / 2, style.w, style.h, Math.min(8, style.h / 3)); g.fillColor = style.color; g.fill();
+        g.lineWidth = 1.2; g.strokeColor = new Color(125, 150, 188, 230); g.stroke();
+    }
+
+    private redrawPanelButtons(root: Node) {
+        this.redrawPanelButton(root);
+        for (const child of root.children) this.redrawPanelButtons(child);
+    }
+
+    private openStylePanel() {
+        if (this.audioPanelOpen) this.closeAudioPanel();
+        const created = !this.stylePanel;
+        if (created) this.buildStylePanel();
+        this.stylePanel!.active = true;
+        this.stylePanelOpen = true;
+        this.stylePanel!.setSiblingIndex(this.uiRoot.children.length - 1);
+        this.layoutStylePanel(); this.rebuildStyleRows();
+    }
+
+    private closeStylePanel() { if (this.stylePanel) { this.stylePanel.active = false; this.stylePanelOpen = false; } }
+
+    private buildStylePanel() {
+        const panel = new Node('StyleManagerPanel'); panel.layer = Layers.Enum.UI_2D;
+        panel.addComponent(UITransform).setContentSize(1400, 860);
+        const initialBg = panel.addComponent(Graphics); initialBg.rect(-700, -430, 1400, 860); initialBg.fillColor = new Color(8, 12, 24, 255); initialBg.fill();
+        const title = this.makeLabel('StyleTitle', isEnglish() ? 'Style Manager' : '样式管理', 30, 38, new Color(240, 244, 252, 255), 700, 50); panel.addChild(title);
+        const save = this.makePanelButton(panel, isEnglish() ? 'Save current as new style' : '保存当前所有为新样式', 0, 0, 300, 52, () => { this.saveCurrentStyle(); this.rebuildStyleRows(); }, new Color(38, 72, 106, 255)); save.name = 'StyleSave';
+        const flow = this.makePanelButton(panel, isEnglish() ? 'New style flow' : '新建样式流', 0, 0, 300, 52, () => this.openStyleFlowEditor(), new Color(38, 72, 106, 255)); flow.name = 'StyleFlow';
+        const imp = this.makePanelButton(panel, isEnglish() ? 'Import' : '导入', 0, 0, 300, 52, () => this.importStyleJson(), new Color(38, 72, 106, 255)); imp.name = 'StyleImport';
+        const clearList = this.makePanelButton(panel, isEnglish() ? 'Clear style list' : '清空样式栏', 0, 0, 300, 52, () => this.confirmClearStyles(), new Color(92, 54, 64, 255)); clearList.name = 'StyleClearList';
+        const clearPackages = this.makePanelButton(panel, isEnglish() ? 'Clear packages' : '清空数据包', 0, 0, 300, 52, () => this.confirmClearPackages(), new Color(92, 54, 64, 255)); clearPackages.name = 'StyleClearPackages';
+        for (const leftButton of [save, flow, imp, clearList, clearPackages]) leftButton.addComponent(UIOpacity).opacity = 128;
+        const close = this.makePanelButton(panel, isEnglish() ? 'Close' : '关闭', 0, 0, 110, 42, () => this.closeStylePanel(), new Color(45, 58, 88, 255)); close.name = 'StyleClose';
+        const swallow = (e: EventTouch) => { e.propagationStopped = true; };
+        panel.on(Node.EventType.TOUCH_START, swallow, this); panel.on(Node.EventType.TOUCH_MOVE, swallow, this); panel.on(Node.EventType.TOUCH_END, swallow, this);
+        this.uiRoot.addChild(panel); panel.active = false;
+        initialBg.clear(); initialBg.rect(-700, -430, 1400, 860); initialBg.fillColor = new Color(8, 12, 24, 255); initialBg.fill();
+        this.stylePanel = panel;
+    }
+
+    private layoutStylePanel() {
+        if (!this.stylePanel) return;
+        const panel = this.stylePanel; const view = this.userViewport(false);
+        const leftW = Math.max(300, Math.min(350, view.w * .25)); const dividerX = -view.w / 2 + leftW;
+        panel.getComponent(UITransform)!.setContentSize(view.w, view.h);
+        const g = panel.getComponent(Graphics)!; g.clear();
+        g.rect(-view.w / 2, -view.h / 2, view.w, view.h); g.fillColor = new Color(8, 12, 24, 255); g.fill();
+        g.lineWidth = 1.5; g.strokeColor = new Color(95, 125, 165, 255); g.rect(-view.w / 2 + 1, -view.h / 2 + 1, view.w - 2, view.h - 2); g.stroke();
+        g.strokeColor = new Color(225, 232, 244, 210); g.moveTo(dividerX, -view.h / 2 + 18); g.lineTo(dividerX, view.h / 2 - 70); g.stroke();
+        panel.getChildByName('StyleTitle')?.setPosition(0, view.h / 2 - 34);
+        panel.getChildByName('StyleClose')?.setPosition(view.w / 2 - 68, view.h / 2 - 34);
+        const leftCenter = -view.w / 2 + leftW / 2;
+        panel.getChildByName('StyleSave')?.setPosition(leftCenter, view.h / 2 - 125);
+        panel.getChildByName('StyleFlow')?.setPosition(leftCenter, view.h / 2 - 194);
+        panel.getChildByName('StyleImport')?.setPosition(leftCenter, view.h / 2 - 263);
+        panel.getChildByName('StyleClearList')?.setPosition(leftCenter, view.h / 2 - 332);
+        panel.getChildByName('StyleClearPackages')?.setPosition(leftCenter, view.h / 2 - 401);
+        this.redrawPanelButtons(panel);
+    }
+
+    private rebuildStyleRows() {
+        if (!this.stylePanel) return;
+        for (const row of this.styleRows) row.destroy(); this.styleRows = [];
+        const view = this.userViewport(false); const leftW = Math.max(300, Math.min(350, view.w * .25));
+        const rightLeft = -view.w / 2 + leftW + 16; const rowW = view.w - leftW - 32; let cursor = view.h / 2 - 80;
+        this.styles.forEach((style, i) => {
+            const expanded = this.expandedStyleId === style.id; const totalH = expanded ? 150 : 62; const barY = totalH / 2 - 31;
+            const row = new Node(`StyleRow${style.id}`); row.layer = Layers.Enum.UI_2D; row.addComponent(UITransform).setContentSize(rowW, totalH); row.setPosition(rightLeft + rowW / 2, cursor - totalH / 2);
+            const g = row.addComponent(Graphics); g.roundRect(-rowW / 2, barY - 28, rowW, 56, 6); g.fillColor = new Color(22, 30, 48, 255); g.fill(); g.lineWidth = 2; g.strokeColor = style.kind === 'flow' ? new Color(75, 125, 240, 255) : new Color(60, 190, 110, 255); g.stroke();
+            const right = rowW / 2;
+            this.makePanelButton(row, style.name, -rowW / 2 + Math.min(185, rowW * .22), barY, Math.min(330, rowW * .43), 38, () => this.renameStyle(style), new Color(30, 40, 62, 255));
+            this.makePanelButton(row, expanded ? '▲' : '▼', right - 190, barY, 42, 38, () => { this.expandedStyleId = expanded ? '' : style.id; this.rebuildStyleRows(); }, style.kind === 'flow' ? new Color(42, 72, 130, 255) : new Color(42, 105, 72, 255));
+            this.makePanelButton(row, '→', right - 136, barY, 42, 38, () => this.exportStyleJson(style), new Color(42, 72, 115, 255));
+            this.makePanelButton(row, '↓', right - 82, barY, 42, 38, () => this.applyStyle(style), new Color(42, 72, 115, 255));
+            this.makePanelButton(row, '×', right - 28, barY, 42, 38, () => this.deleteStyle(style), new Color(115, 45, 58, 255));
+            if (expanded) this.drawStylePreview(row, style, rowW, barY - 68);
+            this.stylePanel!.addChild(row); this.styleRows.push(row); cursor -= totalH + 10;
+            row.setScale(.98, .98, 1); tween(row).to(.18, { scale: new Vec3(1, 1, 1) }, { easing: 'quadOut' }).start();
+        });
+    }
+
+    private renameStyle(style: StyleSnapshot) { NativeBridge.promptText('重命名样式', style.name, (value) => { if (value.trim()) style.name = value.trim(); this.saveStyles(); this.rebuildStyleRows(); }); }
+
+    private deleteStyle(style: StyleSnapshot) {
+        NativeBridge.confirm('删除样式', `确定删除“${style.name}”吗？`, (confirmed) => {
+            if (!confirmed) return;
+            this.styles = this.styles.filter((item) => item.id !== style.id);
+            if (this.activeStyleFlow?.id === style.id) this.activeStyleFlow = null;
+            if (this.expandedStyleId === style.id) this.expandedStyleId = '';
+            this.saveStyles(); this.rebuildStyleRows();
+        });
+    }
+
+    private confirmTwice(action: string, apply: () => void) {
+        NativeBridge.confirm('确认清空', `是否${action}？`, (first) => {
+            if (!first) return;
+            NativeBridge.confirm('再次确认', `${action}后无法恢复，确定继续吗？`, (second) => { if (second) apply(); });
+        });
+    }
+
+    private confirmClearStyles() {
+        this.confirmTwice('清空样式栏中的所有样式和样式流', () => {
+            this.styles = []; this.activeStyleFlow = null; this.expandedStyleId = ''; this.saveStyles(); this.rebuildStyleRows();
+            this.setInfo('样式栏已清空', new Color(220, 225, 235, 255));
+        });
+    }
+
+    private confirmClearPackages() {
+        this.confirmTwice('清除游戏文件根目录中的所有样式数据包', () => {
+            const removed = NativeBridge.clearStylePackages();
+            this.setInfo(removed >= 0 ? `已清空数据包（${removed} 个）` : '清空数据包失败', removed >= 0 ? new Color(220, 225, 235, 255) : new Color(255, 150, 150, 255));
+        });
+    }
+
+    private drawStylePreview(row: Node, style: StyleSnapshot, width: number, centerY: number) {
+        const preview = new Node('Preview'); preview.layer = Layers.Enum.UI_2D; preview.addComponent(UITransform).setContentSize(width - 20, 78); preview.setPosition(0, centerY); row.addChild(preview);
+        const g = preview.addComponent(Graphics); const pw = width - 48; g.roundRect(-pw / 2, -37, pw, 74, 5); g.fillColor = new Color(13, 19, 33, 255); g.fill();
+        if (style.kind === 'flow') {
+            const nodes = style.flowNodes || []; const count = Math.max(1, nodes.length); const gap = Math.min(100, (pw - 70) / count); const start = -(count - 1) * gap / 2;
+            nodes.forEach((n, i) => { g.circle(start + i * gap, 7, 7); g.fillColor = new Color(80, 135, 245, 255); g.fill(); if (i < nodes.length - 1) { g.strokeColor = new Color(150, 180, 235, 255); g.lineWidth = 1.5; g.moveTo(start + i * gap + 10, 7); g.lineTo(start + (i + 1) * gap - 10, 7); g.stroke(); } });
+            const label = this.makeLabel('FlowPreviewText', `${nodes.length} 个节点`, 16, 20, new Color(185, 205, 240, 255), pw, 22); label.setPosition(0, -20); preview.addChild(label); return;
+        }
+        const colors = [new Color(255, 80, 90, 255), new Color(65, 225, 130, 255), new Color(80, 145, 255, 255)];
+        const laneW = pw / 3;
+        style.waves.slice(0, 3).forEach((wave, ch) => {
+            const data = wave.baseWave?.length ? wave.baseWave : [0, 0]; const laneLeft = -pw / 2 + ch * laneW; const usable = Math.max(20, laneW - 30); g.strokeColor = colors[ch]; g.lineWidth = 1.5;
+            if (ch > 0) { g.strokeColor = new Color(70, 82, 105, 180); g.lineWidth = 1; g.moveTo(laneLeft, -28); g.lineTo(laneLeft, 28); g.stroke(); g.strokeColor = colors[ch]; g.lineWidth = 1.5; }
+            for (let x = 0; x < usable; x++) { const phase = (x / Math.max(1, usable - 1)) * Math.max(.1, wave.cycles); const idx = Math.floor((phase % 1) * (data.length - 1)); const px = laneLeft + 15 + x; const py = -6 + Math.max(-20, Math.min(20, data[idx] * wave.amplitude * 20)); if (x === 0) g.moveTo(px, py); else g.lineTo(px, py); } g.stroke();
+            const label = this.makeLabel(`Preview${ch}`, ['R', 'G', 'B'][ch], 14, 18, colors[ch], laneW, 18); label.setPosition(laneLeft + laneW / 2, 26); preview.addChild(label);
+        });
+    }
+
+    private captureStyle(kind: 'style' | 'flow', name: string): StyleSnapshot {
+        return {
+            id: `style_${Date.now()}`, name, kind, createdAt: Date.now(),
+            waves: [0, 1, 2].map((ch) => {
+                const area = this.waveAreas[ch];
+                const stored = this.loadWave(ch);
+                return area
+                    ? { baseWave: area.baseWave.slice(), amplitude: area.amplitude, cycles: area.cycles, instId: this.instIds[ch] }
+                    : { baseWave: this.loadBaseWave(ch, stored), amplitude: this.loadWaveScalar(ch, 'amp', 1), cycles: this.loadWaveScalar(ch, 'cycles', 1), instId: loadStr('cm_inst_' + ch, ch === 0 ? 'piano' : ch === 1 ? 'flute' : 'bell') };
+            }),
+            grid: JSON.parse(JSON.stringify(this.gridState)), fxSlots: JSON.parse(JSON.stringify(this.fxSlots)), outputFxSlots: JSON.parse(JSON.stringify(this.outputFxSlots)),
+            drumBlackId: this.drumBlackId, drumWhiteId: this.drumWhiteId,
+        };
+    }
+
+    private saveCurrentStyle() { this.styles.push(this.captureStyle('style', '新样式')); this.saveStyles(); this.setInfo('已保存新样式', new Color(220, 225, 235, 255)); }
+
+    private openStyleFlowEditor() {
+        const styleChoices = this.styles.filter((s) => s.kind === 'style');
+        if (!styleChoices.length) { this.setInfo('请先保存至少一个样式', new Color(255, 190, 120, 255)); return; }
+        const created = !this.flowEditorPanel;
+        if (created) this.buildStyleFlowEditor();
+        this.flowEditorPanel!.active = true;
+        this.flowEditorNodes = Array.from({ length: 5 }, (_, i) => ({ styleId: styleChoices[Math.min(i, styleChoices.length - 1)].id, delaySec: 5 }));
+        this.stylePanel!.active = false; this.flowEditorPanel!.setSiblingIndex(this.uiRoot.children.length - 1);
+        this.layoutStyleFlowEditor(); this.rebuildStyleFlowEditor();
+    }
+
+    private buildStyleFlowEditor() {
+        const panel = new Node('StyleFlowEditor'); panel.layer = Layers.Enum.UI_2D; panel.addComponent(UITransform).setContentSize(1400, 860); const initialBg = panel.addComponent(Graphics); initialBg.rect(-700, -430, 1400, 860); initialBg.fillColor = new Color(8, 12, 24, 255); initialBg.fill();
+        const title = this.makeLabel('FlowTitle', '新建样式流', 30, 38, new Color(240, 244, 252, 255), 600, 50); panel.addChild(title);
+        const reset = this.makePanelButton(panel, '重置', -130, 0, 110, 44, () => { const choices = this.styles.filter((s) => s.kind === 'style'); this.flowEditorNodes = Array.from({ length: 5 }, (_, i) => ({ styleId: choices[Math.min(i, choices.length - 1)]?.id || '', delaySec: 5 })); this.rebuildStyleFlowEditor(); }, new Color(45, 58, 88, 255)); reset.name = 'FlowReset';
+        const close = this.makePanelButton(panel, '关闭', 0, 0, 110, 44, () => this.closeStyleFlowEditor(), new Color(45, 58, 88, 255)); close.name = 'FlowClose';
+        const save = this.makePanelButton(panel, '保存', 130, 0, 110, 44, () => this.saveStyleFlow(), new Color(42, 105, 72, 255)); save.name = 'FlowSave';
+        const swallow = (e: EventTouch) => { e.propagationStopped = true; }; panel.on(Node.EventType.TOUCH_START, swallow, this); panel.on(Node.EventType.TOUCH_MOVE, swallow, this); panel.on(Node.EventType.TOUCH_END, swallow, this);
+        this.uiRoot.addChild(panel); panel.active = false;
+        initialBg.clear(); initialBg.rect(-700, -430, 1400, 860); initialBg.fillColor = new Color(8, 12, 24, 255); initialBg.fill();
+        this.flowEditorPanel = panel;
+    }
+
+    private layoutStyleFlowEditor() {
+        if (!this.flowEditorPanel) return; const panel = this.flowEditorPanel; const view = this.userViewport(false); panel.getComponent(UITransform)!.setContentSize(view.w, view.h);
+        const g = panel.getComponent(Graphics)!; g.clear(); g.rect(-view.w / 2, -view.h / 2, view.w, view.h); g.fillColor = new Color(8, 12, 24, 255); g.fill(); g.lineWidth = 1.5; g.strokeColor = new Color(75, 125, 240, 255); g.rect(-view.w / 2 + 1, -view.h / 2 + 1, view.w - 2, view.h - 2); g.stroke();
+        panel.getChildByName('FlowTitle')?.setPosition(0, view.h / 2 - 35); panel.getChildByName('FlowReset')?.setPosition(-130, -view.h / 2 + 42); panel.getChildByName('FlowClose')?.setPosition(0, -view.h / 2 + 42); panel.getChildByName('FlowSave')?.setPosition(130, -view.h / 2 + 42);
+        this.redrawPanelButtons(panel);
+    }
+
+    private rebuildStyleFlowEditor() {
+        if (!this.flowEditorPanel) return; for (const n of this.flowEditorDynamic) n.destroy(); this.flowEditorDynamic = [];
+        const panel = this.flowEditorPanel; const view = this.userViewport(false); const choices = this.styles.filter((s) => s.kind === 'style'); const perRow = 5; const cellW = Math.min(250, (view.w - 50) / perRow);
+        this.flowEditorNodes.forEach((flowNode, i) => {
+            const row = Math.floor(i / perRow); const col = i % perRow; const countInRow = Math.min(perRow, this.flowEditorNodes.length - row * perRow); const x = (col - (countInRow - 1) / 2) * cellW; const y = view.h / 2 - 140 - row * 190;
+            const nodeMark = new Node(`FlowNode${i}`); nodeMark.layer = Layers.Enum.UI_2D; nodeMark.addComponent(UITransform).setContentSize(26, 26); nodeMark.setPosition(x, y + 58); const mg = nodeMark.addComponent(Graphics); mg.circle(0, 0, 10); mg.fillColor = new Color(80, 135, 245, 255); mg.fill(); const num = this.makeLabel('Number', String(i + 1), 12, 14, new Color(255, 255, 255, 255), 22, 22); nodeMark.addChild(num); panel.addChild(nodeMark); this.flowEditorDynamic.push(nodeMark);
+            const before = new Set(panel.children); const dd = new Dropdown(panel, choices.map((s) => ({ id: s.id, label: s.name })), flowNode.styleId, () => '', (id) => { flowNode.styleId = id; }); dd.setPosition(x, y + 15); dd.redraw(); for (const child of panel.children) if (!before.has(child)) this.flowEditorDynamic.push(child);
+            const time = this.makePanelButton(panel, `${flowNode.delaySec.toFixed(1)} 秒`, x, y - 42, 105, 36, () => NativeBridge.promptText(i === this.flowEditorNodes.length - 1 ? '循环回到首节点时间（秒）' : '切换到下一样式时间（秒）', String(flowNode.delaySec), (value) => { const n = Number(value); if (Number.isFinite(n)) flowNode.delaySec = Math.max(.1, Math.min(3599, n)); this.rebuildStyleFlowEditor(); }), new Color(38, 58, 88, 255)); this.flowEditorDynamic.push(time);
+        });
+        const rows = Math.ceil(this.flowEditorNodes.length / perRow); const controlsY = view.h / 2 - 140 - (rows - 1) * 190 - 100;
+        const plus = this.makePanelButton(panel, '+', 25, controlsY, 38, 38, () => { if (this.flowEditorNodes.length >= 13) { this.setInfo('最多支持 13 个节点', new Color(255, 190, 120, 255)); return; } this.flowEditorNodes.push({ styleId: choices[0]?.id || '', delaySec: 5 }); this.rebuildStyleFlowEditor(); }, new Color(42, 105, 72, 255));
+        const minus = this.makePanelButton(panel, '−', -25, controlsY, 38, 38, () => { if (this.flowEditorNodes.length > 1) this.flowEditorNodes.pop(); this.rebuildStyleFlowEditor(); }, new Color(110, 55, 65, 255)); this.flowEditorDynamic.push(plus, minus);
+    }
+
+    private closeStyleFlowEditor() { if (this.flowEditorPanel) this.flowEditorPanel.active = false; if (this.stylePanel) { this.stylePanel.active = true; this.layoutStylePanel(); this.rebuildStyleRows(); } }
+
+    private saveStyleFlow() {
+        const flow = this.captureStyle('flow', '新样式流'); flow.flowNodes = this.flowEditorNodes.map((n) => ({ ...n })); this.styles.push(flow); this.saveStyles(); this.closeStyleFlowEditor(); this.setInfo('已保存新样式流', new Color(220, 225, 235, 255));
+    }
+    private loadStyles(): StyleSnapshot[] { try { const raw = sys.localStorage.getItem('cm_styles'); const v = raw ? JSON.parse(raw) : []; return Array.isArray(v) ? v : []; } catch (e) { return []; } }
+    private saveStyles() { try { sys.localStorage.setItem('cm_styles', JSON.stringify(this.styles)); } catch (e) { /* ignore */ } }
+
+    private applyStyle(style: StyleSnapshot) {
+        if (style.kind === 'flow') {
+            this.activeStyleFlow = style;
+            const first = this.styles.find((s) => s.kind === 'style' && s.id === style.flowNodes?.[0]?.styleId);
+            if (first) this.applyStyleSnapshot(first, true);
+            this.setInfo('样式流已载入，将在循环播放时运行', new Color(180, 205, 255, 255));
+            return;
+        }
+        this.applyStyleSnapshot(style, false);
+    }
+
+    private applyStyleSnapshot(style: StyleSnapshot, preserveFlow: boolean) {
+        if (!preserveFlow) this.activeStyleFlow = null;
+        const previousEdgeMode = this.edgeMode;
+        this.styleTransition = true;
+        this.redrawPlayGrid();
+        style.waves.forEach((w, ch) => {
+            const wave = this.applyWaveAxes(w.baseWave, w.amplitude, w.cycles);
+            const a = this.waveAreas[ch];
+            if (a) { a.baseWave = w.baseWave.slice(); a.amplitude = w.amplitude; a.cycles = w.cycles; a.wave = wave; this.saveWaveState(a); this.redrawWaveArea(a); }
+            else {
+                try { sys.localStorage.setItem(this.waveKey(ch), JSON.stringify(wave)); sys.localStorage.setItem(`cm_wt_base_${ch}`, JSON.stringify(w.baseWave)); sys.localStorage.setItem(`cm_wt_amp_${ch}`, String(w.amplitude)); sys.localStorage.setItem(`cm_wt_cycles_${ch}`, String(w.cycles)); } catch (e) { /* ignore */ }
+            }
+            this.instIds[ch] = w.instId; saveStr('cm_inst_' + ch, w.instId); this.sendWaveToNative(ch, w.baseWave, w.amplitude, w.cycles);
+        });
+        this.gridState = JSON.parse(JSON.stringify(style.grid)); saveGridState(this.gridState); this.fxSlots = JSON.parse(JSON.stringify(style.fxSlots)); saveFxSlots(this.fxSlots); this.outputFxSlots = JSON.parse(JSON.stringify(style.outputFxSlots)); saveOutputFxSlots(this.outputFxSlots); this.drumBlackId = style.drumBlackId; this.drumWhiteId = style.drumWhiteId; this.pushFxToNative(); this.pushOutputFxToNative(); this.pushDrumToNative(); this.redrawPlayGrid(); this.scheduleOnce(() => { this.styleTransition = false; this.edgeMode = previousEdgeMode; this.redrawPlayGrid(); }, 1.3); this.setInfo('样式已载入', new Color(220, 225, 235, 255));
+    }
+
+    private startStyleFlow() {
+        const flow = this.activeStyleFlow; const nodes = flow?.flowNodes || []; const token = ++this.styleFlowToken; if (!flow || !nodes.length) return;
+        const advance = (index: number) => {
+            if (token !== this.styleFlowToken || !this.clipsPlaying || !this.activePlaybackLoop) return;
+            const node = nodes[index]; const style = this.styles.find((s) => s.kind === 'style' && s.id === node.styleId); if (style) this.applyStyleSnapshot(style, true);
+            this.scheduleOnce(() => advance((index + 1) % nodes.length), Math.max(.1, node.delaySec));
+        };
+        advance(0);
+    }
+
+    private exportStyleJson(style: StyleSnapshot) { const text = JSON.stringify(style); const base = `Neuro_Deta_${style.kind === 'flow' ? 'Style_Flow' : 'Style'}`; if (NativeBridge.isAndroidNative) { const path = NativeBridge.exportStylePackage(base, text); if (path) this.showCenterMessage('导出成功，数据包已保存至游戏文件根目录'); else this.setInfo('数据包导出失败', new Color(255, 150, 150, 255)); } else if (typeof document !== 'undefined') { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type: 'application/json' })); a.download = `${base}_${Date.now()}.json`; a.click(); this.showCenterMessage('导出成功，数据包已保存至游戏文件根目录'); } }
+    private acceptImportedStyle(text: string) { try { const style = JSON.parse(text) as StyleSnapshot; if (!style?.waves || !style?.grid || (style.kind !== 'style' && style.kind !== 'flow')) throw new Error('invalid'); style.id = `style_${Date.now()}`; this.styles.push(style); this.saveStyles(); this.rebuildStyleRows(); this.setInfo('样式数据包已导入', new Color(220, 225, 235, 255)); } catch (e) { this.setInfo('样式文件解析失败', new Color(255, 150, 150, 255)); } }
+    private importStyleJson() { if (NativeBridge.isAndroidNative) { NativeBridge.importStylePackage((json) => this.acceptImportedStyle(json)); return; } if (typeof document === 'undefined') return; const input = document.createElement('input'); input.type = 'file'; input.accept = '.json,.style'; input.onchange = () => { const f = input.files?.[0]; if (!f) return; const r = new FileReader(); r.onload = () => this.acceptImportedStyle(String(r.result)); r.readAsText(f); }; input.click(); }
 
     private pickWeb() {
         if (typeof document === 'undefined') return;
@@ -2417,6 +3024,7 @@ export class GameManager extends Component {
         }
         if (!this.activeTouches.has(id)) return;
         this.activeTouches.delete(id);
+        this.hideTouchRipple(id);
         if (NativeBridge.isAndroidNative) {
             NativeBridge.noteOff(id);
         } else {
@@ -2479,7 +3087,7 @@ export class GameManager extends Component {
             this.webSynth.noteOn(touchId, params.r, params.g, params.b, params.a, params.freq, params.volume);
         }
 
-        this.showRipple(local.x, local.y, color);
+        this.showTouchRipple(touchId, local.x, local.y, color);
         const note = midiToName(midi);
         const summary = colorToneSummary(color.r, color.g, color.b, color.a);
         this.setInfo(
@@ -2490,16 +3098,56 @@ export class GameManager extends Component {
         );
     }
 
-    private showRipple(localX: number, localY: number, color: { r: number; g: number; b: number }) {
-        this.ripple.setPosition(localX, localY);
-        this.ripple.setScale(0.6, 0.6, 1);
-        this.rippleGfx.clear();
-        this.rippleGfx.circle(0, 0, 42);
-        this.rippleGfx.fillColor = new Color(color.r, color.g, color.b, 210);
-        this.rippleGfx.fill();
-        this.rippleOpacity.opacity = 255;
-        tween(this.ripple).to(0.22, { scale: new Vec3(1.5, 1.5, 1) }, { easing: 'quadOut' }).start();
-        tween(this.rippleOpacity).to(0.3, { opacity: 0 }, { easing: 'quadOut' }).start();
+    private showTouchRipple(touchId: number, localX: number, localY: number,
+        color: { r: number; g: number; b: number }) {
+        let ripple = this.touchRipples.get(touchId);
+        const isNew = !ripple;
+        if (!ripple) {
+            const node = new Node(`TouchRipple-${touchId}`);
+            node.layer = Layers.Enum.UI_2D;
+            node.addComponent(UITransform).setContentSize(160, 160);
+            const gfx = node.addComponent(Graphics);
+            const opacity = node.addComponent(UIOpacity);
+            this.imageDisplay.addChild(node);
+            ripple = { node, gfx, opacity };
+            this.touchRipples.set(touchId, ripple);
+        }
+
+        Tween.stopAllByTarget(ripple.node);
+        Tween.stopAllByTarget(ripple.opacity);
+        ripple.node.setPosition(localX, localY);
+        ripple.node.setScale(isNew ? 0.6 : 1, isNew ? 0.6 : 1, 1);
+        ripple.gfx.clear();
+        ripple.gfx.circle(0, 0, 42);
+        ripple.gfx.fillColor = new Color(color.r, color.g, color.b, 210);
+        ripple.gfx.fill();
+        ripple.opacity.opacity = 255;
+        if (isNew) {
+            tween(ripple.node).to(0.12, { scale: new Vec3(1, 1, 1) }, { easing: 'quadOut' }).start();
+        }
+    }
+
+    private hideTouchRipple(touchId: number) {
+        const ripple = this.touchRipples.get(touchId);
+        if (!ripple) return;
+        // 先移出映射；若系统快速复用 touchId，新光点不会被旧淡出回调误删。
+        this.touchRipples.delete(touchId);
+        Tween.stopAllByTarget(ripple.node);
+        Tween.stopAllByTarget(ripple.opacity);
+        tween(ripple.node).to(0.16, { scale: new Vec3(1.3, 1.3, 1) }, { easing: 'quadOut' }).start();
+        tween(ripple.opacity)
+            .to(0.16, { opacity: 0 }, { easing: 'quadOut' })
+            .call(() => ripple!.node.destroy())
+            .start();
+    }
+
+    private clearTouchRipples() {
+        for (const ripple of this.touchRipples.values()) {
+            Tween.stopAllByTarget(ripple.node);
+            Tween.stopAllByTarget(ripple.opacity);
+            ripple.node.destroy();
+        }
+        this.touchRipples.clear();
     }
 
     /* ============================== 陀螺仪旋转 ============================== */
@@ -2606,8 +3254,12 @@ export class GameManager extends Component {
          * uiRoot 的局部坐标就是旋转补偿后的“用户视角坐标”：横屏可见区为
          * 2000×900，竖屏为 900×2000。直接在此坐标系布局，可让 ±90° 和
          * 180° 都得到一致结果，也避免旋转后的控件宽度越过屏幕边缘。
-         */
+        */
         const portrait = target === 90 || target === -90;
+        if (portrait) {
+            if (this.audioPanelOpen) this.closeAudioPanel();
+            if (this.stylePanelOpen) this.closeStylePanel();
+        }
         const targetScale = this.rootScaleFor(portrait);
         const view = this.userViewport(portrait);
         const menuPos: [number, number] = [view.w / 2 - 24, view.h / 2 - 24];
@@ -2633,6 +3285,13 @@ export class GameManager extends Component {
             this.mainMenuBtn.setPosition(menuPos[0], menuPos[1]);
             this.languageBtn.angle = 0;
             this.languageBtn.setPosition(menuPos[0] - 38, menuPos[1]);
+            for (let i = 0; i < this.consoleButtons.length; i++) {
+                const node = this.consoleButtons[i];
+                node.angle = 0;
+                const x = menuPos[0] - 76 - view.w / 6 - i * 38;
+                if (withTween) this.tweenTo(node, x, menuPos[1], ROT_TWEEN);
+                else node.setPosition(x, menuPos[1]);
+            }
             this.infoNode.angle = 0;
             tween(this.infoNode).stop();
             if (withTween) this.tweenTo(this.infoNode, infoPos[0], infoPos[1]);
@@ -2686,6 +3345,17 @@ export class GameManager extends Component {
         const target = this.targetForSnapped(snapped);
         if (target === this.currentTarget) return;
         this.applyRotation(target, true);
+    }
+
+    private showCenterMessage(text: string) {
+        this.uiRoot.getChildByName('CenterMessage')?.destroy();
+        const view = this.userViewport(false); const width = Math.min(920, view.w - 80); const height = 108;
+        const message = new Node('CenterMessage'); message.layer = Layers.Enum.UI_2D; message.addComponent(UITransform).setContentSize(width, height);
+        const g = message.addComponent(Graphics); g.roundRect(-width / 2, -height / 2, width, height, 6); g.fillColor = new Color(12, 19, 31, 245); g.fill(); g.lineWidth = 2; g.strokeColor = new Color(70, 190, 115, 255); g.stroke();
+        const label = this.makeLabel('Text', text, 22, 30, new Color(240, 248, 244, 255), width - 36, 52); label.setPosition(0, 14); message.addChild(label);
+        this.makePanelButton(message, '查看目录', width / 2 - 82, -31, 132, 34, () => NativeBridge.openExportDirectory(), new Color(42, 105, 72, 255));
+        const opacity = message.addComponent(UIOpacity); opacity.opacity = 0; this.uiRoot.addChild(message); message.setPosition(0, 0); message.setSiblingIndex(this.uiRoot.children.length - 1);
+        tween(opacity).to(.16, { opacity: 255 }).delay(5).to(.24, { opacity: 0 }).call(() => message.destroy()).start();
     }
 
     private setInfo(text: string, color: Color) {

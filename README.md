@@ -1,12 +1,12 @@
-# ColorMusic
+# Neuro（demo）
 
-ColorMusic is an interactive image-to-sound instrument for Android. Choose an image, then touch or slide across it to play tones derived from each pixel's position and RGB color.
+Neuro（demo） is an interactive image-to-sound instrument for Android. Choose an image, then touch or slide across it to play tones derived from each pixel's position and RGB color. The repository and application ID remain `ColorMusic` / `com.colormusic.game` for upgrade compatibility.
 
 ## Release
 
-- Current release: **1.2**
+- Current release: **1.3**
 - Platform: **Android only**
-- Best target resolution: **2944 x 1940**
+- Resolution: **automatically adapted**; tested on `2944 x 1840` tablets and `2800 x 1260` phones
 - Recommended architecture: `arm64-v8a`
 - Application ID: `com.colormusic.game`
 
@@ -22,6 +22,9 @@ The first launch defaults to **English**. Use the flag button in the top-right m
 - Built-in presets, random generation, undo/reset, calibration, and an in-app bilingual guide.
 - Responsive landscape and portrait layouts that preserve button and text proportions.
 - Native Android `AudioTrack` synthesis with WebAudio fallback for editor/browser preview.
+- Recording, one-shot and loop playback, up to 13 mixer clips, trim handles, volume control, WAV export, and Android MP3 export.
+- Style and style-flow management with preview, rename, clone, delete, import, export, and timed transitions.
+- Automatic resolution-aware landscape UI spacing and typography.
 
 ## Requirements
 
@@ -64,11 +67,19 @@ Install it on a USB-debugging Android device with:
   'build/android/proj/build/ColorMusic/outputs/apk/debug/ColorMusic-debug.apk'
 ```
 
+### MT 管理器便捷化设置教程
+
+1. 安装并打开 MT 管理器，确认游戏已至少启动过一次。
+2. 在 MT 左侧栏右上角点击“添加本地存储”，选择应用 `Neuro（demo）`（包名为 `com.colormusic.game`）。
+3. 进入 `android_data/files/ColorMusic`。这里是游戏文件根目录，录音、导出的 WAV/MP3、样式和样式流数据包都在这里。
+4. 游戏中的导出成功提示可点击“查看目录”返回 MT；若 MT 版本只打开首页，请从左侧的 `ColorMusic` 本地存储进入上述目录。
+5. 分享文件时长按文件选择“分享”或“复制”。不要删除 `audio_*.wav` 文件，否则混音台中对应的录音片段会失效。
+
 ### Direct APK installation
 
 ADB is optional. You can also install the release package directly:
 
-1. Download `ColorMusic-1.2-arm64-v8a.apk` from the [v1.2 release](https://github.com/ColFumice/ColorMusic/releases/tag/v1.2) on the Android device, or transfer the APK to the device over USB, cloud storage, or a messaging app.
+1. Download `Neuro-demo-1.3-arm64-v8a.apk` from the [v1.3 release](https://github.com/ColFumice/ColorMusic/releases/tag/v1.3) on the Android device, or transfer the APK to the device over USB, cloud storage, or a messaging app.
 2. Open the APK in the device's file manager and confirm **Install**.
 3. If Android blocks the installation, enable **Allow from this source** for the file manager or browser when prompted, then retry.
 
@@ -96,7 +107,7 @@ native/engine/android/app/src/...   Android activity, bridge, and AudioTrack syn
 
 ## Versioning
 
-The repository currently publishes releases **1.0**, **1.1**, and **1.2**. Releases 1.0 and 1.1 are preserved as the APK archives supplied for those versions; active source documentation follows the current 1.2 tree.
+The repository publishes releases **1.0**, **1.1**, **1.2**, and **1.3**. Releases 1.0 and 1.1 are preserved as the APK archives supplied for those versions; active source documentation follows the current 1.3 tree.
 
 ## License
 

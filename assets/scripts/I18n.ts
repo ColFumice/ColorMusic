@@ -14,6 +14,8 @@ const EN: Record<string, string> = {
     '全部重置': 'Reset All', '自定义': 'Custom', '无': 'None',
     '快速开始': 'Quick Start', '触摸演奏': 'Touch Performance', '颜色与音色': 'Color & Timbre',
     '波表编辑器': 'Wavetable Editor', '效果器': 'Effects', '菜单与校准': 'Menu & Calibration',
+    '查看目录': 'View Folder', '导出成功，音频已保存至游戏文件根目录': 'Export successful. Audio saved to the game file root.',
+    '录音与混音': 'Recording & Mixer', '样式管理': 'Style Manager',
     '网格设置': 'Grid Settings', '显示网格线': 'Show Grid Lines', '显示音色提示': 'Show Tone Info',
     '横线颜色': 'Horizontal Color', '横线透明度': 'Horizontal Opacity', '竖线颜色': 'Vertical Color', '竖线透明度': 'Vertical Opacity',
     '左右音阶范围（MIDI）': 'Pitch Range (MIDI)', '上下音量范围（%）': 'Volume Range (%)',

@@ -45,8 +45,16 @@ export interface PickedImageInfo {
 export const NATIVE_CLASS = 'com/colormusic/game/NativeBridge';
 export const JS_CALLBACK_NAME = '__colormusic_onImagePicked';
 export const JS_SYNTH_READY_FLAG = '__colormusic_synthReady';
+export const JS_TEXT_INPUT_CALLBACK = '__colormusic_onTextInput';
+export const JS_STYLE_IMPORT_CALLBACK = '__colormusic_onStyleImported';
+export const JS_CONFIRM_CALLBACK = '__colormusic_onConfirm';
+export const JS_AUDIO_FORMAT_CALLBACK = '__colormusic_onAudioFormat';
 
 export class NativeBridge {
+    private static textCallbacks = new Map<string, (value: string) => void>();
+    private static confirmCallbacks = new Map<string, (confirmed: boolean) => void>();
+    private static audioFormatCallbacks = new Map<string, (format: 'wav' | 'mp3' | '') => void>();
+    private static styleImportCallback: ((json: string) => void) | null = null;
     /** 当前是否运行在原生环境（本项目只构建 Android，isNative 即安卓）。 */
     static get isAndroidNative(): boolean {
         return sys.isNative;
@@ -63,6 +71,101 @@ export class NativeBridge {
                 console.error('[ColorMusic] 解析原生图片回调失败:', e);
             }
         };
+    }
+
+    static registerUtilityCallbacks(): void {
+        const g = globalThis as any;
+        g[JS_TEXT_INPUT_CALLBACK] = (requestId: string, value: string) => {
+            const cb = NativeBridge.textCallbacks.get(requestId);
+            NativeBridge.textCallbacks.delete(requestId);
+            if (cb) cb(value);
+        };
+        g[JS_STYLE_IMPORT_CALLBACK] = (json: string) => {
+            const cb = NativeBridge.styleImportCallback;
+            NativeBridge.styleImportCallback = null;
+            if (cb) cb(json);
+        };
+        g[JS_CONFIRM_CALLBACK] = (requestId: string, confirmed: boolean) => {
+            const cb = NativeBridge.confirmCallbacks.get(requestId);
+            NativeBridge.confirmCallbacks.delete(requestId);
+            if (cb) cb(confirmed === true);
+        };
+        g[JS_AUDIO_FORMAT_CALLBACK] = (requestId: string, format: string) => {
+            const cb = NativeBridge.audioFormatCallbacks.get(requestId);
+            NativeBridge.audioFormatCallbacks.delete(requestId);
+            if (cb) cb(format === 'wav' || format === 'mp3' ? format : '');
+        };
+    }
+
+    static promptText(title: string, initial: string, cb: (value: string) => void): void {
+        if (!NativeBridge.isAndroidNative) {
+            const value = typeof globalThis.prompt === 'function' ? globalThis.prompt(title, initial) : initial;
+            if (value !== null) cb(value);
+            return;
+        }
+        const requestId = `text_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+        NativeBridge.textCallbacks.set(requestId, cb);
+        NativeBridge.call('promptText', '(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V', requestId, title, initial);
+    }
+
+    static confirm(title: string, message: string, cb: (confirmed: boolean) => void): void {
+        if (!NativeBridge.isAndroidNative) {
+            cb(typeof globalThis.confirm === 'function' ? globalThis.confirm(message) : false);
+            return;
+        }
+        const requestId = `confirm_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+        NativeBridge.confirmCallbacks.set(requestId, cb);
+        NativeBridge.call('confirmAction', '(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V', requestId, title, message);
+    }
+
+    static importStylePackage(cb: (json: string) => void): void {
+        NativeBridge.styleImportCallback = cb;
+        NativeBridge.call('openStyleImporter', '()V');
+    }
+
+    static exportStylePackage(fileName: string, json: string): string {
+        if (!NativeBridge.isAndroidNative) return '';
+        const ref = NativeBridge.reflection;
+        try {
+            const out = ref?.callStaticMethod(NATIVE_CLASS, 'exportStylePackage', '(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;', fileName, json);
+            return typeof out === 'string' ? out : String(out ?? '');
+        } catch (e) { console.error('[ColorMusic] exportStylePackage 失败:', e); return ''; }
+    }
+
+    static clearStylePackages(): number {
+        if (!NativeBridge.isAndroidNative) return 0;
+        try {
+            const out = NativeBridge.reflection?.callStaticMethod(NATIVE_CLASS, 'clearStylePackages', '()I');
+            return Number(out) || 0;
+        } catch (e) { console.error('[ColorMusic] clearStylePackages 失败:', e); return -1; }
+    }
+
+    static openExportDirectory(): void {
+        NativeBridge.call('openExportDirectory', '()V');
+    }
+
+    static chooseAudioExportFormat(cb: (format: 'wav' | 'mp3' | '') => void): void {
+        if (!NativeBridge.isAndroidNative) { cb(''); return; }
+        const requestId = `audio_format_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+        NativeBridge.audioFormatCallbacks.set(requestId, cb);
+        NativeBridge.call('chooseAudioExportFormat', '(Ljava/lang/String;)V', requestId);
+    }
+
+    static exportAudio(path: string, name: string, format: 'wav' | 'mp3'): string {
+        if (!NativeBridge.isAndroidNative) return '';
+        const ref = NativeBridge.reflection;
+        try {
+            const out = ref?.callStaticMethod(NATIVE_CLASS, 'exportAudio', '(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;', path, name, format);
+            return typeof out === 'string' ? out : String(out ?? '');
+        } catch (e) { console.error('[ColorMusic] exportAudio 失败:', e); return ''; }
+    }
+
+    static consumeDebugPanel(): string {
+        if (!NativeBridge.isAndroidNative) return '';
+        try {
+            const out = NativeBridge.reflection?.callStaticMethod(NATIVE_CLASS, 'consumeDebugPanel', '()Ljava/lang/String;');
+            return typeof out === 'string' ? out : '';
+        } catch (e) { return ''; }
     }
 
     /** 原生合成器是否已就绪（原生侧在 AudioSynth 启动后置 true）。 */
@@ -133,10 +236,43 @@ export class NativeBridge {
         NativeBridge.call('setMaxVoices', '(I)V', Math.max(1, Math.min(16, Math.round(n))));
     }
 
-    /** 设置通道波表（0=R、1=G、2=B），wave 为长度 ≤256 的浮点数组（JSON 传输）。 */
-    static setWavetable(channel: number, wave: number[]): void {
+    /** 录制原生合成器最终输出，返回 WAV 文件路径。 */
+    static startRecording(fileName: string): string {
+        if (!NativeBridge.isAndroidNative) return '';
+        const ref = NativeBridge.reflection;
+        if (!ref?.callStaticMethod) return '';
+        try {
+            const out = ref.callStaticMethod(NATIVE_CLASS, 'startRecording', '(Ljava/lang/String;)Ljava/lang/String;', fileName);
+            return typeof out === 'string' ? out : String(out ?? '');
+        } catch (e) { console.error('[ColorMusic] startRecording 失败:', e); return ''; }
+    }
+
+    /** 停止录音并完成 WAV 文件头。 */
+    static stopRecording(): string {
+        if (!NativeBridge.isAndroidNative) return '';
+        const ref = NativeBridge.reflection;
+        if (!ref?.callStaticMethod) return '';
+        try {
+            const out = ref.callStaticMethod(NATIVE_CLASS, 'stopRecording', '()Ljava/lang/String;');
+            return typeof out === 'string' ? out : String(out ?? '');
+        } catch (e) { console.error('[ColorMusic] stopRecording 失败:', e); return ''; }
+    }
+
+    /** 同时播放多个录音片段，用于混音/循环播放。 */
+    static playAudioFiles(clips: Array<string | { path: string; volume: number; trimStart: number; trimEnd: number; duration: number }>, loop: boolean): void {
+        NativeBridge.call('playAudioFiles', '(Ljava/lang/String;Z)V', JSON.stringify(clips), !!loop);
+    }
+
+    /** 停止所有录音片段播放。 */
+    static stopAudioFiles(): void {
+        NativeBridge.call('stopAudioFiles', '()V');
+    }
+
+    /** 设置通道单周期波表及其周期倍率（0=R、1=G、2=B）。 */
+    static setWavetable(channel: number, wave: number[], cycles = 1): void {
         const json = JSON.stringify(wave);
-        NativeBridge.call('setWavetable', '(ILjava/lang/String;)V', channel, json);
+        NativeBridge.call('setWavetable', '(ILjava/lang/String;F)V', channel, json,
+            Math.max(1, Math.min(8, cycles)));
     }
 
     /** 设置 8 个效果器插件槽位（JSON 字符串，见 Effects.fxSlotsToJson）。 */
@@ -593,37 +729,37 @@ export class WebSynth {
             this.sustainedMap.set(touchId, { graph, stopNodes });
         } else {
             // 原位更新
-            const g = existing.graph;
-            g.filter.frequency.setTargetAtTime(t.cutoff, t0, 0.05);
-            g.shaper.curve = this.makeTanhCurve(t.drive);
-            g.strGain.gain.setTargetAtTime((r / 255) * t.sumNorm, t0, 0.02);
-            g.fluteGain.gain.setTargetAtTime((g / 255) * t.sumNorm, t0, 0.02);
-            g.bellGain.gain.setTargetAtTime((b / 255) * t.sumNorm, t0, 0.02);
-            g.sub.frequency.setTargetAtTime(freq * 0.5, t0, 0.02);
-            g.s1.frequency.setTargetAtTime(freq, t0, 0.02);
-            g.s2.frequency.setTargetAtTime(freq * 2, t0, 0.02);
-            g.s3.frequency.setTargetAtTime(freq * 3, t0, 0.02);
-            g.s4.frequency.setTargetAtTime(freq * 4, t0, 0.02);
-            g.f1.frequency.setTargetAtTime(freq, t0, 0.02);
-            g.f2.frequency.setTargetAtTime(freq * 2, t0, 0.02);
+            const graph = existing.graph;
+            graph.filter.frequency.setTargetAtTime(t.cutoff, t0, 0.05);
+            graph.shaper.curve = this.makeTanhCurve(t.drive);
+            graph.strGain.gain.setTargetAtTime((r / 255) * t.sumNorm, t0, 0.02);
+            graph.fluteGain.gain.setTargetAtTime((g / 255) * t.sumNorm, t0, 0.02);
+            graph.bellGain.gain.setTargetAtTime((b / 255) * t.sumNorm, t0, 0.02);
+            graph.sub.frequency.setTargetAtTime(freq * 0.5, t0, 0.02);
+            graph.s1.frequency.setTargetAtTime(freq, t0, 0.02);
+            graph.s2.frequency.setTargetAtTime(freq * 2, t0, 0.02);
+            graph.s3.frequency.setTargetAtTime(freq * 3, t0, 0.02);
+            graph.s4.frequency.setTargetAtTime(freq * 4, t0, 0.02);
+            graph.f1.frequency.setTargetAtTime(freq, t0, 0.02);
+            graph.f2.frequency.setTargetAtTime(freq * 2, t0, 0.02);
             [1, 2, 3].forEach((mult, i) => {
-                g.bellOscs[i]?.frequency.setTargetAtTime(freq * mult, t0, 0.02);
+                graph.bellOscs[i]?.frequency.setTargetAtTime(freq * mult, t0, 0.02);
             });
-            g.bus.gain.cancelScheduledValues(t0);
-            g.bus.gain.setTargetAtTime(amp * this.pitchLoudnessGain(freq) * (1 - t.drumWeight), t0, 0.05);
+            graph.bus.gain.cancelScheduledValues(t0);
+            graph.bus.gain.setTargetAtTime(amp * this.pitchLoudnessGain(freq) * (1 - t.drumWeight), t0, 0.05);
             // 回声量（alpha 变化时）
-            if (g.echoMix && g.echo) {
-                g.echoMix.gain.setTargetAtTime(t.reverbMix * 0.45, t0, 0.05);
+            if (graph.echoMix && graph.echo) {
+                graph.echoMix.gain.setTargetAtTime(t.reverbMix * 0.45, t0, 0.05);
             }
             // 特效频率随颜色/音高更新
-            if (g.psyLfo) g.psyLfo.frequency.setTargetAtTime(10 * (1 - t.psyRatio) + 0.5, t0, 0.05);
-            if (g.glLfo) g.glLfo.frequency.setTargetAtTime(8 + 30 * t.glitchRatio, t0, 0.05);
-            if (g.reeseOsc) g.reeseOsc.frequency.setTargetAtTime(freq * 1.012, t0, 0.02);
-            if (g.pulseOsc) g.pulseOsc.frequency.setTargetAtTime(freq * 0.5, t0, 0.02);
-            if (g.laserOsc) {
-                g.laserOsc.frequency.cancelScheduledValues(t0);
-                g.laserOsc.frequency.setValueAtTime(freq * 2.6, t0);
-                g.laserOsc.frequency.exponentialRampToValueAtTime(Math.max(20, freq), t0 + 0.09);
+            if (graph.psyLfo) graph.psyLfo.frequency.setTargetAtTime(10 * (1 - t.psyRatio) + 0.5, t0, 0.05);
+            if (graph.glLfo) graph.glLfo.frequency.setTargetAtTime(8 + 30 * t.glitchRatio, t0, 0.05);
+            if (graph.reeseOsc) graph.reeseOsc.frequency.setTargetAtTime(freq * 1.012, t0, 0.02);
+            if (graph.pulseOsc) graph.pulseOsc.frequency.setTargetAtTime(freq * 0.5, t0, 0.02);
+            if (graph.laserOsc) {
+                graph.laserOsc.frequency.cancelScheduledValues(t0);
+                graph.laserOsc.frequency.setValueAtTime(freq * 2.6, t0);
+                graph.laserOsc.frequency.exponentialRampToValueAtTime(Math.max(20, freq), t0 + 0.09);
             }
         }
     }
