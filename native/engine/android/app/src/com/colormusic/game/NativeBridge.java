@@ -68,6 +68,7 @@ public class NativeBridge {
     /** 由 AppActivity.onCreate 调用。 */
     public static void init(Activity activity) {
         sActivity = activity;
+        sSynth.loadDrumSamples(activity.getAssets());
         sSynth.start();
         evalToJs("globalThis.__colormusic_synthReady = true;");
     }
@@ -516,6 +517,11 @@ public class NativeBridge {
     /** 设置黑鼓/白鼓元素 id（808 鼓组）。 */
     public static void setDrumIds(String black, String white) {
         AudioSynth.setDrumIds(black, white);
+    }
+
+    /** 设置 RGB 通道的鼓采样；id=none 时恢复该通道波表合成。 */
+    public static void setChannelDrum(int channel, String id, float volume, float speed) {
+        AudioSynth.setChannelDrum(channel, id, volume, speed);
     }
 
     /** 保存启动幕布 JPEG（base64）到应用缓存目录，返回文件绝对路径；失败返回空串。 */

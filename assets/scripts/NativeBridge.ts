@@ -290,6 +290,11 @@ export class NativeBridge {
         NativeBridge.call('setDrumIds', '(Ljava/lang/String;Ljava/lang/String;)V', black, white);
     }
 
+    static setChannelDrum(channel: number, id: string, volume: number, speed: number): void {
+        NativeBridge.call('setChannelDrum', '(ILjava/lang/String;FF)V', Math.max(0, Math.min(2, Math.round(channel))), id,
+            Math.max(0, Math.min(1.25, volume)), Math.max(.5, Math.min(2, speed)));
+    }
+
     /** 保存启动幕布图片（base64 JPEG）到应用缓存目录，返回文件绝对路径；非原生/失败返回空串。 */
     static saveSplashImage(b64: string): string {
         if (!NativeBridge.isAndroidNative) return '';
@@ -347,6 +352,7 @@ interface SynthGraph {
 export class WebSynth {
     private ctx: AudioContext | null = null;
     private master: GainNode | null = null;
+    private limiter: DynamicsCompressorNode | null = null;
     /** 多指持续音：touchId → 持续音符图 */
     private sustainedMap = new Map<number, { graph: SynthGraph; stopNodes: (stopAt: number) => void }>();
 
@@ -362,7 +368,14 @@ export class WebSynth {
         this.ctx = new AC();
         this.master = this.ctx.createGain();
         this.master.gain.value = 0.5;
-        this.master.connect(this.ctx.destination);
+        this.limiter = this.ctx.createDynamicsCompressor();
+        this.limiter.threshold.value = -6;
+        this.limiter.knee.value = 6;
+        this.limiter.ratio.value = 16;
+        this.limiter.attack.value = 0.003;
+        this.limiter.release.value = 0.15;
+        this.master.connect(this.limiter);
+        this.limiter.connect(this.ctx.destination);
     }
 
     private makeNoise(): AudioBufferSourceNode {

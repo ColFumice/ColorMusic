@@ -4,7 +4,7 @@ Neuro（demo） is an interactive image-to-sound instrument for Android. Choose 
 
 ## Release
 
-- Current release: **1.3**
+- Current release: **1.4**
 - Platform: **Android only**
 - Resolution: **automatically adapted**; tested on `2944 x 1840` tablets and `2800 x 1260` phones
 - Recommended architecture: `arm64-v8a`
@@ -16,8 +16,10 @@ The first launch defaults to **English**. Use the flag button in the top-right m
 
 - Position-aware performance: horizontal position controls pitch and vertical position controls volume.
 - RGB-driven timbre synthesis with independent R/G/B wavetable editing.
+- A 21-sample drum library covering TR-808, TR-909, TR-606 / RD-6, acoustic, Boom-Bap, Trap, and Lo-fi kits.
+- Per-channel drum waveform preview with real-time volume and playback-speed shaping through the existing effect chains.
 - Touch, hold, multi-touch, and slide performance with continuous pitch updates.
-- Configurable grid with pitch/volume rulers, colors, opacity, density, and edge gestures.
+- Configurable grid with pitch/volume rulers, colors, opacity, density, edge gestures, minimum line visibility, and adaptive ruler typography.
 - Per-channel global effect chains plus four final output effect slots.
 - Built-in presets, random generation, undo/reset, calibration, and an in-app bilingual guide.
 - Responsive landscape and portrait layouts that preserve button and text proportions.
@@ -25,6 +27,7 @@ The first launch defaults to **English**. Use the flag button in the top-right m
 - Recording, one-shot and loop playback, up to 13 mixer clips, trim handles, volume control, WAV export, and Android MP3 export.
 - Style and style-flow management with preview, rename, clone, delete, import, export, and timed transitions.
 - Automatic resolution-aware landscape UI spacing and typography.
+- An immersive UI lock that leaves only the performance grid and unlock control visible.
 
 ## Requirements
 
@@ -79,7 +82,7 @@ Install it on a USB-debugging Android device with:
 
 ADB is optional. You can also install the release package directly:
 
-1. Download `Neuro-demo-1.3-arm64-v8a.apk` from the [v1.3 release](https://github.com/ColFumice/ColorMusic/releases/tag/v1.3) on the Android device, or transfer the APK to the device over USB, cloud storage, or a messaging app.
+1. Download `Neuro-demo-1.4-arm64-v8a.apk` from the [v1.4 release](https://github.com/ColFumice/ColorMusic/releases/tag/v1.4) on the Android device, or transfer the APK to the device over USB, cloud storage, or a messaging app.
 2. Open the APK in the device's file manager and confirm **Install**.
 3. If Android blocks the installation, enable **Allow from this source** for the file manager or browser when prompted, then retry.
 
@@ -90,10 +93,12 @@ The package is signed as a debug APK for this release build. Android may ask you
 ```text
 assets/scripts/GameManager.ts       Main UI, touch mapping, image performance
 assets/scripts/NativeBridge.ts      JS/native bridge and WebAudio fallback
+assets/scripts/DrumLibrary.ts       Drum-kit catalog and waveform metadata
 assets/scripts/SynthMapping.ts      Position and color to sound mapping
 assets/scripts/GridSettings.ts      Grid configuration UI and persistence
 assets/scripts/FxUI.ts              Wavetable and effect-chain UI
 native/engine/android/app/src/...   Android activity, bridge, and AudioTrack synth
+native/engine/android/app/drum-assets Bundled redistributable drum samples
 .tooling/build-android.json         Reproducible Android build configuration
 ```
 
@@ -107,7 +112,7 @@ native/engine/android/app/src/...   Android activity, bridge, and AudioTrack syn
 
 ## Versioning
 
-The repository publishes releases **1.0**, **1.1**, **1.2**, and **1.3**. Releases 1.0 and 1.1 are preserved as the APK archives supplied for those versions; active source documentation follows the current 1.3 tree.
+The repository publishes releases **1.0**, **1.1**, **1.2**, **1.3**, and **1.4**. Releases 1.0 and 1.1 are preserved as the APK archives supplied for those versions; active source documentation follows the current 1.4 tree.
 
 ## License
 

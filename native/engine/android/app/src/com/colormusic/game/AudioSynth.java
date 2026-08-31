@@ -1,5 +1,6 @@
 package com.colormusic.game;
 
+import android.content.res.AssetManager;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioManager;
@@ -11,9 +12,14 @@ import android.util.Log;
 import java.util.ArrayList;
 import java.util.List;
 import java.io.BufferedOutputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.InputStream;
 import java.io.RandomAccessFile;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
  * AudioSynth —— 实时音频合成器（方案 A：AudioTrack 流式输出，无需第三方库）。
@@ -44,6 +50,12 @@ public class AudioSynth {
     private static final int MIN_TAP_SAMPLES = Math.max(1, SAMPLE_RATE * 12 / 1000);
     /** 末端使用约 8ms 的平滑窗，保证最后一个 PCM 采样精确回到零。 */
     private static final int DECLICK_SAMPLES = Math.max(2, SAMPLE_RATE * 8 / 1000);
+    /** 复音增加时平滑预留峰值余量，避免同相波形叠加后进入非线性失真。 */
+    private static final float MIX_GAIN_ATTACK = (float) (1.0 - Math.exp(-1.0 / (0.006 * SAMPLE_RATE)));
+    private static final float MIX_GAIN_RELEASE = (float) (1.0 - Math.exp(-1.0 / (0.150 * SAMPLE_RATE)));
+    private static final float LIMITER_CEILING = 0.92f;
+    private static final float LIMITER_RELEASE_PER_BLOCK =
+            (float) (1.0 - Math.exp(-CHUNK / (0.120 * SAMPLE_RATE)));
     /** 波表长度（单周期采样点数）。 */
     public static final int WAVE_N = 256;
 
@@ -66,6 +78,39 @@ public class AudioSynth {
     /** 三个通道的波表状态（0=R弦乐、1=G笛、2=B钢琴/铃）。 */
     private static volatile WavetableState[] wavetableStates = new WavetableState[3];
 
+    private static final class DrumSample {
+        final float[] samples;
+        final int sampleRate;
+        DrumSample(float[] samples, int sampleRate) {
+            this.samples = samples;
+            this.sampleRate = sampleRate;
+        }
+    }
+
+    private static final class ChannelDrumState {
+        final String id;
+        final float volume;
+        final float speed;
+        ChannelDrumState(String id, float volume, float speed) {
+            this.id = id;
+            this.volume = volume;
+            this.speed = speed;
+        }
+        boolean enabled() { return id != null && !"none".equals(id); }
+    }
+
+    private static volatile Map<String, DrumSample> drumSamples = Collections.emptyMap();
+    private static volatile ChannelDrumState[] channelDrumStates = new ChannelDrumState[] {
+            new ChannelDrumState("none", 1f, 1f), new ChannelDrumState("none", 1f, 1f),
+            new ChannelDrumState("none", 1f, 1f)
+    };
+    private static final String[] DRUM_SAMPLE_IDS = new String[] {
+            "tr808_kick", "tr808_snare", "tr808_hat", "tr909_kick", "tr909_snare", "tr909_hat",
+            "tr606_kick", "tr606_snare", "tr606_hat", "acoustic_kick", "acoustic_snare", "acoustic_hat",
+            "boombap_kick", "boombap_snare", "boombap_clap", "trap_kick", "trap_snare", "trap_hat",
+            "lofi_kick", "lofi_snare", "lofi_hat"
+    };
+
     static {
         for (int ch = 0; ch < 3; ch++) {
             float[] samples = new float[WAVE_N];
@@ -87,6 +132,100 @@ public class AudioSynth {
         next[channel] = new WavetableState(row, safeCycles);
         wavetableStates = next;
         Log.i(TAG, "setWavetable ch=" + channel + " n=" + n + " cycles=" + safeCycles);
+    }
+
+    public static void setChannelDrum(int channel, String id, float volume, float speed) {
+        if (channel < 0 || channel > 2) return;
+        String safeId = id == null ? "none" : id;
+        float safeVolume = Float.isNaN(volume) ? 1f : Math.max(0f, Math.min(1.25f, volume));
+        float safeSpeed = Float.isNaN(speed) ? 1f : Math.max(.5f, Math.min(2f, speed));
+        ChannelDrumState[] next = channelDrumStates.clone();
+        next[channel] = new ChannelDrumState(safeId, safeVolume, safeSpeed);
+        channelDrumStates = next;
+        Log.i(TAG, "setChannelDrum ch=" + channel + " id=" + safeId + " volume=" + safeVolume + " speed=" + safeSpeed);
+    }
+
+    /** Decode bundled one-shot WAV assets before the real-time audio thread starts. */
+    public void loadDrumSamples(AssetManager assets) {
+        if (assets == null || !drumSamples.isEmpty()) return;
+        Map<String, DrumSample> loaded = new HashMap<>();
+        for (String id : DRUM_SAMPLE_IDS) {
+            try (InputStream in = assets.open("drums/" + id + ".wav")) {
+                ByteArrayOutputStream out = new ByteArrayOutputStream();
+                byte[] block = new byte[16384];
+                int read;
+                while ((read = in.read(block)) >= 0) if (read > 0) out.write(block, 0, read);
+                DrumSample sample = decodeWav(out.toByteArray());
+                if (sample != null) loaded.put(id, sample);
+            } catch (Exception e) {
+                Log.e(TAG, "Unable to load drum sample " + id, e);
+            }
+        }
+        drumSamples = Collections.unmodifiableMap(loaded);
+        Log.i(TAG, "Loaded drum samples: " + loaded.size() + "/" + DRUM_SAMPLE_IDS.length);
+    }
+
+    private static DrumSample decodeWav(byte[] bytes) {
+        if (bytes == null || bytes.length < 44 || le32(bytes, 0) != 0x46464952 || le32(bytes, 8) != 0x45564157) return null;
+        int format = 1, channels = 1, sourceRate = SAMPLE_RATE, bits = 16, dataOffset = -1, dataSize = 0;
+        int offset = 12;
+        while (offset + 8 <= bytes.length) {
+            int chunkId = le32(bytes, offset);
+            int chunkSize = le32(bytes, offset + 4);
+            int body = offset + 8;
+            if (chunkSize < 0 || body + chunkSize > bytes.length) break;
+            if (chunkId == 0x20746d66 && chunkSize >= 16) {
+                format = le16(bytes, body); channels = Math.max(1, le16(bytes, body + 2));
+                sourceRate = Math.max(8000, le32(bytes, body + 4)); bits = le16(bytes, body + 14);
+            } else if (chunkId == 0x61746164) {
+                dataOffset = body; dataSize = chunkSize;
+            }
+            offset = body + chunkSize + (chunkSize & 1);
+        }
+        int bytesPerSample = Math.max(1, bits / 8);
+        int frameBytes = bytesPerSample * channels;
+        if (dataOffset < 0 || dataSize < frameBytes || (format != 1 && format != 3)) return null;
+        int frames = dataSize / frameBytes;
+        float[] mono = new float[frames];
+        for (int frame = 0; frame < frames; frame++) {
+            float sum = 0f;
+            for (int channel = 0; channel < channels; channel++) {
+                int p = dataOffset + frame * frameBytes + channel * bytesPerSample;
+                float value;
+                if (format == 3 && bits == 32) value = Float.intBitsToFloat(le32(bytes, p));
+                else if (bits == 8) value = ((bytes[p] & 255) - 128) / 128f;
+                else if (bits == 16) value = (short) le16(bytes, p) / 32768f;
+                else if (bits == 24) {
+                    int raw = (bytes[p] & 255) | ((bytes[p + 1] & 255) << 8) | ((bytes[p + 2] & 255) << 16);
+                    if ((raw & 0x800000) != 0) raw |= 0xff000000;
+                    value = raw / 8388608f;
+                } else if (bits == 32) value = le32(bytes, p) / 2147483648f;
+                else return null;
+                sum += value;
+            }
+            mono[frame] = Math.max(-1f, Math.min(1f, sum / channels));
+        }
+        return new DrumSample(mono, sourceRate);
+    }
+
+    private static int le16(byte[] bytes, int offset) {
+        return (bytes[offset] & 255) | ((bytes[offset + 1] & 255) << 8);
+    }
+
+    private static int le32(byte[] bytes, int offset) {
+        return (bytes[offset] & 255) | ((bytes[offset + 1] & 255) << 8)
+                | ((bytes[offset + 2] & 255) << 16) | ((bytes[offset + 3] & 255) << 24);
+    }
+
+    private static float oneShot(String id, int elapsed, float speed) {
+        DrumSample sample = drumSamples.get(id);
+        if (sample == null || sample.samples.length == 0) return 0f;
+        double position = elapsed * Math.max(.5f, Math.min(2f, speed)) * sample.sampleRate / SAMPLE_RATE;
+        int i0 = (int) position;
+        if (i0 < 0 || i0 >= sample.samples.length) return 0f;
+        int i1 = Math.min(sample.samples.length - 1, i0 + 1);
+        float fraction = (float) (position - i0);
+        return sample.samples[i0] + (sample.samples[i1] - sample.samples[i0]) * fraction;
     }
 
     /** 波表读取：相位 0~1 → 波形采样（线性插值）。 */
@@ -154,9 +293,9 @@ public class AudioSynth {
     private static volatile FxState[] outputFxSlots;
     private static volatile int outputFxVersion = 1;
 
-    /** 黑鼓（RGB 全 <55）/ 白鼓（RGB 全 >200）的元素 id（808 鼓组）。 */
-    private static volatile String drumBlack = "kick";
-    private static volatile String drumWhite = "snare";
+    /** 黑鼓（RGB 全 <55）/ 白鼓（RGB 全 >200）的采样 id。 */
+    private static volatile String drumBlack = "tr808_kick";
+    private static volatile String drumWhite = "tr808_snare";
 
     /** 设置黑鼓/白鼓元素（808 鼓组：kick/snare/clap/hihat/tom/maracas）。 */
     public static void setDrumIds(String black, String white) {
@@ -279,6 +418,8 @@ public class AudioSynth {
     private final Voice.FxChain outputChain = new Voice.FxChain();
     private int appliedOutputFxVersion = 0;
     private long outputSampleClock = 0;
+    private float voiceBusGain = 1f;
+    private float outputLimiterGain = 1f;
     private final Object recordingLock = new Object();
     private BufferedOutputStream recordingStream;
     private File recordingFile;
@@ -296,6 +437,8 @@ public class AudioSynth {
         outputChain.setFx(new Voice.ActiveFx[0]);
         appliedOutputFxVersion = 0;
         outputSampleClock = 0;
+        voiceBusGain = 1f;
+        outputLimiterGain = 1f;
         try {
             track = createTrack();
             track.play();
@@ -338,6 +481,7 @@ public class AudioSynth {
         if (!running) return;
         Voice v = new Voice(r, g, b, alpha, freq, volume, durationMs, false);
         synchronized (voiceLock) {
+            dampReleasedRetrigger(freq);
             if (activeVoiceCount() >= maxVoices) {
                 stealOldest();
             }
@@ -354,6 +498,7 @@ public class AudioSynth {
                 v.updateParams(r, g, b, alpha, freq, volume);
                 return;
             }
+            dampReleasedRetrigger(freq);
             if (activeVoiceCount() >= maxVoices) {
                 stealOldest();
             }
@@ -470,6 +615,13 @@ public class AudioSynth {
         return count;
     }
 
+    /** 同音高再次触发时，只快速收掉已释放/非持续的旧尾音，保留真正的多指持续合奏。 */
+    private void dampReleasedRetrigger(float freq) {
+        for (Voice voice : voices) {
+            if (!voice.isSustained() && voice.matchesPitch(freq)) voice.deClickStop();
+        }
+    }
+
     private void stealOldest() {
         Voice victim = null;
         // 优先让最旧的非持续音退场，再考虑仍被按住的持续音。
@@ -498,25 +650,43 @@ public class AudioSynth {
 
     private void renderLoop() {
         android.os.Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
-        short[] buf = new short[CHUNK];
+        float[] mixBuf = new float[CHUNK];
+        float[] outputBuf = new float[CHUNK];
         short[] stereoBuf = new short[CHUNK * 2];
         while (running) {
+            int mixedVoiceCount;
             synchronized (voiceLock) {
-                java.util.Arrays.fill(buf, (short) 0);
+                java.util.Arrays.fill(mixBuf, 0f);
+                mixedVoiceCount = 0;
                 for (Voice v : voices) {
-                    v.render(buf, CHUNK);
+                    if (v.remaining > 0) mixedVoiceCount++;
+                    v.render(mixBuf, CHUNK);
                 }
                 // 清理已结束的音符（释放后的持续音符 remaining 会递减到 0）
                 voices.removeIf(v -> v.remaining <= 0);
             }
             syncOutputFx();
+            float targetVoiceGain = 1f / (float) Math.sqrt(Math.max(1, mixedVoiceCount));
+            float peak = 0f;
             for (int i = 0; i < CHUNK; i++) {
-                float dry = buf[i] / 32767f;
+                float smoothing = targetVoiceGain < voiceBusGain ? MIX_GAIN_ATTACK : MIX_GAIN_RELEASE;
+                voiceBusGain += (targetVoiceGain - voiceBusGain) * smoothing;
+                float dry = mixBuf[i] * voiceBusGain;
                 float wet = outputChain.process(dry, 440.0 / SAMPLE_RATE, outputSampleClock / (float) SAMPLE_RATE);
-                buf[i] = (short) ((float) Math.tanh(wet) * 0.95f * 32767f);
-                stereoBuf[i * 2] = buf[i];
-                stereoBuf[i * 2 + 1] = buf[i];
+                if (Float.isNaN(wet) || Float.isInfinite(wet)) wet = 0f;
+                outputBuf[i] = wet;
+                peak = Math.max(peak, Math.abs(wet));
                 outputSampleClock++;
+            }
+            float targetLimiterGain = peak > LIMITER_CEILING ? LIMITER_CEILING / peak : 1f;
+            if (targetLimiterGain < outputLimiterGain) outputLimiterGain = targetLimiterGain;
+            else outputLimiterGain += (targetLimiterGain - outputLimiterGain) * LIMITER_RELEASE_PER_BLOCK;
+            for (int i = 0; i < CHUNK; i++) {
+                float sample = outputBuf[i] * outputLimiterGain;
+                sample = Math.max(-LIMITER_CEILING, Math.min(LIMITER_CEILING, sample));
+                short pcm = (short) (sample * 32767f);
+                stereoBuf[i * 2] = pcm;
+                stereoBuf[i * 2 + 1] = pcm;
             }
             writeRecordingChunk(stereoBuf);
             if (track != null) {
@@ -631,6 +801,7 @@ public class AudioSynth {
         private float amp;
         private float pitchGain = 1f;
         private float lowPresence = 0f;
+        private float frequency = 440f;
         private double step;
         private float attack;       // 音头时间（alpha 控制）
         private float release;      // 释放时间
@@ -650,6 +821,11 @@ public class AudioSynth {
 
         boolean isDeClicking() {
             return deClicking;
+        }
+
+        boolean matchesPitch(float otherFrequency) {
+            float scale = Math.max(1f, Math.max(frequency, otherFrequency));
+            return Math.abs(frequency - otherFrequency) / scale < 0.005f;
         }
         private double phase = 0;
         private long noiseState = 0x9E3779B97F4A7C15L; // 噪声 PRNG
@@ -818,6 +994,7 @@ public class AudioSynth {
             vibratoRate = 5f + even * 2f;
 
             amp = Math.min(1f, Math.max(0.001f, volume));
+            frequency = Math.max(1f, freq);
             pitchGain = pitchLoudnessGain(freq);
             lowPresence = lowPitchPresence(freq);
             step = freq / SAMPLE_RATE;
@@ -1055,8 +1232,8 @@ public class AudioSynth {
             remaining = Math.min(remaining, DECLICK_SAMPLES);
         }
 
-        /** 向 buf 中混合本音符的采样。 */
-        void render(short[] buf, int count) {
+        /** 在线性浮点总线上混合本音符，所有声部完成后再统一做峰值管理。 */
+        void render(float[] buf, int count) {
             if (releasePending && elapsed >= MIN_TAP_SAMPLES) beginRelease();
             int n = Math.min(count, remaining);
             for (int i = 0; i < n; i++) {
@@ -1064,13 +1241,17 @@ public class AudioSynth {
                 smoothVoiceMix();
 
                 // 三个声部（各带自己的包络特征；先经各自通道的全局效果器塑形，再按通道增益混合）
-                float string = stringPart(t);
-                float flute = flutePart(t);
-                float bell = bellPart(t);
+                ChannelDrumState[] drumStates = channelDrumStates;
+                ChannelDrumState drumR = drumStates[0], drumG = drumStates[1], drumB = drumStates[2];
+                float string = drumR.enabled() ? oneShot(drumR.id, elapsed, drumR.speed) * drumR.volume : stringPart(t);
+                float flute = drumG.enabled() ? oneShot(drumG.id, elapsed, drumG.speed) * drumG.volume : flutePart(t);
+                float bell = drumB.enabled() ? oneShot(drumB.id, elapsed, drumB.speed) * drumB.volume : bellPart(t);
                 if (Math.max(gStr, targetGStr) > 0.0005f) string = globalFx[0].process(string, step, t);
                 if (Math.max(gFlu, targetGFlu) > 0.0005f) flute = globalFx[1].process(flute, step, t);
                 if (Math.max(gBell, targetGBell) > 0.0005f) bell = globalFx[2].process(bell, step, t);
-                float base = (string * gStr + flute * gFlu + bell * gBell) * sumNorm * pitchGain;
+                float base = (string * gStr * (drumR.enabled() ? 1f : pitchGain)
+                        + flute * gFlu * (drumG.enabled() ? 1f : pitchGain)
+                        + bell * gBell * (drumB.enabled() ? 1f : pitchGain)) * sumNorm;
 
                 // 鼓组：snare/kick 与基础音色按权重叠加（互斥，取大者；黑/白鼓元素可配置）
                 float mixed = base;
@@ -1214,10 +1395,7 @@ public class AudioSynth {
                 }
                 float sample = out * amp * env;
 
-                float mixedSample = buf[i] + sample * 32767f;
-                float x = mixedSample / 32767f;
-                float clipped = (float) Math.tanh(x) * 0.95f;
-                buf[i] = (short) (clipped * 32767f);
+                buf[i] += sample;
 
                 phase += step;
                 vibratoPhase += vibratoRate / SAMPLE_RATE * Math.PI * 2;
@@ -1254,8 +1432,9 @@ public class AudioSynth {
             return (float) Math.sin(2.0 * Math.PI * drumPhase) * decay;
         }
 
-        /** 808 鼓组元素采样（黑/白鼓可选）。 */
+        /** 黑/白像素鼓优先播放素材库采样；旧 id 保留程序化兼容路径。 */
         private float drumSample(String id, float t) {
+            if (drumSamples.containsKey(id)) return oneShot(id, elapsed, 1f);
             switch (id) {
                 case "snare": return snareSound(t);
                 case "clap": {

@@ -10,6 +10,8 @@ import { t } from './I18n';
 export interface DdItem {
     id: string;
     label: string;
+    /** Optional category. Categorized menus render as a compact grouped grid. */
+    group?: string;
 }
 
 const W = 200;
@@ -31,6 +33,15 @@ export class Dropdown {
     private descOf: (id: string) => string;
     private onPick: (id: string) => void;
     private value: string;
+    private readonly grouped: boolean;
+    private listWidth: number;
+    private listHeight: number;
+    private readonly groups: string[];
+    private readonly groupBlocks: Array<{
+        header: Node;
+        headerLabel: Label;
+        rows: Array<{ node: Node; label: Label; bg: Graphics }>;
+    }> = [];
 
     constructor(panel: Node, items: DdItem[], value: string, descOf: (id: string) => string, onPick: (id: string) => void) {
         this.panel = panel;
@@ -38,6 +49,10 @@ export class Dropdown {
         this.descOf = descOf;
         this.onPick = onPick;
         this.value = value;
+        this.groups = Array.from(new Set(items.map((item) => item.group).filter((group): group is string => !!group)));
+        this.grouped = this.groups.length > 0;
+        this.listWidth = this.grouped ? 1080 : W;
+        this.listHeight = this.grouped ? 320 : 12 + ROW_H * items.length + 8;
 
         const chip = new Node('Dd');
         chip.layer = Layers.Enum.UI_2D;
@@ -96,44 +111,73 @@ export class Dropdown {
         // 列表
         const list = new Node('DdList');
         list.layer = Layers.Enum.UI_2D;
-        const listH = 12 + ROW_H * items.length + 8;
-        list.addComponent(UITransform).setContentSize(W, listH);
+        const listH = this.listHeight;
+        list.addComponent(UITransform).setContentSize(this.listWidth, listH);
         list.active = false;
         panel.addChild(list);
         const lbg = list.addComponent(Graphics);
-        lbg.roundRect(-W / 2, -listH / 2, W, listH, 8);
+        lbg.roundRect(-this.listWidth / 2, -listH / 2, this.listWidth, listH, 8);
         lbg.fillColor = new Color(16, 22, 40, 252);
         lbg.fill();
         this.list = list;
-        for (let i = 0; i < items.length; i++) {
+        const makeRow = (item: DdItem, i: number, x: number, y: number, width = W, height = ROW_H) => {
             const row = new Node('Row' + i);
             row.layer = Layers.Enum.UI_2D;
-            row.addComponent(UITransform).setContentSize(W, ROW_H);
-            row.setPosition(0, listH / 2 - 6 - ROW_H * (i + 0.5));
+            row.addComponent(UITransform).setContentSize(width, height);
+            row.setPosition(x, y);
             list.addChild(row);
             const rb = new Node('Bg');
             rb.layer = Layers.Enum.UI_2D;
-            rb.addComponent(UITransform).setContentSize(W, ROW_H);
+            rb.addComponent(UITransform).setContentSize(width, height);
             row.addChild(rb);
             const rg = rb.addComponent(Graphics);
-            rg.roundRect(-W / 2, -ROW_H / 2, W, ROW_H, 6);
+            rg.roundRect(-width / 2, -height / 2, width, height, 6);
             rg.fillColor = new Color(30, 40, 68, 255);
             rg.fill();
             const rt = new Node('Text');
             rt.layer = Layers.Enum.UI_2D;
-            rt.addComponent(UITransform).setContentSize(W, ROW_H);
+            rt.addComponent(UITransform).setContentSize(width, height);
             row.addChild(rt);
             const rl = rt.addComponent(Label);
-            rl.string = t(items[i].label);
-            rl.fontSize = 16;
+            rl.string = t(item.label);
+            rl.fontSize = this.grouped ? 14 : 16;
             rl.isSystemFontUsed = true;
             rl.horizontalAlign = Label.HorizontalAlign.CENTER;
             rl.verticalAlign = Label.VerticalAlign.CENTER;
             rl.overflow = Label.Overflow.SHRINK;
             rl.enableWrapText = false;
             rl.color = new Color(255, 255, 255, 255);
-            const id = items[i].id;
+            const id = item.id;
             row.on(Node.EventType.TOUCH_END, () => this.pick(id), this);
+            return { node: row, label: rl, bg: rg };
+        };
+        if (this.grouped) {
+            let rowIndex = 0;
+            for (let groupIndex = 0; groupIndex < this.groups.length; groupIndex++) {
+                const group = this.groups[groupIndex];
+                const groupItems = items.filter((item) => item.group === group);
+                const header = new Node(`Group${groupIndex}`);
+                header.layer = Layers.Enum.UI_2D;
+                header.addComponent(UITransform).setContentSize(100, 32);
+                list.addChild(header);
+                const headerLabel = header.addComponent(Label);
+                headerLabel.string = t(group);
+                headerLabel.fontSize = 20;
+                headerLabel.isSystemFontUsed = true;
+                headerLabel.horizontalAlign = Label.HorizontalAlign.LEFT;
+                headerLabel.verticalAlign = Label.VerticalAlign.CENTER;
+                headerLabel.color = new Color(140, 185, 240, 255);
+                const rows: Array<{ node: Node; label: Label; bg: Graphics }> = [];
+                for (let itemIndex = 0; itemIndex < groupItems.length; itemIndex++) {
+                    rows.push(makeRow(groupItems[itemIndex], rowIndex++, 0, 0, 100, 38));
+                }
+                this.groupBlocks.push({ header, headerLabel, rows });
+            }
+            this.layoutGrouped(false);
+        } else {
+            for (let i = 0; i < items.length; i++) {
+                makeRow(items[i], i, 0, listH / 2 - 6 - ROW_H * (i + 0.5));
+            }
         }
 
         // 解释：作用/算法说明（无框，固定宽度换行，超出列表宽度自动换行）
@@ -183,7 +227,34 @@ export class Dropdown {
     open() {
         const cp = this.chip.position;
         const panelUt = this.panel.getComponent(UITransform)!;
-        const listH = 12 + ROW_H * this.items.length + 8;
+        if (this.grouped) {
+            const pw = panelUt.contentSize.width;
+            const ph = panelUt.contentSize.height;
+            const portrait = ph > pw;
+            this.layoutGrouped(portrait);
+            const listX = Math.max(-pw / 2 + this.listWidth / 2 + 10,
+                Math.min(pw / 2 - this.listWidth / 2 - 10, 0));
+            this.redrawOverlay(pw, ph);
+            this.list.setPosition(listX, 0);
+            this.list.active = true;
+            this.list.setSiblingIndex(this.panel.children.length - 1);
+            this.shade.active = true;
+            this.shade.setSiblingIndex(this.panel.children.length - 2);
+            const explainW = Math.min(portrait ? 820 : 900, pw - 32);
+            const explainH = 140;
+            this.explain.getComponent(UITransform)!.setContentSize(explainW, explainH);
+            this.explain.getChildByName('Text')!.getComponent(UITransform)!.setContentSize(explainW - 12, explainH - 8);
+            this.explain.getChildByName('Text')!.getComponent(Label)!.string = t(this.descOf(this.value));
+            // Keep the explanation attached to the grouped menu instead of the
+            // panel title; this also leaves a clear strip between both blocks.
+            const explainY = Math.min(ph / 2 - explainH / 2 - 16,
+                this.listHeight / 2 + explainH / 2 + 18);
+            this.explain.setPosition(0, explainY);
+            this.explain.active = true;
+            this.explain.setSiblingIndex(this.panel.children.length - 1);
+            return;
+        }
+        const listH = this.listHeight;
         // 列表尽量在芯片下方；不够则上方
         let ly = cp.y - H / 2 - 4 - listH / 2;
         if (ly - listH / 2 < -panelUt.contentSize.height / 2 + 10) {
@@ -201,18 +272,9 @@ export class Dropdown {
         // the originating slot.
         if (this.items.length >= 12) ly = 0;
         // 重绘遮罩（按面板尺寸，激活后 Graphics 数据丢失）+ 列表底
-        const sg = this.shade.getComponent(Graphics)!;
         const pw = panelUt.contentSize.width;
         const ph = panelUt.contentSize.height;
-        sg.clear();
-        sg.rect(-pw / 2, -ph / 2, pw, ph);
-        sg.fillColor = new Color(0, 0, 0, 160);
-        sg.fill();
-        const lbg = this.list.getComponent(Graphics)!;
-        lbg.clear();
-        lbg.roundRect(-W / 2, -listH / 2, W, listH, 8);
-        lbg.fillColor = new Color(16, 22, 40, 252);
-        lbg.fill();
+        this.redrawOverlay(pw, ph);
 
         this.list.setPosition(cp.x, ly);
         this.list.active = true;
@@ -245,6 +307,58 @@ export class Dropdown {
         this.list.active = false;
         this.shade.active = false;
         this.explain.active = false;
+    }
+
+    private redrawOverlay(width: number, height: number) {
+        const sg = this.shade.getComponent(Graphics)!;
+        sg.clear();
+        sg.rect(-width / 2, -height / 2, width, height);
+        sg.fillColor = new Color(0, 0, 0, 160);
+        sg.fill();
+        const lbg = this.list.getComponent(Graphics)!;
+        lbg.clear();
+        lbg.roundRect(-this.listWidth / 2, -this.listHeight / 2, this.listWidth, this.listHeight, 8);
+        lbg.fillColor = new Color(16, 22, 40, 252);
+        lbg.fill();
+    }
+
+    private layoutGrouped(portrait: boolean) {
+        if (!this.grouped) return;
+        const columns = portrait ? 2 : 4;
+        const blockHeight = portrait ? 160 : 150;
+        this.listWidth = portrait ? 840 : 1080;
+        this.listHeight = Math.ceil(this.groups.length / columns) * blockHeight + 20;
+        this.list.getComponent(UITransform)!.setContentSize(this.listWidth, this.listHeight);
+        const blockWidth = (this.listWidth - 24) / columns;
+        for (let groupIndex = 0; groupIndex < this.groupBlocks.length; groupIndex++) {
+            const block = this.groupBlocks[groupIndex];
+            const column = groupIndex % columns;
+            const blockRow = Math.floor(groupIndex / columns);
+            const x = -this.listWidth / 2 + 12 + blockWidth * (column + .5);
+            const top = this.listHeight / 2 - 10 - blockRow * blockHeight;
+            const contentWidth = blockWidth - 14;
+            block.header.getComponent(UITransform)!.setContentSize(contentWidth, 32);
+            block.header.setPosition(x, top - 16);
+            block.headerLabel.fontSize = portrait ? 21 : 20;
+            for (let itemIndex = 0; itemIndex < block.rows.length; itemIndex++) {
+                const row = block.rows[itemIndex];
+                const rowHeight = portrait ? 40 : 38;
+                row.node.getComponent(UITransform)!.setContentSize(contentWidth, rowHeight);
+                row.node.setPosition(x, top - 52 - itemIndex * (portrait ? 44 : 42));
+                row.node.getChildByName('Bg')!.getComponent(UITransform)!.setContentSize(contentWidth, rowHeight);
+                row.node.getChildByName('Text')!.getComponent(UITransform)!.setContentSize(contentWidth, rowHeight);
+                row.label.fontSize = portrait ? 19 : 18;
+                row.bg.clear();
+                row.bg.roundRect(-contentWidth / 2, -rowHeight / 2, contentWidth, rowHeight, 6);
+                row.bg.fillColor = new Color(30, 40, 68, 255);
+                row.bg.fill();
+            }
+        }
+        const lbg = this.list.getComponent(Graphics)!;
+        lbg.clear();
+        lbg.roundRect(-this.listWidth / 2, -this.listHeight / 2, this.listWidth, this.listHeight, 10);
+        lbg.fillColor = new Color(16, 22, 40, 252);
+        lbg.fill();
     }
 
     /** 供 relayout 在面板大小/方向改变时同步遮罩与解释尺寸（半透明遮罩覆盖面板）。 */

@@ -49,8 +49,11 @@ export const GRID_COLORS: Record<string, Color> = {
     purple: new Color(180, 80, 235, 255),
 };
 
+export const DEFAULT_GRID_COLUMNS = 30;
+export const DEFAULT_GRID_ROWS = 12;
+
 export function defaultGridState(): GridState {
-    const columns = 30, rows = 12;
+    const columns = DEFAULT_GRID_COLUMNS, rows = DEFAULT_GRID_ROWS;
     return {
         visible: true,
         showToneInfo: true,

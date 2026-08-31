@@ -12,21 +12,25 @@
 import {
     _decorator, Component, Node, Sprite, SpriteFrame, UITransform, Button, Label, Graphics,
     Color, Vec3, UIOpacity, assetManager, ImageAsset, Texture2D, game, Game, tween, Tween, EventTouch,
-    Layers, sys, profiler, input, Input, EventAcceleration, Mask, director, EditBox,
+    Layers, sys, profiler, input, Input, EventAcceleration, Mask, director, EditBox, screen,
 } from 'cc';
 import { ImageStore } from './ImageStore';
 import { NativeBridge, WebSynth, PickedImageInfo, JS_SYNTH_READY_FLAG } from './NativeBridge';
 import { buildNoteParams, uvToMidi, midiToName, midiToFreq, colorToneSummary } from './SynthMapping';
 import { FxUI } from './FxUI';
 import {
-    FxSlot, loadFxSlots, saveFxSlots, fxSlotsToJson, PRESET_INST, DRUM_808, presetWaveFor,
+    FxSlot, loadFxSlots, saveFxSlots, fxSlotsToJson, PRESET_INST, presetWaveFor,
     recommendedGlobalFxChain, FX_SLOT_COUNT, newSlot, globalFxIndex, FX_GLOBAL_SLOTS_PER_CHANNEL,
     FX_LIBRARY, fxDefOf, loadOutputFxSlots, saveOutputFxSlots,
 } from './Effects';
 import { Dropdown } from './Dropdown';
 import { SPLASH_B64 } from './SplashData';
-import { GridSettingsUI, GridState, GRID_COLORS, loadGridState, saveGridState, defaultGridState } from './GridSettings';
+import {
+    GridSettingsUI, GridState, GRID_COLORS, loadGridState, saveGridState, defaultGridState,
+    DEFAULT_GRID_COLUMNS, DEFAULT_GRID_ROWS,
+} from './GridSettings';
 import { isEnglish, t, toggleLanguage } from './I18n';
+import { DRUM_CUSTOM_ID, DRUM_NONE_ID, DRUM_PRESETS, DrumPresetDef } from './DrumLibrary';
 
 const { ccclass } = _decorator;
 
@@ -51,6 +55,32 @@ const SLIDE_MIN_DIST = 12;       // 滑音最小移动距离（设计单位）
 const CUSTOM_INST = { id: 'custom', label: '自定义' };
 /** 旋转过渡补间时长（秒），≤2 秒。 */
 const ROT_TWEEN = 1.0;
+/** 低分辨率设备仅放大游戏主界面控件；大分辨率平板保持原尺寸。 */
+const MAIN_UI_SCALE_SHORT_SIDE = 1700;
+const MAIN_UI_MAX_SCALE = 1.35;
+const MAIN_MENU_BUTTON_SIZE = 68;
+const LANGUAGE_BUTTON_SIZE = 34;
+const MENU_LANGUAGE_GAP = 6;
+/** 默认网格线宽及其最细限制；密集网格也至少保留默认粗细的一半。 */
+const DEFAULT_GRID_LINE_WIDTH = 1.6;
+const MIN_GRID_LINE_WIDTH = DEFAULT_GRID_LINE_WIDTH / 2;
+const DEFAULT_GRID_LABEL_FONT_SIZE = 9;
+const MIN_GRID_LABEL_FONT_SIZE = 4;
+const MAX_GRID_LABEL_FONT_SIZE = 24;
+/** 屏幕状态边框约 2mm 的设计坐标圆角。 */
+const SCREEN_EDGE_RADIUS = 16;
+const LEGACY_DRUM_IDS: Record<string, string> = {
+    kick: 'tr808_kick', snare: 'tr808_snare', clap: 'boombap_clap',
+    hihat: 'tr808_hat', tom: 'tr606_kick', maracas: 'lofi_hat',
+};
+
+interface CachedPickedImage {
+    url: string;
+    nativeInfo?: PickedImageInfo;
+}
+
+/** 场景切换不会清空模块状态，用于语言切换后恢复玩家已选择的图片。 */
+let cachedPickedImage: CachedPickedImage | null = null;
 
 interface AudioClipMeta {
     id: string;
@@ -68,7 +98,7 @@ interface StyleSnapshot {
     name: string;
     kind: 'style' | 'flow';
     createdAt: number;
-    waves: { baseWave: number[]; amplitude: number; cycles: number; instId: string }[];
+    waves: { baseWave: number[]; amplitude: number; cycles: number; instId: string; drumId?: string; drumSourceId?: string; drumSpeed?: number }[];
     grid: GridState;
     fxSlots: FxSlot[];
     outputFxSlots: FxSlot[];
@@ -96,7 +126,10 @@ export class GameManager extends Component {
     private playOnceBtn!: Node;
     private playLoopBtn!: Node;
     private styleBtn!: Node;
+    private lockBtn!: Node;
+    private lockIconGfx!: Graphics;
     private consoleButtons: Node[] = [];
+    private uiLocked = false;
     private edgeMode: 'idle' | 'record' | 'play' | 'both' = 'idle';
     private styleTransition = false;
     private isRecording = false;
@@ -140,7 +173,7 @@ export class GameManager extends Component {
     private waveAreas: Array<{
         ch: number; node: Node; gfx: Graphics; transform: UITransform; labelNode: Node;
         points: { x: number; y: number }[]; wave: number[]; baseWave: number[];
-        amplitude: number; cycles: number; ampAxis: Node; waveAxis: Node;
+        amplitude: number; cycles: number; drumSpeed: number; ampAxis: Node; waveAxis: Node;
         ampGfx: Graphics; waveGfx: Graphics;
     }> = [];
     /** 效果器插件槽位 UI（8 槽下拉 + 设置弹窗） */
@@ -149,16 +182,20 @@ export class GameManager extends Component {
     /** 音色预设下拉（R/G/B 各一） */
     private instDds: Dropdown[] = [];
     private instIds: string[] = ['piano', 'flute', 'bell'];
+    /** RGB 通道的鼓采样状态；custom 保留 sourceId 与调节后的音量/速度。 */
+    private drumDds: Dropdown[] = [];
+    private channelDrumIds: string[] = [DRUM_NONE_ID, DRUM_NONE_ID, DRUM_NONE_ID];
+    private channelDrumSourceIds: string[] = ['tr808_kick', 'tr808_snare', 'tr808_hat'];
     /** 撤销栈：记录波形+预设状态快照（绘制/选预设/随机/经典/重置前压栈）。 */
-    private undoStack: { waves: number[][]; baseWaves: number[][]; amplitudes: number[]; cycles: number[]; instIds: string[]; fxSlots: FxSlot[] }[] = [];
+    private undoStack: { waves: number[][]; baseWaves: number[][]; amplitudes: number[]; cycles: number[]; drumSpeeds: number[]; instIds: string[]; drumIds: string[]; drumSourceIds: string[]; fxSlots: FxSlot[] }[] = [];
     /** 波表编辑器“撤回”按钮（左下角）。 */
     private undoBtn: Node | null = null;
     private undoBgGfx: Graphics | null = null;
     /** 黑鼓/白鼓下拉 */
     private blackDd: Dropdown | null = null;
     private whiteDd: Dropdown | null = null;
-    private drumBlackId = 'kick';
-    private drumWhiteId = 'snare';
+    private drumBlackId = 'tr808_kick';
+    private drumWhiteId = 'tr808_snare';
     private waveDrawn = false;
     /** 当前绘制中的触摸 ID（每个区域最多一根手指） */
     private waveTouchIds = new Map<number, number>(); // areaIndex → touchId
@@ -257,6 +294,7 @@ export class GameManager extends Component {
         this.registerNativeCallbacks();
         this.attachTouch();
         this.refreshSynthStatus();
+        this.restoreCachedImage();
         // 启动幕布：全屏放映 Neuro 标志约 1.33s 后淡出进入游戏界面
         this.showSplash();
         const debugPanel = NativeBridge.consumeDebugPanel();
@@ -264,6 +302,7 @@ export class GameManager extends Component {
             if (debugPanel === 'mixer') this.openAudioPanel();
             else if (debugPanel === 'style') this.openStylePanel();
             else if (debugPanel === 'flow') { if (!this.styles.some((s) => s.kind === 'style')) this.saveCurrentStyle(); this.openStylePanel(); this.scheduleOnce(() => this.openStyleFlowEditor(), .15); }
+            else if (debugPanel === 'wave') this.openWavePanel();
         }, 1.7);
 
         // 陀螺仪：横竖屏判定（锁横屏的 Activity 下传感器仍能反映物理姿态）
@@ -401,6 +440,7 @@ export class GameManager extends Component {
         this.buildMainMenuButton();
         this.buildLanguageButton();
         this.buildConsoleButtons();
+        this.buildLockButton();
         for (const button of [this.pickBtn, this.testBtn, this.calibBtn, this.guideBtn, this.waveBtn]) {
             button.getComponent(UIOpacity)!.opacity = 0;
             button.setScale(.001, .001, 1);
@@ -422,7 +462,7 @@ export class GameManager extends Component {
         info.setPosition(-640, 425);
         root.addChild(info);
         this.infoNode = info;
-        this.infoNode.active = this.gridState.showToneInfo;
+        this.infoNode.active = this.gridState.showToneInfo && !this.uiLocked;
     }
 
     /** 右上角五个常驻圆形控制台按钮：录音、混音、单次、循环、样式。 */
@@ -442,6 +482,75 @@ export class GameManager extends Component {
         styleGlyph.lineWidth = 1.5; styleGlyph.strokeColor = new Color(255, 255, 255, 255);
         for (const y of [-6, 0, 6]) { styleGlyph.moveTo(-7, y); styleGlyph.lineTo(7, y); styleGlyph.stroke(); }
         this.consoleButtons = [this.recordBtn, this.mixerBtn, this.playOnceBtn, this.playLoopBtn, this.styleBtn];
+    }
+
+    /** 沉浸模式锁：位于控制台最右按钮和菜单按钮的正中间。 */
+    private buildLockButton() {
+        const node = new Node('ImmersiveLockButton');
+        node.layer = Layers.Enum.UI_2D;
+        node.addComponent(UITransform).setContentSize(34, 34);
+        const button = node.addComponent(Button);
+        button.transition = Button.Transition.SCALE;
+        button.zoomScale = 1.08;
+        const bg = node.addComponent(Graphics);
+        bg.circle(0, 0, 15.5); bg.fillColor = new Color(0, 0, 0, 255); bg.fill();
+        node.addComponent(UIOpacity).opacity = 204;
+        const icon = new Node('LockIcon');
+        icon.layer = Layers.Enum.UI_2D;
+        icon.addComponent(UITransform).setContentSize(24, 24);
+        this.lockIconGfx = icon.addComponent(Graphics);
+        node.addChild(icon);
+        this.uiRoot.addChild(node);
+        node.on(Button.EventType.CLICK, () => this.setUiLocked(!this.uiLocked), this);
+        this.lockBtn = node;
+        this.redrawLockIcon();
+    }
+
+    private redrawLockIcon() {
+        if (!this.lockIconGfx) return;
+        const g = this.lockIconGfx;
+        g.clear();
+        g.lineWidth = 1.8;
+        g.strokeColor = new Color(255, 255, 255, 255);
+        g.roundRect(-7, -8, 14, 12, 2);
+        g.stroke();
+        if (this.uiLocked) {
+            g.moveTo(-5, 4); g.lineTo(-5, 7);
+            g.bezierCurveTo(-5, 12, 5, 12, 5, 7);
+            g.lineTo(5, 4); g.stroke();
+        } else {
+            g.moveTo(-5, 4); g.lineTo(-3, 9);
+            g.bezierCurveTo(-1, 13, 7, 11, 7, 6); g.stroke();
+        }
+    }
+
+    private setUiLocked(locked: boolean) {
+        this.uiLocked = locked;
+        this.settingsMenu.active = false;
+        this.mainMenuOpen = false;
+        const menuControls = [this.pickBtn, this.testBtn, this.calibBtn, this.guideBtn, this.waveBtn];
+        for (const node of menuControls) {
+            tween(node).stop();
+            node.active = true;
+            node.setScale(.001, .001, 1);
+            const opacity = node.getComponent(UIOpacity);
+            if (opacity) { tween(opacity).stop(); opacity.opacity = 0; }
+            const button = node.getComponent(Button);
+            if (button) button.interactable = !locked;
+        }
+        for (const node of [this.mainMenuBtn, this.languageBtn, ...this.consoleButtons]) {
+            node.active = true;
+            const opacity = node.getComponent(UIOpacity);
+            if (opacity) opacity.opacity = locked ? 0 : 204;
+            const button = node.getComponent(Button);
+            if (button) button.interactable = !locked;
+        }
+        this.placeholderLabelNode.active = !locked;
+        if (locked) this.infoNode.active = false;
+        else this.refreshInfoVisibility();
+        this.redrawLockIcon();
+        this.applyRotation(this.currentTarget, false);
+        this.lockBtn.setSiblingIndex(this.uiRoot.children.length - 1);
     }
 
     private makeConsoleButton(name: string, glyph: string, cb: () => void, glyphColor: Color): Node {
@@ -470,7 +579,7 @@ export class GameManager extends Component {
         this.placeholderGfx.fillColor = new Color(11, 16, 30, 255);
         this.placeholderGfx.fill();
         // 播放区边界（沿节点尺寸，视觉提示可点击区）
-        this.placeholderGfx.roundRect(-w / 2, -h / 2, w, h, 18);
+        this.placeholderGfx.roundRect(-w / 2, -h / 2, w, h, SCREEN_EDGE_RADIUS);
         this.placeholderGfx.lineWidth = 2;
         this.placeholderGfx.strokeColor = new Color(90, 100, 130, 255);
         this.placeholderGfx.stroke();
@@ -551,16 +660,16 @@ export class GameManager extends Component {
     private buildMainMenuButton() {
         const menu = new Node('MainMenuButton');
         menu.layer = Layers.Enum.UI_2D;
-        menu.addComponent(UITransform).setContentSize(34, 34);
+        menu.addComponent(UITransform).setContentSize(MAIN_MENU_BUTTON_SIZE, MAIN_MENU_BUTTON_SIZE);
         const button = menu.addComponent(Button);
         button.transition = Button.Transition.SCALE;
         button.zoomScale = 1.08;
         const g = menu.addComponent(Graphics);
-        g.circle(0, 0, 15.5);
+        g.circle(0, 0, 31);
         g.fillColor = new Color(0, 0, 0, 245); g.fill();
-        g.lineWidth = 1.5; g.strokeColor = new Color(255, 255, 255, 255); g.stroke();
+        g.lineWidth = 2.5; g.strokeColor = new Color(255, 255, 255, 255); g.stroke();
         menu.addComponent(UIOpacity).opacity = 204;
-        const labelNode = this.makeLabel('MainMenuGlyph', '∏', 17, 20, new Color(255, 255, 255, 255), 28, 28);
+        const labelNode = this.makeLabel('MainMenuGlyph', '∏', 34, 40, new Color(255, 255, 255, 255), 56, 56);
         menu.addChild(labelNode);
         this.uiRoot.addChild(menu);
         menu.on(Button.EventType.CLICK, () => this.toggleMainMenu(), this);
@@ -600,6 +709,7 @@ export class GameManager extends Component {
         borderGfx.strokeColor = new Color(255, 255, 255, 128);
         borderGfx.stroke();
         buttonNode.addChild(border);
+        buttonNode.addComponent(UIOpacity).opacity = 204;
 
         buttonNode.on(Button.EventType.CLICK, () => {
             for (const id of this.activeTouches.keys()) {
@@ -667,17 +777,18 @@ export class GameManager extends Component {
         this.mainMenuOpen = true;
         this.settingsMenu.active = false;
         const controls = [this.pickBtn, this.testBtn, this.calibBtn, this.guideBtn, this.waveBtn];
+        const mainScale = this.mainUiControlScale();
         for (let i = 0; i < controls.length; i++) {
             const node = controls[i];
             tween(node).stop();
             node.active = true;
             node.setPosition(this.mainMenuCollapsedPosition[0], this.mainMenuCollapsedPosition[1]);
-            node.setScale(.72, .72, 1);
+            node.setScale(.72 * mainScale, .72 * mainScale, 1);
             const opacity = node.getComponent(UIOpacity)!;
             tween(opacity).stop(); opacity.opacity = 0;
             tween(node).delay(i * .035).to(.22, {
                 position: new Vec3(this.mainMenuButtonPositions[i][0], this.mainMenuButtonPositions[i][1], 0),
-                scale: new Vec3(1, 1, 1),
+                scale: new Vec3(mainScale, mainScale, 1),
             }, { easing: 'quadOut' }).start();
             tween(opacity).delay(i * .035).to(.17, { opacity: 204 }, { easing: 'quadOut' }).start();
         }
@@ -688,13 +799,14 @@ export class GameManager extends Component {
         if (closeSettings) this.settingsMenu.active = false;
         if (!this.mainMenuOpen) return;
         this.mainMenuOpen = false;
+        const mainScale = this.mainUiControlScale();
         for (const node of [this.pickBtn, this.testBtn, this.calibBtn, this.guideBtn, this.waveBtn]) {
             tween(node).stop();
             const opacity = node.getComponent(UIOpacity)!;
             tween(opacity).stop();
             tween(node).to(.18, {
                 position: new Vec3(this.mainMenuCollapsedPosition[0], this.mainMenuCollapsedPosition[1], 0),
-                scale: new Vec3(.72, .72, 1),
+                scale: new Vec3(.72 * mainScale, .72 * mainScale, 1),
             }, { easing: 'quadIn' }).call(() => {
                 if (!this.mainMenuOpen) node.setScale(.001, .001, 1);
             }).start();
@@ -904,9 +1016,9 @@ export class GameManager extends Component {
             this.waveTitleLabel.fontSize = 30;
             mv(this.waveTitle, 0, view.h / 2 - 42);
             const frameW = Math.min(580, view.w - 300);
-            const frameH = 260;
-            const topCenter = view.h / 2 - 280;
-            const portraitGap = 375;
+            const frameH = 220;
+            const topCenter = view.h / 2 - 315;
+            const portraitGap = 360;
             const wpos = [
                 { ch: 0, x: 0, y: topCenter },
                 { ch: 1, x: 0, y: topCenter - portraitGap },
@@ -920,9 +1032,12 @@ export class GameManager extends Component {
                 mv(a.labelNode, 0, frameH / 2 - 18);
                 this.layoutWaveAxes(a);
             }
-            mv(this.instDds[0], 0, topCenter - frameH / 2 - 75);
-            mv(this.instDds[1], 0, topCenter - portraitGap - frameH / 2 - 75);
-            mv(this.instDds[2], 0, topCenter - portraitGap * 2 - frameH / 2 - 75);
+            mv(this.instDds[0], 0, topCenter - frameH / 2 - 48);
+            mv(this.instDds[1], 0, topCenter - portraitGap - frameH / 2 - 48);
+            mv(this.instDds[2], 0, topCenter - portraitGap * 2 - frameH / 2 - 48);
+            mv(this.drumDds[0], 0, topCenter - frameH / 2 - 94);
+            mv(this.drumDds[1], 0, topCenter - portraitGap - frameH / 2 - 94);
+            mv(this.drumDds[2], 0, topCenter - portraitGap * 2 - frameH / 2 - 94);
             const bw = 104;
             const bh = 50;
             const yBtn = -view.h / 2 + 112;
@@ -961,6 +1076,9 @@ export class GameManager extends Component {
             mv(this.instDds[0], -cx + 105, -145);
             mv(this.instDds[1], 105, -145);
             mv(this.instDds[2], cx + 105, -145);
+            mv(this.drumDds[0], -cx + 105, -195);
+            mv(this.drumDds[1], 105, -195);
+            mv(this.drumDds[2], cx + 105, -195);
             const btnXs = [-480, -330, -160, -10, 140, 350, 640];
             for (let i = 0; i < this.panelBtnBgs.length; i++) {
                 const info = this.panelBtnBgs[i];
@@ -983,6 +1101,7 @@ export class GameManager extends Component {
         }
         // 预设/鼓下拉重绘（截点位置）
         for (const dd of this.instDds) dd?.redraw();
+        for (const dd of this.drumDds) dd?.redraw();
         this.blackDd?.redraw();
         this.whiteDd?.redraw();
     }
@@ -999,6 +1118,13 @@ export class GameManager extends Component {
         const ch = Math.max(1, this.canvasTransform.contentSize.height);
         const scale = Math.min(cw, ch) / DESIGN_H;
         return new Vec3(scale, scale, 1);
+    }
+
+    /** 按实际输出分辨率放大主界面按钮，不影响设置/编辑器等面板。 */
+    private mainUiControlScale(): number {
+        const frame = screen.windowSize;
+        const shortSide = Math.max(1, Math.min(frame.width, frame.height));
+        return Math.max(1, Math.min(MAIN_UI_MAX_SCALE, MAIN_UI_SCALE_SHORT_SIDE / shortSide));
     }
 
     /** 当前设备比例在 UIRoot 局部坐标中的真实可见范围。 */
@@ -1094,7 +1220,16 @@ export class GameManager extends Component {
             const baseWave = this.loadBaseWave(d.ch, storedWave);
             const amplitude = this.loadWaveScalar(d.ch, 'amp', 1);
             const cycles = this.loadWaveScalar(d.ch, 'cycles', 1);
-            const wave = this.applyWaveAxes(baseWave, amplitude, cycles);
+            const savedDrumId = loadStr(`cm_drum_channel_${d.ch}`, DRUM_NONE_ID);
+            const savedSourceId = loadStr(`cm_drum_channel_source_${d.ch}`, ['tr808_kick', 'tr808_snare', 'tr808_hat'][d.ch]);
+            this.channelDrumIds[d.ch] = savedDrumId === DRUM_CUSTOM_ID || savedDrumId === DRUM_NONE_ID || !!this.drumPresetOf(savedDrumId)
+                ? savedDrumId : DRUM_NONE_ID;
+            this.channelDrumSourceIds[d.ch] = this.drumPresetOf(savedSourceId)?.id ?? ['tr808_kick', 'tr808_snare', 'tr808_hat'][d.ch];
+            const drumSpeed = this.loadWaveScalar(d.ch, 'drum_speed', 1);
+            const sampleWave = this.drumPresetOf(this.channelDrumSourceIds[d.ch])?.waveform;
+            const wave = this.channelDrumIds[d.ch] !== DRUM_NONE_ID && sampleWave
+                ? this.stretchDrumWave(sampleWave, amplitude, drumSpeed)
+                : this.applyWaveAxes(baseWave, amplitude, cycles);
             const lbl = this.makeLabel('WaveAreaLabel' + d.ch, d.label, 26, 32, d.color, 560, 32);
             lbl.setPosition(0, 190);
             areaNode.addChild(lbl);
@@ -1104,7 +1239,7 @@ export class GameManager extends Component {
             const waveAxis = new Node('WavelengthAxis' + d.ch);
             waveAxis.layer = Layers.Enum.UI_2D; waveAxis.addComponent(UITransform).setContentSize(500, 24); areaNode.addChild(waveAxis);
             const waveGfx = waveAxis.addComponent(Graphics);
-            const area = { ch: d.ch, node: areaNode, gfx: areaGfx, transform: ut, labelNode: lbl, points: [], wave, baseWave, amplitude, cycles, ampAxis, waveAxis, ampGfx, waveGfx };
+            const area = { ch: d.ch, node: areaNode, gfx: areaGfx, transform: ut, labelNode: lbl, points: [], wave, baseWave, amplitude, cycles, drumSpeed, ampAxis, waveAxis, ampGfx, waveGfx };
             this.waveAreas.push(area);
             this.sendWaveToNative(d.ch, baseWave, amplitude, cycles);
 
@@ -1212,6 +1347,18 @@ export class GameManager extends Component {
                 (id) => this.onInstPick(c, id));
             this.instDds.push(dd);
         }
+        const channelDrumItems = [
+            { id: DRUM_CUSTOM_ID, label: isEnglish() ? 'Drum · Custom' : '鼓预设 · 自定义', group: isEnglish() ? 'Mode' : '模式' },
+            { id: DRUM_NONE_ID, label: isEnglish() ? 'Drum · None' : '鼓预设 · 无', group: isEnglish() ? 'Mode' : '模式' },
+            ...this.drumMenuItems(),
+        ];
+        this.drumDds = [];
+        for (let c = 0; c < 3; c++) {
+            const dd = new Dropdown(panel, channelDrumItems, this.channelDrumIds[c],
+                (id) => this.channelDrumDescription(id), (id) => this.onChannelDrumPick(c, id));
+            this.drumDds.push(dd);
+            this.refreshChannelDrumWave(c, false);
+        }
         // 启动时为空的通道使用完整 4 槽乐器塑形链。
         for (let c = 0; c < 3; c++) {
             const first = globalFxIndex(c, 0);
@@ -1224,25 +1371,18 @@ export class GameManager extends Component {
         this.fxUI.setSlots(this.fxSlots);
         this.pushFxToNative();
         // 黑鼓/白鼓下拉
-        this.drumBlackId = loadStr('cm_drum_black', 'kick');
-        this.drumWhiteId = loadStr('cm_drum_white', 'snare');
-        const drumEnglish: Record<string, string> = {
-            kick: 'Kick: a fast-decaying sine sweep from 150 Hz down to 45 Hz.',
-            snare: 'Snare: short band-passed noise plus a 180 Hz attack tone.',
-            clap: 'Clap: several short noise bursts that imitate handclaps.',
-            hihat: 'Hi-hat: crisp high-passed noise with a fast decay.',
-            tom: 'Tom: a rounded frequency sweep from 200 Hz down to 80 Hz.',
-            maracas: 'Maracas: a short band-passed noise texture.',
-        };
-        this.blackDd = new Dropdown(panel, DRUM_808.map((d) => ({ id: d.id, label: d.label })), this.drumBlackId,
+        this.drumBlackId = this.validDrumId(loadStr('cm_drum_black', 'tr808_kick'), 'tr808_kick');
+        this.drumWhiteId = this.validDrumId(loadStr('cm_drum_white', 'tr808_snare'), 'tr808_snare');
+        const drumItems = this.drumMenuItems();
+        this.blackDd = new Dropdown(panel, drumItems, this.drumBlackId,
             (id) => isEnglish()
-                ? `Trigger: tap a near-black pixel where R, G and B are all below 55.\n\n${drumEnglish[id] ?? ''}`
-                : `触发条件：点击图片中 R、G、B 均低于 55 的近黑像素。\n\n${DRUM_808.find((d) => d.id === id)?.desc ?? ''}`,
+                ? `Trigger: tap a near-black pixel where R, G and B are all below 55.\n\nSelected one-shot: ${this.drumPresetOf(id)?.englishLabel ?? ''}.`
+                : `触发条件：点击图片中 R、G、B 均低于 55 的近黑像素。\n\n当前单击采样：${this.drumPresetOf(id)?.label ?? ''}。`,
             (id) => { this.drumBlackId = id; saveStr('cm_drum_black', id); this.pushDrumToNative(); });
-        this.whiteDd = new Dropdown(panel, DRUM_808.map((d) => ({ id: d.id, label: d.label })), this.drumWhiteId,
+        this.whiteDd = new Dropdown(panel, drumItems, this.drumWhiteId,
             (id) => isEnglish()
-                ? `Trigger: tap a near-white pixel where R, G and B are all above 200.\n\n${drumEnglish[id] ?? ''}`
-                : `触发条件：点击图片中 R、G、B 均高于 200 的近白像素。\n\n${DRUM_808.find((d) => d.id === id)?.desc ?? ''}`,
+                ? `Trigger: tap a near-white pixel where R, G and B are all above 200.\n\nSelected one-shot: ${this.drumPresetOf(id)?.englishLabel ?? ''}.`
+                : `触发条件：点击图片中 R、G、B 均高于 200 的近白像素。\n\n当前单击采样：${this.drumPresetOf(id)?.label ?? ''}。`,
             (id) => { this.drumWhiteId = id; saveStr('cm_drum_white', id); this.pushDrumToNative(); });
 
         // 初始隐藏（deactivate）；打开时激活并重绘所有 Graphics（见 onWavePressed）
@@ -1251,15 +1391,127 @@ export class GameManager extends Component {
         for (const a of this.waveAreas) this.redrawWaveArea(a);
     }
 
+    private drumPresetOf(id: string): DrumPresetDef | undefined {
+        return DRUM_PRESETS.find((preset) => preset.id === (LEGACY_DRUM_IDS[id] ?? id));
+    }
+
+    private validDrumId(id: string, fallback: string): string {
+        return this.drumPresetOf(id)?.id ?? fallback;
+    }
+
+    private drumMenuItems() {
+        return DRUM_PRESETS.map((preset) => ({
+            id: preset.id,
+            label: isEnglish() ? preset.englishLabel : preset.label,
+            group: isEnglish() ? (preset.group === '原声鼓' ? 'Acoustic' : preset.group) : preset.group,
+        }));
+    }
+
+    private channelDrumDescription(id: string): string {
+        if (id === DRUM_NONE_ID) return t(
+            '无：关闭该 RGB 通道的鼓采样，恢复可绘制的循环波表。',
+            'None: disables the drum sample on this RGB channel and restores the drawable wavetable.',
+        );
+        if (id === DRUM_CUSTOM_ID) return t(
+            '自定义：保留当前鼓采样，并使用你调节后的音量、播放速度和效果器。',
+            'Custom: keeps the current sample with your adjusted level, playback speed and effects.',
+        );
+        const preset = this.drumPresetOf(id);
+        return isEnglish() ? (preset?.englishDesc ?? '') : (preset?.desc ?? '');
+    }
+
+    private isChannelDrumActive(ch: number): boolean {
+        return this.channelDrumIds[ch] !== DRUM_NONE_ID && !!this.drumPresetOf(this.channelDrumSourceIds[ch]);
+    }
+
+    private saveChannelDrumState(ch: number): void {
+        const area = this.waveAreas[ch];
+        if (!area) return;
+        saveStr(`cm_drum_channel_${ch}`, this.channelDrumIds[ch]);
+        saveStr(`cm_drum_channel_source_${ch}`, this.channelDrumSourceIds[ch]);
+        saveStr(`cm_wt_drum_speed_${ch}`, String(area.drumSpeed));
+    }
+
+    private pushChannelDrumToNative(ch: number): void {
+        const area = this.waveAreas[ch];
+        if (!area || !NativeBridge.isAndroidNative || !NativeBridge.synthReady) return;
+        NativeBridge.setChannelDrum(ch, this.isChannelDrumActive(ch) ? this.channelDrumSourceIds[ch] : DRUM_NONE_ID,
+            area.amplitude, area.drumSpeed);
+    }
+
+    /** Keep the editor on a fixed time window: faster samples compress left, slower samples stretch past the frame. */
+    private stretchDrumWave(source: number[], amplitude: number, speed: number): number[] {
+        const out = new Array(256).fill(0);
+        const safeSpeed = Math.max(.5, Math.min(2, speed));
+        for (let i = 0; i < out.length; i++) {
+            const position = i * safeSpeed;
+            const i0 = Math.floor(position);
+            if (i0 >= source.length) continue;
+            const i1 = Math.min(source.length - 1, i0 + 1);
+            const value = source[i0] + (source[i1] - source[i0]) * (position - i0);
+            out[i] = Math.max(-1, Math.min(1, value * amplitude));
+        }
+        return out;
+    }
+
+    private refreshChannelDrumWave(ch: number, pushNative = true): void {
+        const area = this.waveAreas[ch];
+        if (!area) return;
+        const sample = this.drumPresetOf(this.channelDrumSourceIds[ch]);
+        area.wave = this.isChannelDrumActive(ch) && sample
+            ? this.stretchDrumWave(sample.waveform, area.amplitude, area.drumSpeed)
+            : this.applyWaveAxes(area.baseWave, area.amplitude, area.cycles);
+        this.saveWaveState(area);
+        this.redrawWaveArea(area);
+        if (pushNative) this.pushChannelDrumToNative(ch);
+    }
+
+    private disableChannelDrum(ch: number, pushNative = true): void {
+        this.channelDrumIds[ch] = DRUM_NONE_ID;
+        this.drumDds[ch]?.setValue(DRUM_NONE_ID);
+        this.saveChannelDrumState(ch);
+        this.refreshChannelDrumWave(ch, pushNative);
+    }
+
+    private markChannelDrumCustom(ch: number): void {
+        if (!this.isChannelDrumActive(ch)) return;
+        this.channelDrumIds[ch] = DRUM_CUSTOM_ID;
+        this.drumDds[ch]?.setValue(DRUM_CUSTOM_ID);
+        this.saveChannelDrumState(ch);
+    }
+
+    private onChannelDrumPick(ch: number, id: string): void {
+        this.pushUndo();
+        const area = this.waveAreas[ch];
+        if (!area) return;
+        if (id === DRUM_NONE_ID) {
+            this.disableChannelDrum(ch);
+            this.setInfo(t('鼓采样已关闭，可继续绘制该通道波形', 'Drum sample disabled; this channel can be drawn again'), new Color(220, 225, 235, 255));
+            return;
+        }
+        if (id !== DRUM_CUSTOM_ID) {
+            const preset = this.drumPresetOf(id);
+            if (!preset) return;
+            this.channelDrumSourceIds[ch] = preset.id;
+            area.amplitude = 1;
+            area.drumSpeed = 1;
+        }
+        this.channelDrumIds[ch] = id;
+        this.saveChannelDrumState(ch);
+        this.refreshChannelDrumWave(ch);
+        this.setInfo(t('已启用鼓采样：波形框改为采样预览，绘制暂时关闭', 'Drum sample enabled: the frame now previews the sample and drawing is disabled'), new Color(220, 225, 235, 255));
+    }
+
     /** 音色预设选择 → 把通道波表替换为对应音色波形，并把该通道的全局效果器设为该乐器推荐配置。 */
     private onInstPick(ch: number, id: string) {
+        this.pushUndo();
+        this.disableChannelDrum(ch);
         // “自定义”：不改变波形，仅标记（保留当前自绘/重置波形）
         if (id === CUSTOM_INST.id) {
             this.instIds[ch] = id;
             saveStr('cm_inst_' + ch, id);
             return;
         }
-        this.pushUndo();
         this.instIds[ch] = id;
         saveStr('cm_inst_' + ch, id);
         const wave = presetWaveFor(id);
@@ -1299,9 +1551,12 @@ export class GameManager extends Component {
             const baseWaves = this.waveAreas.map((a) => a.baseWave.slice());
             const amplitudes = this.waveAreas.map((a) => a.amplitude);
             const cycles = this.waveAreas.map((a) => a.cycles);
+            const drumSpeeds = this.waveAreas.map((a) => a.drumSpeed);
             const instIds = this.instIds.slice();
+            const drumIds = this.channelDrumIds.slice();
+            const drumSourceIds = this.channelDrumSourceIds.slice();
             const fxSlots = this.cloneSlots(this.fxSlots);
-            this.undoStack.push({ waves, baseWaves, amplitudes, cycles, instIds, fxSlots });
+            this.undoStack.push({ waves, baseWaves, amplitudes, cycles, drumSpeeds, instIds, drumIds, drumSourceIds, fxSlots });
             if (this.undoStack.length > 30) this.undoStack.shift();
         } catch (e) { /* 忽略 */ }
     }
@@ -1322,12 +1577,17 @@ export class GameManager extends Component {
                 a.baseWave = snap.baseWaves[ch]?.slice() ?? w.slice();
                 a.amplitude = snap.amplitudes[ch] ?? 1;
                 a.cycles = snap.cycles[ch] ?? 1;
-                this.saveWaveState(a);
+                a.drumSpeed = snap.drumSpeeds[ch] ?? 1;
+                this.channelDrumIds[ch] = snap.drumIds[ch] ?? DRUM_NONE_ID;
+                this.channelDrumSourceIds[ch] = snap.drumSourceIds[ch] ?? ['tr808_kick', 'tr808_snare', 'tr808_hat'][ch];
+                this.saveChannelDrumState(ch);
+                this.refreshChannelDrumWave(ch, false);
                 this.sendWaveToNative(ch, a.baseWave, a.amplitude, a.cycles);
-                this.redrawWaveArea(a);
+                this.pushChannelDrumToNative(ch);
                 this.instIds[ch] = snap.instIds[ch] ?? CUSTOM_INST.id;
                 saveStr('cm_inst_' + ch, this.instIds[ch]);
                 this.instDds[ch]?.setValue(this.instIds[ch]);
+                this.drumDds[ch]?.setValue(this.channelDrumIds[ch]);
             }
             this.fxSlots = this.cloneSlots(snap.fxSlots);
             saveFxSlots(this.fxSlots); this.fxUI?.setSlots(this.fxSlots); this.pushFxToNative();
@@ -1344,9 +1604,14 @@ export class GameManager extends Component {
             const a = this.waveAreas[ch];
             if (!a) continue;
             const w = this.sineWave();
-            a.baseWave = w.slice(); a.amplitude = 1; a.cycles = 1; a.wave = w;
+            a.baseWave = w.slice(); a.amplitude = 1; a.cycles = 1; a.drumSpeed = 1; a.wave = w;
+            this.channelDrumIds[ch] = DRUM_NONE_ID;
+            this.channelDrumSourceIds[ch] = ['tr808_kick', 'tr808_snare', 'tr808_hat'][ch];
+            this.saveChannelDrumState(ch);
+            this.drumDds[ch]?.setValue(DRUM_NONE_ID);
             this.saveWaveState(a);
             this.sendWaveToNative(ch, a.baseWave, a.amplitude, a.cycles);
+            this.pushChannelDrumToNative(ch);
             this.redrawWaveArea(a);
             this.markInstCustom(ch);
         }
@@ -1358,14 +1623,14 @@ export class GameManager extends Component {
         this.fxUI?.resetGlobalSlotCounts();
         this.pushFxToNative();
         // 鼓重置
-        this.drumBlackId = 'kick';
-        this.drumWhiteId = 'snare';
+        this.drumBlackId = 'tr808_kick';
+        this.drumWhiteId = 'tr808_snare';
         saveStr('cm_drum_black', this.drumBlackId);
         saveStr('cm_drum_white', this.drumWhiteId);
         this.blackDd?.setValue(this.drumBlackId);
         this.whiteDd?.setValue(this.drumWhiteId);
         this.pushDrumToNative();
-        this.setInfo('已全部重置（波形=正弦、预设=自定义、效果器=无、鼓=kick/snare）', new Color(220, 225, 235, 255));
+        this.setInfo('已全部重置（波形=正弦、RGB 鼓=无、效果器=无、黑白鼓=TR-808）', new Color(220, 225, 235, 255));
     }
 
     /** 黑/白鼓元素推给原生。 */
@@ -1425,7 +1690,7 @@ export class GameManager extends Component {
                 const p = verticalLines[i];
                 const before = p - (i > 0 ? verticalLines[i - 1] : 0);
                 const after = (i + 1 < verticalLines.length ? verticalLines[i + 1] : 1) - p;
-                const thickness = Math.max(.7, Math.min(5, Math.min(Math.min(before, after) * w, h / (horizontalLines.length + 1)) / 30));
+                const thickness = Math.max(MIN_GRID_LINE_WIDTH, Math.min(5, Math.min(Math.min(before, after) * w, h / (horizontalLines.length + 1)) / 30));
                 const x = -w / 2 + p * w;
                 g.lineWidth = thickness;
                 g.moveTo(x, -h / 2); g.lineTo(x, h / 2); g.stroke();
@@ -1439,7 +1704,7 @@ export class GameManager extends Component {
                 const p = horizontalLines[i];
                 const before = p - (i > 0 ? horizontalLines[i - 1] : 0);
                 const after = (i + 1 < horizontalLines.length ? horizontalLines[i + 1] : 1) - p;
-                const thickness = Math.max(.7, Math.min(5, Math.min(Math.min(before, after) * h, w / (verticalLines.length + 1)) / 30));
+                const thickness = Math.max(MIN_GRID_LINE_WIDTH, Math.min(5, Math.min(Math.min(before, after) * h, w / (verticalLines.length + 1)) / 30));
                 const y = -h / 2 + p * h;
                 g.lineWidth = thickness;
                 g.moveTo(-w / 2, y); g.lineTo(w / 2, y); g.stroke();
@@ -1456,7 +1721,9 @@ export class GameManager extends Component {
             : this.edgeMode === 'record' ? new Color(245, 55, 65, 255)
                 : this.edgeMode === 'play' ? new Color(60, 220, 110, 255)
                     : new Color(255, 255, 255, 255);
-        g.lineWidth = 1.6; g.strokeColor = edge; g.rect(-w / 2 + .8, -h / 2 + .8, w - 1.6, h - 1.6); g.stroke();
+        g.lineWidth = 1.6; g.strokeColor = edge;
+        g.roundRect(-w / 2 + .8, -h / 2 + .8, w - 1.6, h - 1.6, SCREEN_EDGE_RADIUS);
+        g.stroke();
     }
 
     private edgeLabel(pool: Node[], index: number, name: string): Node {
@@ -1474,6 +1741,11 @@ export class GameManager extends Component {
             pool.push(node);
         }
         const node = pool[index]; node.active = true; return node;
+    }
+
+    private gridLabelFontSize(cellFraction: number, defaultDivisions: number): number {
+        return Math.max(MIN_GRID_LABEL_FONT_SIZE, Math.min(MAX_GRID_LABEL_FONT_SIZE,
+            DEFAULT_GRID_LABEL_FONT_SIZE * cellFraction * defaultDivisions));
     }
 
     /** 下边缘显示音阶、左边缘显示音量；文字坐标与颜色/透明度跟随对应网格线。 */
@@ -1495,11 +1767,15 @@ export class GameManager extends Component {
             const p = xBoundaries[i], next = xBoundaries[i + 1];
             const node = this.edgeLabel(this.gridNoteLabels, i, 'GridNoteMark');
             node.angle = 0;
-            node.setPosition(-w / 2 + (p + next) * .5 * w, -h / 2 + 9);
+            const cellWidth = (next - p) * w;
+            const fontSize = this.gridLabelFontSize(next - p, DEFAULT_GRID_COLUMNS);
+            const labelHeight = Math.max(16, fontSize + 4);
+            node.getComponent(UITransform)!.setContentSize(Math.max(8, cellWidth - 2), labelHeight);
+            node.setPosition(-w / 2 + (p + next) * .5 * w, -h / 2 + labelHeight / 2 + 1);
             const label = node.getComponent(Label)!;
             const midi = Math.round(this.gridState.midiMin + ((i + .5) / columnCount) * (this.gridState.midiMax - this.gridState.midiMin));
             label.string = midiToName(midi);
-            label.fontSize = Math.max(4, Math.min(9, (next - p) * w * .48));
+            label.fontSize = fontSize;
             label.lineHeight = label.fontSize + 2;
             label.color = noteColor;
         }
@@ -1509,11 +1785,15 @@ export class GameManager extends Component {
             const p = yBoundaries[i], next = yBoundaries[i + 1];
             const node = this.edgeLabel(this.gridVolumeLabels, i, 'GridVolumeMark');
             node.angle = 0;
-            node.setPosition(-w / 2 + 20, -h / 2 + (p + next) * .5 * h);
+            const cellHeight = (next - p) * h;
+            const fontSize = this.gridLabelFontSize(next - p, DEFAULT_GRID_ROWS);
+            const labelWidth = Math.max(38, fontSize * 3.2);
+            node.getComponent(UITransform)!.setContentSize(labelWidth, Math.max(8, cellHeight - 2));
+            node.setPosition(-w / 2 + labelWidth / 2 + 1, -h / 2 + (p + next) * .5 * h);
             const label = node.getComponent(Label)!;
             const volume = this.gridState.volumeMin + ((i + .5) / rowCount) * (this.gridState.volumeMax - this.gridState.volumeMin);
             label.string = String(Math.round(volume * 100));
-            label.fontSize = Math.max(4, Math.min(9, (next - p) * h * .48));
+            label.fontSize = fontSize;
             label.lineHeight = label.fontSize + 2;
             label.color = volumeColor;
         }
@@ -1570,7 +1850,7 @@ export class GameManager extends Component {
             },
             {
                 title: '波表编辑器',
-                    content: '一.打开与布局\n1. 通过“设置→波表”进入，横屏为横向三栏，竖屏为纵向三栏。\n2. 三个绘制框分别对应 R、G、B 声部，绘制框外的坐标轴不会遮挡波形。\n\n二.绘制与试听\n1. 在绘制框内拖动绘制基础波形，松手后自动重建并保存。\n2. 左侧振幅轴控制振幅，波形会实时显示；下方波长轴控制重复次数，波长越短，实际音高越高。\n3. 每个 RGB 声部可独立试听，提示栏会显示当前波长对应的实际音高，按住多久就播放多久。\n4. “随机生成”会依次随机波形、效果器槽位以及各效果器参数。\n\n三.音色管理\n1. 可从预设下拉菜单选择乐器音色，也可选择“自定义”。\n2. 每个颜色最多串联四个全局效果器；加号可继续添加槽位。\n3. “撤回”用于恢复最近一次绘制、预设或随机操作。\n\n四.黑鼓与白鼓\n1. 像素的 R、G、B 全部低于 55 时进入黑鼓区域，纯黑触发最强。\n2. 像素的 R、G、B 全部高于 200 时进入白鼓区域，纯白触发最强。\n3. 两个鼓槽可分别选择 kick、snare、clap、hihat、tom、maracas 等 808 鼓元素。',
+                    content: '一.打开与布局\n1. 通过“设置→波表”进入，横屏为横向三栏，竖屏为纵向三栏。\n2. 三个绘制框分别对应 R、G、B 声部；每个乐器预设槽下方都有独立的鼓预设槽。\n\n二.绘制与试听\n1. 鼓预设为“无”时，可在框内绘制循环波表；左轴调振幅，下轴调重复次数。\n2. 选择鼓采样后，框内改为显示真实采样波形并禁止绘制；左轴调采样音量，下轴调 0.5–2.0 倍播放速度。\n3. 调节鼓采样参数后槽位显示“自定义”，当前采样不会丢失；选择“无”可恢复绘制。\n4. 每个 RGB 声部可独立试听，“随机生成”会随机波形和效果器。\n\n三.鼓组与效果器\n1. 鼓列表按 TR-808、TR-909、TR-606 / RD-6、原声鼓、Boom-Bap、Trap、Lo-fi 分组。\n2. 鼓采样继续通过对应颜色的四槽串联效果器，可调滤波、延迟、混响等音色。\n3. “撤回”和样式管理都会保存波表、鼓采样、音量、速度及效果器状态。\n\n四.黑鼓与白鼓\n1. 像素的 R、G、B 全部低于 55 时进入黑鼓区域，纯黑触发最强。\n2. 像素的 R、G、B 全部高于 200 时进入白鼓区域，纯白触发最强。\n3. 右下角两个鼓槽使用相同的分组采样库，可分别选择不同鼓组和鼓件。',
             },
             {
                 title: '效果器',
@@ -1609,7 +1889,7 @@ export class GameManager extends Component {
                 },
                 {
                     title: 'Wavetable Editor',
-                    content: 'I. Layout\n1. Open Settings → Wavetable. RGB panels run left-to-right in landscape and top-to-bottom in portrait.\n2. Each frame edits one RGB voice; amplitude and wavelength axes remain outside the frame.\n\nII. Drawing and Preview\n1. Drag inside a frame to draw its base waveform; release to rebuild and autosave it.\n2. The left axis changes amplitude. The bottom axis changes wavelength; shorter wavelengths produce higher audible pitches.\n3. Each RGB voice can be previewed independently, and the status line shows its current audible pitch. Playback lasts exactly as long as you hold.\n4. Randomize generates waves, effect choices and effect parameters in sequence.\n\nIII. Timbre and Drums\n1. Choose a preset instrument or Custom. Each color supports up to four serial global effects.\n2. Undo restores the latest drawing, preset or random operation.\n3. All RGB values below 55 enter the black-drum region; pure black is strongest.\n4. All RGB values above 200 enter the white-drum region; pure white is strongest.\n5. Each drum slot can use Kick, Snare, Clap, Hi-hat, Tom or Maracas.',
+                    content: 'I. Layout\n1. Open Settings → Wavetable. RGB panels run left-to-right in landscape and top-to-bottom in portrait.\n2. Every instrument preset has a separate Drum Preset directly below it.\n\nII. Wavetables and Samples\n1. With Drum Preset set to None, draw a looping wavetable in the frame; the left axis controls amplitude and the bottom axis controls repetition.\n2. Choosing a drum replaces the display with its real sample waveform and disables drawing. The left axis controls sample level and the bottom axis controls 0.5–2.0x playback speed.\n3. Editing a drum marks it Custom without losing its source sample. Choose None to return to drawing.\n4. Each RGB channel can be previewed independently.\n\nIII. Drum Kits and Effects\n1. Samples are grouped as TR-808, TR-909, TR-606 / RD-6, Acoustic, Boom-Bap, Trap and Lo-fi.\n2. Samples pass through the selected RGB channel’s four serial effects.\n3. Undo and Styles preserve sample choice, level, speed, wavetable and effects.\n4. Near-black and near-white pixels use the two bottom-right drum slots, which share the same grouped sample library.',
                 },
                 {
                     title: 'Effects',
@@ -1787,7 +2067,10 @@ export class GameManager extends Component {
         wg.moveTo(-w / 2 + 4, lineOffset); wg.lineTo(w / 2 - 4, lineOffset);
         wg.moveTo(w / 2 - 4, lineOffset); wg.lineTo(w / 2 - 14, lineOffset + 7); wg.moveTo(w / 2 - 4, lineOffset); wg.lineTo(w / 2 - 14, lineOffset - 7);
         wg.lineWidth = 3; wg.strokeColor = new Color(235, 240, 250, 230); wg.stroke();
-        const cx = -w / 2 + 4 + Math.max(0, Math.min(1, (area.cycles - 1) / 7)) * (w - 8);
+        const horizontalValue = this.isChannelDrumActive(area.ch)
+            ? (area.drumSpeed - .5) / 1.5
+            : (area.cycles - 1) / 7;
+        const cx = -w / 2 + 4 + Math.max(0, Math.min(1, horizontalValue)) * (w - 8);
         wg.circle(cx, lineOffset, 9); wg.fillColor = this.waveColor(area); wg.fill();
     }
 
@@ -1805,19 +2088,26 @@ export class GameManager extends Component {
         if (this.waveAxisTouchIds.get(key) !== id) return;
         const p = area.transform.convertToNodeSpaceAR(new Vec3(event.getUILocation().x, event.getUILocation().y, 0));
         const w = area.transform.contentSize.width, h = area.transform.contentSize.height;
+        const drumActive = this.isChannelDrumActive(ch);
         if (kind === 'amp') area.amplitude = Math.max(0, Math.min(1.25, ((p.y + h / 2) / h) * 1.25));
+        else if (drumActive) area.drumSpeed = Math.max(.5, Math.min(2, .5 + ((p.x + w / 2) / w) * 1.5));
         else area.cycles = Math.max(1, Math.min(8, 1 + ((p.x + w / 2) / w) * 7));
-        area.wave = this.applyWaveAxes(area.baseWave, area.amplitude, area.cycles);
+        const sample = this.drumPresetOf(this.channelDrumSourceIds[ch]);
+        area.wave = drumActive && sample
+            ? this.stretchDrumWave(sample.waveform, area.amplitude, area.drumSpeed)
+            : this.applyWaveAxes(area.baseWave, area.amplitude, area.cycles);
         this.redrawWaveArea(area);
         // 高频拖动期间不写 localStorage，并限制跨 JS/Java 的波表同步频率；视觉仍逐帧更新。
         const now = Date.now();
         const lastNative = this.waveAxisLastNativeMs.get(key) ?? 0;
         if (phase === 2 || now - lastNative >= 50) {
-            this.sendWaveToNative(ch, area.baseWave, area.amplitude, area.cycles);
+            if (drumActive) this.pushChannelDrumToNative(ch);
+            else this.sendWaveToNative(ch, area.baseWave, area.amplitude, area.cycles);
             this.waveAxisLastNativeMs.set(key, now);
         }
         if (phase === 2) {
             this.saveWaveState(area);
+            if (drumActive) this.markChannelDrumCustom(ch);
             this.waveAxisTouchIds.delete(key);
             this.waveAxisLastNativeMs.delete(key);
         }
@@ -1864,6 +2154,14 @@ export class GameManager extends Component {
             this.webSynth.noteOn(touchId, rgb[0], rgb[1], rgb[2], 255, previewFreq, .7);
         }
         const channels = Array.from(this.previewChannels).sort().map((ch) => 'RGB'[ch]).join('+');
+        const previewCh = Array.from(this.previewChannels)[0];
+        if (this.previewChannels.size === 1 && this.isChannelDrumActive(previewCh)) {
+            const speed = this.waveAreas[previewCh]?.drumSpeed ?? 1;
+            this.setInfo(isEnglish()
+                ? `Preview ${channels}: drum sample at ${speed.toFixed(2)}x speed (release to stop)`
+                : `试听 ${channels}：鼓采样 ${speed.toFixed(2)} 倍速（松开停止）`, new Color(220, 225, 235, 255));
+            return;
+        }
         const audibleFreq = this.previewChannels.size === 1
             ? previewFreq * (this.waveAreas[Array.from(this.previewChannels)[0]]?.cycles ?? 1)
             : previewFreq;
@@ -1877,6 +2175,13 @@ export class GameManager extends Component {
         const area = this.waveAreas[ch];
         if (!area) return;
         event.propagationStopped = true;
+        if (this.isChannelDrumActive(ch)) {
+            if (phase === 0) this.setInfo(t(
+                '鼓采样模式下不能绘制波形；请在鼓预设中选择“无”后再绘制。',
+                'Drawing is disabled in drum sample mode. Choose None in Drum Preset to draw again.',
+            ), new Color(255, 200, 120, 255));
+            return;
+        }
         const id = event.getID();
         if (phase === 0) {
             // 一根手指同时只能画一个区域
@@ -2051,9 +2356,13 @@ export class GameManager extends Component {
         this.pushUndo();
         for (const a of this.waveAreas) {
             const w = idx === 0 ? this.sineWave() : idx === 1 ? this.randomWave() : this.classicWave();
+            this.channelDrumIds[a.ch] = DRUM_NONE_ID;
+            this.drumDds[a.ch]?.setValue(DRUM_NONE_ID);
+            this.saveChannelDrumState(a.ch);
             a.baseWave = w.slice(); a.amplitude = 1; a.cycles = 1; a.wave = w;
             this.saveWaveState(a);
             this.sendWaveToNative(a.ch, a.baseWave, a.amplitude, a.cycles);
+            this.pushChannelDrumToNative(a.ch);
             this.redrawWaveArea(a);
             this.markInstCustom(a.ch);
         }
@@ -2190,6 +2499,7 @@ export class GameManager extends Component {
             sys.localStorage.setItem(`cm_wt_base_${area.ch}`, JSON.stringify(area.baseWave));
             sys.localStorage.setItem(`cm_wt_amp_${area.ch}`, String(area.amplitude));
             sys.localStorage.setItem(`cm_wt_cycles_${area.ch}`, String(area.cycles));
+            sys.localStorage.setItem(`cm_wt_drum_speed_${area.ch}`, String(area.drumSpeed));
         } catch (e) { /* 忽略 */ }
     }
 
@@ -2238,6 +2548,10 @@ export class GameManager extends Component {
             const amplitude = this.loadWaveScalar(ch, 'amp', 1);
             const cycles = this.loadWaveScalar(ch, 'cycles', 1);
             this.sendWaveToNative(ch, baseWave, amplitude, cycles);
+            const drumId = loadStr(`cm_drum_channel_${ch}`, DRUM_NONE_ID);
+            const sourceId = this.validDrumId(loadStr(`cm_drum_channel_source_${ch}`, ['tr808_kick', 'tr808_snare', 'tr808_hat'][ch]), ['tr808_kick', 'tr808_snare', 'tr808_hat'][ch]);
+            const speed = this.loadWaveScalar(ch, 'drum_speed', 1);
+            NativeBridge.setChannelDrum(ch, drumId === DRUM_NONE_ID ? DRUM_NONE_ID : sourceId, amplitude, speed);
         }
         this.pushFxToNative();
         this.pushOutputFxToNative();
@@ -2592,9 +2906,12 @@ export class GameManager extends Component {
         const colors = [new Color(255, 80, 90, 255), new Color(65, 225, 130, 255), new Color(80, 145, 255, 255)];
         const laneW = pw / 3;
         style.waves.slice(0, 3).forEach((wave, ch) => {
-            const data = wave.baseWave?.length ? wave.baseWave : [0, 0]; const laneLeft = -pw / 2 + ch * laneW; const usable = Math.max(20, laneW - 30); g.strokeColor = colors[ch]; g.lineWidth = 1.5;
+            const rawDrumData = wave.drumId && wave.drumId !== DRUM_NONE_ID
+                ? this.drumPresetOf(wave.drumSourceId ?? wave.drumId)?.waveform : undefined;
+            const drumData = rawDrumData ? this.stretchDrumWave(rawDrumData, 1, wave.drumSpeed ?? 1) : undefined;
+            const data = drumData?.length ? drumData : (wave.baseWave?.length ? wave.baseWave : [0, 0]); const laneLeft = -pw / 2 + ch * laneW; const usable = Math.max(20, laneW - 30); g.strokeColor = colors[ch]; g.lineWidth = 1.5;
             if (ch > 0) { g.strokeColor = new Color(70, 82, 105, 180); g.lineWidth = 1; g.moveTo(laneLeft, -28); g.lineTo(laneLeft, 28); g.stroke(); g.strokeColor = colors[ch]; g.lineWidth = 1.5; }
-            for (let x = 0; x < usable; x++) { const phase = (x / Math.max(1, usable - 1)) * Math.max(.1, wave.cycles); const idx = Math.floor((phase % 1) * (data.length - 1)); const px = laneLeft + 15 + x; const py = -6 + Math.max(-20, Math.min(20, data[idx] * wave.amplitude * 20)); if (x === 0) g.moveTo(px, py); else g.lineTo(px, py); } g.stroke();
+            for (let x = 0; x < usable; x++) { const phase = drumData ? x / Math.max(1, usable - 1) : (x / Math.max(1, usable - 1)) * Math.max(.1, wave.cycles); const idx = Math.floor((drumData ? phase : phase % 1) * (data.length - 1)); const px = laneLeft + 15 + x; const py = -6 + Math.max(-20, Math.min(20, data[idx] * wave.amplitude * 20)); if (x === 0) g.moveTo(px, py); else g.lineTo(px, py); } g.stroke();
             const label = this.makeLabel(`Preview${ch}`, ['R', 'G', 'B'][ch], 14, 18, colors[ch], laneW, 18); label.setPosition(laneLeft + laneW / 2, 26); preview.addChild(label);
         });
     }
@@ -2606,8 +2923,8 @@ export class GameManager extends Component {
                 const area = this.waveAreas[ch];
                 const stored = this.loadWave(ch);
                 return area
-                    ? { baseWave: area.baseWave.slice(), amplitude: area.amplitude, cycles: area.cycles, instId: this.instIds[ch] }
-                    : { baseWave: this.loadBaseWave(ch, stored), amplitude: this.loadWaveScalar(ch, 'amp', 1), cycles: this.loadWaveScalar(ch, 'cycles', 1), instId: loadStr('cm_inst_' + ch, ch === 0 ? 'piano' : ch === 1 ? 'flute' : 'bell') };
+                    ? { baseWave: area.baseWave.slice(), amplitude: area.amplitude, cycles: area.cycles, instId: this.instIds[ch], drumId: this.channelDrumIds[ch], drumSourceId: this.channelDrumSourceIds[ch], drumSpeed: area.drumSpeed }
+                    : { baseWave: this.loadBaseWave(ch, stored), amplitude: this.loadWaveScalar(ch, 'amp', 1), cycles: this.loadWaveScalar(ch, 'cycles', 1), instId: loadStr('cm_inst_' + ch, ch === 0 ? 'piano' : ch === 1 ? 'flute' : 'bell'), drumId: loadStr(`cm_drum_channel_${ch}`, DRUM_NONE_ID), drumSourceId: loadStr(`cm_drum_channel_source_${ch}`, ['tr808_kick', 'tr808_snare', 'tr808_hat'][ch]), drumSpeed: this.loadWaveScalar(ch, 'drum_speed', 1) };
             }),
             grid: JSON.parse(JSON.stringify(this.gridState)), fxSlots: JSON.parse(JSON.stringify(this.fxSlots)), outputFxSlots: JSON.parse(JSON.stringify(this.outputFxSlots)),
             drumBlackId: this.drumBlackId, drumWhiteId: this.drumWhiteId,
@@ -2685,13 +3002,18 @@ export class GameManager extends Component {
         this.styleTransition = true;
         this.redrawPlayGrid();
         style.waves.forEach((w, ch) => {
-            const wave = this.applyWaveAxes(w.baseWave, w.amplitude, w.cycles);
+            const drumId = w.drumId ?? DRUM_NONE_ID;
+            const drumSourceId = this.validDrumId(w.drumSourceId ?? drumId, ['tr808_kick', 'tr808_snare', 'tr808_hat'][ch]);
+            const sampleWave = drumId !== DRUM_NONE_ID ? this.drumPresetOf(drumSourceId)?.waveform : undefined;
+            const wave = sampleWave ? this.stretchDrumWave(sampleWave, w.amplitude, w.drumSpeed ?? 1) : this.applyWaveAxes(w.baseWave, w.amplitude, w.cycles);
             const a = this.waveAreas[ch];
-            if (a) { a.baseWave = w.baseWave.slice(); a.amplitude = w.amplitude; a.cycles = w.cycles; a.wave = wave; this.saveWaveState(a); this.redrawWaveArea(a); }
+            this.channelDrumIds[ch] = drumId;
+            this.channelDrumSourceIds[ch] = drumSourceId;
+            if (a) { a.baseWave = w.baseWave.slice(); a.amplitude = w.amplitude; a.cycles = w.cycles; a.drumSpeed = w.drumSpeed ?? 1; a.wave = wave; this.saveWaveState(a); this.saveChannelDrumState(ch); this.redrawWaveArea(a); this.drumDds[ch]?.setValue(drumId); }
             else {
                 try { sys.localStorage.setItem(this.waveKey(ch), JSON.stringify(wave)); sys.localStorage.setItem(`cm_wt_base_${ch}`, JSON.stringify(w.baseWave)); sys.localStorage.setItem(`cm_wt_amp_${ch}`, String(w.amplitude)); sys.localStorage.setItem(`cm_wt_cycles_${ch}`, String(w.cycles)); } catch (e) { /* ignore */ }
             }
-            this.instIds[ch] = w.instId; saveStr('cm_inst_' + ch, w.instId); this.sendWaveToNative(ch, w.baseWave, w.amplitude, w.cycles);
+            this.instIds[ch] = w.instId; saveStr('cm_inst_' + ch, w.instId); this.sendWaveToNative(ch, w.baseWave, w.amplitude, w.cycles); this.pushChannelDrumToNative(ch);
         });
         this.gridState = JSON.parse(JSON.stringify(style.grid)); saveGridState(this.gridState); this.fxSlots = JSON.parse(JSON.stringify(style.fxSlots)); saveFxSlots(this.fxSlots); this.outputFxSlots = JSON.parse(JSON.stringify(style.outputFxSlots)); saveOutputFxSlots(this.outputFxSlots); this.drumBlackId = style.drumBlackId; this.drumWhiteId = style.drumWhiteId; this.pushFxToNative(); this.pushOutputFxToNative(); this.pushDrumToNative(); this.redrawPlayGrid(); this.scheduleOnce(() => { this.styleTransition = false; this.edgeMode = previousEdgeMode; this.redrawPlayGrid(); }, 1.3); this.setInfo('样式已载入', new Color(220, 225, 235, 255));
     }
@@ -2725,6 +3047,7 @@ export class GameManager extends Component {
             const file = inputEl?.files && inputEl.files[0];
             if (!file) return;
             const url = URL.createObjectURL(file);
+            cachedPickedImage = { url };
             this.loadRemoteAndShow(url);
         };
         inputEl.click();
@@ -2740,7 +3063,15 @@ export class GameManager extends Component {
         if (!path.startsWith('file://') && (path.startsWith('/') || /^[A-Za-z]:/.test(path))) {
             path = 'file://' + path;
         }
+        // 显示图已保存到应用缓存路径；无需再保留体积较大的 imageBase64。
+        cachedPickedImage = { url: path, nativeInfo: { ...info, imageBase64: undefined } };
         this.loadRemoteAndShow(path);
+    }
+
+    private restoreCachedImage() {
+        if (!cachedPickedImage) return;
+        if (cachedPickedImage.nativeInfo) this.store.initFromNative(cachedPickedImage.nativeInfo);
+        this.loadRemoteAndShow(cachedPickedImage.url);
     }
 
     private loadRemoteAndShow(url: string) {
@@ -3262,10 +3593,15 @@ export class GameManager extends Component {
         }
         const targetScale = this.rootScaleFor(portrait);
         const view = this.userViewport(portrait);
-        const menuPos: [number, number] = [view.w / 2 - 24, view.h / 2 - 24];
-        const bx = view.w / 2 - 70, top = view.h / 2 - 59;
+        const mainScale = this.mainUiControlScale();
+        const cornerInset = MAIN_MENU_BUTTON_SIZE / 2 * mainScale + 6;
+        const menuPos: [number, number] = [view.w / 2 - cornerInset, view.h / 2 - cornerInset];
+        const bx = view.w / 2 - Math.max(70, 57.5 * mainScale + 12);
+        const top = menuPos[1] - 46 * mainScale;
+        const menuStep = 39 * mainScale;
         const btnPos: Array<[number, number]> = [
-            [bx, top], [bx, top - 39], [bx, top - 78], [bx, top - 117], [bx, top - 156],
+            [bx, top], [bx, top - menuStep], [bx, top - menuStep * 2],
+            [bx, top - menuStep * 3], [bx, top - menuStep * 4],
         ];
         const infoPos: [number, number] = [-view.w / 2 + 12, view.h / 2 - 34];
         this.mainMenuCollapsedPosition = menuPos;
@@ -3279,19 +3615,33 @@ export class GameManager extends Component {
                 tween(node).stop();
                 const destination = this.mainMenuOpen ? btnPos[i] : menuPos;
                 if (withTween && node.active) this.tweenTo(node, destination[0], destination[1]);
-                else node.setPosition(destination[0], destination[1]);
+                else {
+                    node.setPosition(destination[0], destination[1]);
+                    node.setScale(this.mainMenuOpen ? mainScale : .001, this.mainMenuOpen ? mainScale : .001, 1);
+                }
             }
             this.mainMenuBtn.angle = 0;
             this.mainMenuBtn.setPosition(menuPos[0], menuPos[1]);
+            this.mainMenuBtn.setScale(mainScale, mainScale, 1);
             this.languageBtn.angle = 0;
-            this.languageBtn.setPosition(menuPos[0] - 38, menuPos[1]);
+            const languageOffset = (MAIN_MENU_BUTTON_SIZE + LANGUAGE_BUTTON_SIZE) / 2 + MENU_LANGUAGE_GAP;
+            this.languageBtn.setPosition(menuPos[0] - languageOffset * mainScale, menuPos[1]);
+            this.languageBtn.setScale(mainScale, mainScale, 1);
+            let rightmostConsoleX = menuPos[0];
             for (let i = 0; i < this.consoleButtons.length; i++) {
                 const node = this.consoleButtons[i];
                 node.angle = 0;
-                const x = menuPos[0] - 76 - view.w / 6 - i * 38;
+                const x = menuPos[0] - 76 * mainScale - view.w / 6 - i * 38 * mainScale;
+                if (i === 0) rightmostConsoleX = x;
                 if (withTween) this.tweenTo(node, x, menuPos[1], ROT_TWEEN);
                 else node.setPosition(x, menuPos[1]);
+                node.setScale(mainScale, mainScale, 1);
             }
+            this.lockBtn.angle = 0;
+            const lockX = (rightmostConsoleX + menuPos[0]) / 2;
+            if (withTween) this.tweenTo(this.lockBtn, lockX, menuPos[1], ROT_TWEEN);
+            else this.lockBtn.setPosition(lockX, menuPos[1]);
+            this.lockBtn.setScale(mainScale, mainScale, 1);
             this.infoNode.angle = 0;
             tween(this.infoNode).stop();
             if (withTween) this.tweenTo(this.infoNode, infoPos[0], infoPos[1]);
@@ -3366,7 +3716,7 @@ export class GameManager extends Component {
         if (this.gridResizeInfoActive) return;
         this.infoLabel.string = localized;
         this.infoLabel.color = color;
-        this.infoNode.active = this.gridState.showToneInfo;
+        this.infoNode.active = this.gridState.showToneInfo && !this.uiLocked;
     }
 
     /** 边缘拖动期间强制显示网格尺寸，不受“显示音色提示”开关影响。 */
@@ -3374,18 +3724,18 @@ export class GameManager extends Component {
         this.gridResizeInfoActive = true;
         this.infoLabel.string = text;
         this.infoLabel.color = new Color(220, 225, 235, 255);
-        this.infoNode.active = true;
+        this.infoNode.active = !this.uiLocked;
     }
 
     private restoreInfoAfterGridResize() {
         this.infoLabel.string = this.infoText;
         this.infoLabel.color = this.infoColor;
-        this.infoNode.active = this.gridState.showToneInfo;
+        this.infoNode.active = this.gridState.showToneInfo && !this.uiLocked;
     }
 
     private refreshInfoVisibility() {
         if (!this.infoNode || this.gridResizeInfoActive) return;
-        this.infoNode.active = this.gridState.showToneInfo;
+        this.infoNode.active = this.gridState.showToneInfo && !this.uiLocked;
     }
 
     /** 供调试/插件使用的图片数据访问。 */
