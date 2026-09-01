@@ -20,6 +20,10 @@ import java.io.RandomAccessFile;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * AudioSynth —— 实时音频合成器（方案 A：AudioTrack 流式输出，无需第三方库）。
@@ -46,16 +50,19 @@ public class AudioSynth {
     /** 128 帧在 48kHz 下约 2.7ms，缩短触摸到下一次送入 AudioTrack 的等待。 */
     private static final int CHUNK = 128;
     private static final int MAX_VOICES_DEFAULT = 8;
+    private static final int MAX_VOICE_TAILS = 3;
     /** 再短的点击也至少合成这一段，避免 noteOn/noteOff 落在同一音频块时完全无声。 */
     private static final int MIN_TAP_SAMPLES = Math.max(1, SAMPLE_RATE * 12 / 1000);
     /** 末端使用约 8ms 的平滑窗，保证最后一个 PCM 采样精确回到零。 */
     private static final int DECLICK_SAMPLES = Math.max(2, SAMPLE_RATE * 8 / 1000);
-    /** 复音增加时平滑预留峰值余量，避免同相波形叠加后进入非线性失真。 */
-    private static final float MIX_GAIN_ATTACK = (float) (1.0 - Math.exp(-1.0 / (0.006 * SAMPLE_RATE)));
+    /** 旧音结束后缓慢恢复总线增益，避免和弦音量突然跳变。 */
     private static final float MIX_GAIN_RELEASE = (float) (1.0 - Math.exp(-1.0 / (0.150 * SAMPLE_RATE)));
     private static final float LIMITER_CEILING = 0.92f;
     private static final float LIMITER_RELEASE_PER_BLOCK =
             (float) (1.0 - Math.exp(-CHUNK / (0.120 * SAMPLE_RATE)));
+    private static final float FX_FEEDBACK_LIMIT = 0.76f;
+    private static final long OUTPUT_TAIL_MAX_SAMPLES = SAMPLE_RATE * 4L;
+    private static final float THICK_KICK_DEFAULT_GAIN = 1.28f;
     /** 波表长度（单周期采样点数）。 */
     public static final int WAVE_N = 256;
 
@@ -69,10 +76,34 @@ public class AudioSynth {
     /** 单个通道的波形与周期倍率必须一起替换，音频线程才能始终读到一致状态。 */
     private static final class WavetableState {
         final float[] samples;
+        final float[][] bandLimited;
+        final int[] harmonicLimits;
         final float cycles;
         WavetableState(float[] samples, float cycles) {
             this.samples = samples;
+            this.harmonicLimits = new int[] {127, 64, 32, 16, 8, 4, 2, 1};
+            this.bandLimited = buildBandLimitedTables(samples, harmonicLimits);
             this.cycles = cycles;
+        }
+
+        float sample(double phase, double phaseStep) {
+            double allowed = 0.46 / Math.max(1e-8, Math.abs(phaseStep));
+            int safeLevel = allowed >= 127 ? 0 : allowed >= 64 ? 1 : allowed >= 32 ? 2
+                    : allowed >= 16 ? 3 : allowed >= 8 ? 4 : allowed >= 4 ? 5 : allowed >= 2 ? 6 : 7;
+            float safe = sampleWavetable(bandLimited[safeLevel], phase);
+            if (safeLevel == 0) return safe;
+
+            // Fade in the next harmonic band only inside the 0.46..0.50 Nyquist guard band.
+            // This removes clicks during pitch slides without admitting aliased harmonics.
+            int higherLimit = harmonicLimits[safeLevel - 1];
+            double fadeStart = higherLimit * 0.92;
+            if (allowed <= fadeStart) return safe;
+            float blend = (float) ((allowed - fadeStart) / Math.max(1e-8, higherLimit - fadeStart));
+            if (blend < 0f) blend = 0f;
+            else if (blend > 1f) blend = 1f;
+            blend = blend * blend * (3f - 2f * blend);
+            float higher = sampleWavetable(bandLimited[safeLevel - 1], phase);
+            return safe + (higher - safe) * blend;
         }
     }
     /** 三个通道的波表状态（0=R弦乐、1=G笛、2=B钢琴/铃）。 */
@@ -91,12 +122,14 @@ public class AudioSynth {
         final String id;
         final float volume;
         final float speed;
+        final boolean enabled;
         ChannelDrumState(String id, float volume, float speed) {
             this.id = id;
             this.volume = volume;
             this.speed = speed;
+            this.enabled = id != null && !"none".equals(id);
         }
-        boolean enabled() { return id != null && !"none".equals(id); }
+        boolean enabled() { return enabled; }
     }
 
     private static volatile Map<String, DrumSample> drumSamples = Collections.emptyMap();
@@ -108,7 +141,9 @@ public class AudioSynth {
             "tr808_kick", "tr808_snare", "tr808_hat", "tr909_kick", "tr909_snare", "tr909_hat",
             "tr606_kick", "tr606_snare", "tr606_hat", "acoustic_kick", "acoustic_snare", "acoustic_hat",
             "boombap_kick", "boombap_snare", "boombap_clap", "trap_kick", "trap_snare", "trap_hat",
-            "lofi_kick", "lofi_snare", "lofi_hat"
+            "lofi_kick", "lofi_snare", "lofi_hat", "percussion_shaker", "percussion_maracas",
+            "percussion_tambourine", "percussion_clave", "percussion_rimshot", "percussion_tom",
+            "percussion_cowbell", "percussion_bongo"
     };
 
     static {
@@ -126,12 +161,57 @@ public class AudioSynth {
         if (channel < 0 || channel > 2 || wave == null || wave.length == 0) return;
         int n = Math.min(wave.length, WAVE_N);
         float[] row = new float[WAVE_N];
-        for (int i = 0; i < WAVE_N; i++) row[i] = wave[i % n];
+        float mean = 0f;
+        for (int i = 0; i < WAVE_N; i++) {
+            float value = wave[i % n];
+            if (Float.isNaN(value) || Float.isInfinite(value)) value = 0f;
+            row[i] = Math.max(-1f, Math.min(1f, value));
+            mean += row[i];
+        }
+        mean /= WAVE_N;
+        float peak = 0f;
+        for (int i = 0; i < WAVE_N; i++) {
+            row[i] -= mean;
+            peak = Math.max(peak, Math.abs(row[i]));
+        }
+        if (peak > 1f) for (int i = 0; i < WAVE_N; i++) row[i] /= peak;
         float safeCycles = Float.isNaN(cycles) ? 1f : Math.max(1f, Math.min(8f, cycles));
         WavetableState[] next = wavetableStates.clone();
         next[channel] = new WavetableState(row, safeCycles);
         wavetableStates = next;
         Log.i(TAG, "setWavetable ch=" + channel + " n=" + n + " cycles=" + safeCycles);
+    }
+
+    /** Build mipmapped Fourier reconstructions so discontinuous custom waves do not alias at high notes. */
+    private static float[][] buildBandLimitedTables(float[] source, int[] limits) {
+        float[][] result = new float[limits.length][];
+        double dc = 0;
+        for (float sample : source) dc += sample;
+        dc /= WAVE_N;
+        for (int level = 0; level < limits.length; level++) {
+            int harmonics = Math.min(WAVE_N / 2 - 1, limits[level]);
+            float[] table = new float[WAVE_N];
+            java.util.Arrays.fill(table, (float) dc);
+            for (int k = 1; k <= harmonics; k++) {
+                double cosine = 0, sine = 0;
+                for (int n = 0; n < WAVE_N; n++) {
+                    double angle = 2.0 * Math.PI * k * n / WAVE_N;
+                    cosine += source[n] * Math.cos(angle);
+                    sine += source[n] * Math.sin(angle);
+                }
+                cosine *= 2.0 / WAVE_N;
+                sine *= 2.0 / WAVE_N;
+                for (int n = 0; n < WAVE_N; n++) {
+                    double angle = 2.0 * Math.PI * k * n / WAVE_N;
+                    table[n] += (float) (cosine * Math.cos(angle) + sine * Math.sin(angle));
+                }
+            }
+            float peak = 0f;
+            for (float sample : table) peak = Math.max(peak, Math.abs(sample));
+            if (peak > 1f) for (int n = 0; n < WAVE_N; n++) table[n] /= peak;
+            result[level] = table;
+        }
+        return result;
     }
 
     public static void setChannelDrum(int channel, String id, float volume, float speed) {
@@ -229,15 +309,16 @@ public class AudioSynth {
     }
 
     /** 波表读取：相位 0~1 → 波形采样（线性插值）。 */
-    private static float wt(int ch, double ph) {
+    private static float wt(int ch, double ph, double phaseStep) {
         WavetableState state = wavetableStates[ch];
         double scaledPhase = ph * state.cycles;
-        return sampleWavetable(state.samples, scaledPhase);
+        return state.sample(scaledPhase, phaseStep * state.cycles);
     }
 
     /** 混色时忽略各通道周期倍率，让 RGB 波形在同一基频上融合为一个音色。 */
-    private static float wtPitchLocked(int ch, double ph) {
-        return sampleWavetable(wavetableStates[ch].samples, ph);
+    private static float wtPitchLocked(int ch, double ph, double phaseStep) {
+        WavetableState state = wavetableStates[ch];
+        return state.sample(ph, phaseStep);
     }
 
     private static float sampleWavetable(float[] samples, double ph) {
@@ -280,9 +361,47 @@ public class AudioSynth {
     public static final int FX_GLOBAL_PER_CHANNEL = 4;
     public static final int OUTPUT_FX_SLOTS = 4;
 
+    private static final int FX_NONE = 0;
+    private static final int FX_PSY = 1;
+    private static final int FX_GLITCH = 2;
+    private static final int FX_PULSE = 3;
+    private static final int FX_REESE = 4;
+    private static final int FX_LASER = 5;
+    private static final int FX_LIQUID = 6;
+    private static final int FX_DIST = 7;
+    private static final int FX_FILTER = 8;
+    private static final int FX_DELAY = 9;
+    private static final int FX_REVERB = 10;
+    private static final int FX_CHORUS = 11;
+    private static final int FX_COMPRESSOR = 12;
+    private static final int FX_AIR = 13;
+    private static final int FX_ENV = 14;
+
+    private static int effectKind(String id) {
+        if (id == null) return FX_NONE;
+        switch (id) {
+            case "psy": return FX_PSY;
+            case "glitch": return FX_GLITCH;
+            case "pulse": return FX_PULSE;
+            case "reese": return FX_REESE;
+            case "laser": return FX_LASER;
+            case "liquid": return FX_LIQUID;
+            case "dist": return FX_DIST;
+            case "filter": return FX_FILTER;
+            case "delay": return FX_DELAY;
+            case "reverb": return FX_REVERB;
+            case "chorus": return FX_CHORUS;
+            case "compressor": return FX_COMPRESSOR;
+            case "air": return FX_AIR;
+            case "env": return FX_ENV;
+            default: return FX_NONE;
+        }
+    }
+
     /** 一个槽位的插件配置。 */
     private static final class FxState {
         String id = "none";
+        int kind = FX_NONE;
         boolean invert = false;
         float intensity = 0.5f;
         float[] params = new float[2];  // 由插件 id 决定的语义参数（0..2 个）
@@ -291,6 +410,7 @@ public class AudioSynth {
 
     private static volatile FxState[] fxSlots;
     private static volatile FxState[] outputFxSlots;
+    private static volatile int voiceFxVersion = 1;
     private static volatile int outputFxVersion = 1;
 
     /** 黑鼓（RGB 全 <55）/ 白鼓（RGB 全 >200）的采样 id。 */
@@ -321,6 +441,7 @@ public class AudioSynth {
                     org.json.JSONObject o = arr.optJSONObject(i);
                     if (o != null) {
                         st.id = o.optString("id", "none");
+                        st.kind = effectKind(st.id);
                         st.invert = o.optInt("invert", 0) != 0;
                         st.intensity = Math.max(0f, Math.min(1f, (float) o.optDouble("intensity", 0.5)));
                         st.params = paramsToArray(st.id, o.optJSONObject("params"));
@@ -335,6 +456,7 @@ public class AudioSynth {
                 next[i] = st;
             }
             fxSlots = next;
+            voiceFxVersion++;
             Log.i(TAG, "setEffectSlots ok");
         } catch (Exception e) {
             Log.e(TAG, "setEffectSlots failed", e);
@@ -352,6 +474,7 @@ public class AudioSynth {
                     org.json.JSONObject o = arr.optJSONObject(i);
                     if (o != null) {
                         st.id = o.optString("id", "none");
+                        st.kind = effectKind(st.id);
                         st.invert = o.optInt("invert", 0) != 0;
                         st.intensity = Math.max(0f, Math.min(1f, (float) o.optDouble("intensity", 0.5)));
                         st.params = paramsToArray(st.id, o.optJSONObject("params"));
@@ -411,7 +534,6 @@ public class AudioSynth {
 
     private AudioTrack track;
     private final List<Voice> voices = new ArrayList<>();
-    private final Object voiceLock = new Object();
     private Thread renderThread;
     private volatile boolean running = false;
     private volatile int maxVoices = MAX_VOICES_DEFAULT;
@@ -420,25 +542,73 @@ public class AudioSynth {
     private long outputSampleClock = 0;
     private float voiceBusGain = 1f;
     private float outputLimiterGain = 1f;
+    private float monitorLimiterGain = 1f;
+    private long outputIdleSamples = 0;
+    private boolean outputTailCleared = false;
+    private volatile boolean metronomeEnabled = false;
+    private volatile int metronomeBeatsPerBar = 4;
+    private volatile int metronomeBeatUnit = 4;
+    private volatile int metronomeBpm = 120;
+    private volatile long metronomeNextSample = 0;
+    private long metronomeClickStart = -1;
+    private int metronomeBeat = 0;
+    private boolean metronomeAccent = true;
     private final Object recordingLock = new Object();
     private BufferedOutputStream recordingStream;
     private File recordingFile;
     private long recordingBytes;
     /** 多指持续音：touchId → 持续音符（支持合奏） */
     private final java.util.Map<Integer, Voice> sustainedVoices = new java.util.HashMap<>();
+    private final java.util.Map<Integer, Integer> sustainedGenerations = new java.util.HashMap<>();
+
+    private static final int COMMAND_NOTE_ON = 1;
+    private static final int COMMAND_NOTE_OFF = 2;
+
+    /** UI/JNI threads only publish immutable commands; the audio thread owns every Voice. */
+    private static final class VoiceCommand {
+        final int type, epoch, touchId, generation;
+        final int r, g, b, alpha;
+        final float freq, volume, durationMs;
+
+        VoiceCommand(int type, int epoch, int touchId, int generation,
+                     int r, int g, int b, int alpha, float freq, float volume, float durationMs) {
+            this.type = type;
+            this.epoch = epoch;
+            this.touchId = touchId;
+            this.generation = generation;
+            this.r = r;
+            this.g = g;
+            this.b = b;
+            this.alpha = alpha;
+            this.freq = freq;
+            this.volume = volume;
+            this.durationMs = durationMs;
+        }
+    }
+
+    private final ConcurrentLinkedQueue<VoiceCommand> pendingOneShots = new ConcurrentLinkedQueue<>();
+    private final ConcurrentHashMap<Integer, VoiceCommand> pendingTouchCommands = new ConcurrentHashMap<>();
+    private final ConcurrentLinkedQueue<Integer> pendingTouchIds = new ConcurrentLinkedQueue<>();
+    private final ConcurrentHashMap<Integer, Integer> liveTouchGenerations = new ConcurrentHashMap<>();
+    private final AtomicInteger nextTouchGeneration = new AtomicInteger();
+    private final AtomicInteger commandEpoch = new AtomicInteger();
+    private final AtomicBoolean pendingReleaseAll = new AtomicBoolean();
 
     /** 启动渲染线程与 AudioTrack。 */
     public synchronized void start() {
         if (running) return;
-        synchronized (voiceLock) {
-            voices.clear();
-            sustainedVoices.clear();
-        }
+        clearVoiceState();
         outputChain.setFx(new Voice.ActiveFx[0]);
         appliedOutputFxVersion = 0;
         outputSampleClock = 0;
+        metronomeNextSample = 0;
+        metronomeClickStart = -1;
+        metronomeBeat = 0;
         voiceBusGain = 1f;
         outputLimiterGain = 1f;
+        monitorLimiterGain = 1f;
+        outputIdleSamples = 0;
+        outputTailCleared = false;
         try {
             track = createTrack();
             track.play();
@@ -462,10 +632,7 @@ public class AudioSynth {
         if (t != null) {
             try { t.join(300); } catch (InterruptedException ignored) { }
         }
-        synchronized (voiceLock) {
-            voices.clear();
-            sustainedVoices.clear();
-        }
+        clearVoiceState();
         if (track != null) {
             try {
                 track.pause();
@@ -479,44 +646,120 @@ public class AudioSynth {
     /** 短音符（点按）。第 4 个 int 为 Alpha（0~255）。任意线程可调用。 */
     public void playNote(int r, int g, int b, int alpha, float freq, float volume, float durationMs) {
         if (!running) return;
-        Voice v = new Voice(r, g, b, alpha, freq, volume, durationMs, false);
-        synchronized (voiceLock) {
-            dampReleasedRetrigger(freq);
-            if (activeVoiceCount() >= maxVoices) {
-                stealOldest();
-            }
-            voices.add(v);
-        }
+        pendingOneShots.offer(new VoiceCommand(COMMAND_NOTE_ON, commandEpoch.get(), -1, 0,
+                r, g, b, alpha, freq, volume, durationMs));
     }
 
     /** 持续音开始/原位更新（多指：按 touchId 区分；滑音更新频率/音色/音量，相位连续）。第 5 个 int 为 Alpha。 */
     public void noteOn(int touchId, int r, int g, int b, int alpha, float freq, float volume) {
         if (!running) return;
-        synchronized (voiceLock) {
-            Voice v = sustainedVoices.get(touchId);
-            if (v != null) {
-                v.updateParams(r, g, b, alpha, freq, volume);
-                return;
-            }
-            dampReleasedRetrigger(freq);
-            if (activeVoiceCount() >= maxVoices) {
-                stealOldest();
-            }
-            Voice nv = new Voice(r, g, b, alpha, freq, volume, 0f, true);
-            sustainedVoices.put(touchId, nv);
-            voices.add(nv);
+        Integer generation = liveTouchGenerations.get(touchId);
+        if (generation == null) {
+            int created = nextTouchGeneration.incrementAndGet();
+            Integer existing = liveTouchGenerations.putIfAbsent(touchId, created);
+            generation = existing == null ? created : existing;
         }
+        publishTouchCommand(new VoiceCommand(COMMAND_NOTE_ON, commandEpoch.get(), touchId, generation,
+                r, g, b, alpha, freq, volume, 0f));
     }
 
     /** 释放指定 touchId 的持续音。 */
     public void noteOff(int touchId) {
         if (!running) return;
-        synchronized (voiceLock) {
-            Voice v = sustainedVoices.remove(touchId);
-            if (v != null) {
-                v.release();
+        Integer generation = liveTouchGenerations.remove(touchId);
+        publishTouchCommand(new VoiceCommand(COMMAND_NOTE_OFF, commandEpoch.get(), touchId,
+                generation == null ? 0 : generation, 0, 0, 0, 0, 0f, 0f, 0f));
+    }
+
+    /** Releases every sustained voice when Android/Cocos loses a touch-end event. */
+    public void releaseAllNotes() {
+        liveTouchGenerations.clear();
+        commandEpoch.incrementAndGet();
+        pendingReleaseAll.set(true);
+    }
+
+    private void publishTouchCommand(VoiceCommand command) {
+        VoiceCommand previous = pendingTouchCommands.put(command.touchId, command);
+        if (previous == null) pendingTouchIds.offer(command.touchId);
+    }
+
+    private void clearVoiceState() {
+        voices.clear();
+        sustainedVoices.clear();
+        sustainedGenerations.clear();
+        pendingOneShots.clear();
+        pendingTouchCommands.clear();
+        pendingTouchIds.clear();
+        liveTouchGenerations.clear();
+        pendingReleaseAll.set(false);
+        commandEpoch.incrementAndGet();
+    }
+
+    /** Apply only the latest move for each finger, once per audio block. */
+    private void applyPendingVoiceCommands() {
+        if (pendingReleaseAll.getAndSet(false)) {
+            for (Voice voice : sustainedVoices.values()) voice.release();
+            sustainedVoices.clear();
+            sustainedGenerations.clear();
+        }
+        final int currentEpoch = commandEpoch.get();
+
+        Integer touchId;
+        while ((touchId = pendingTouchIds.poll()) != null) {
+            VoiceCommand command = pendingTouchCommands.remove(touchId);
+            if (command == null || command.epoch != currentEpoch) continue;
+            Voice voice = sustainedVoices.get(touchId);
+            Integer activeGeneration = sustainedGenerations.get(touchId);
+            if (command.type == COMMAND_NOTE_OFF) {
+                if (voice != null && (command.generation == 0 || activeGeneration == null
+                        || activeGeneration == command.generation)) {
+                    voice.release();
+                    sustainedVoices.remove(touchId);
+                    sustainedGenerations.remove(touchId);
+                }
+                continue;
+            }
+            if (voice != null && (activeGeneration == null || activeGeneration != command.generation)) {
+                voice.release();
+                sustainedVoices.remove(touchId);
+                sustainedGenerations.remove(touchId);
+                voice = null;
+            }
+            if (voice != null) {
+                voice.updateParams(command.r, command.g, command.b, command.alpha,
+                        command.freq, command.volume);
+            } else {
+                dampReleasedRetrigger(command.freq);
+                prepareVoiceSlot();
+                Voice created = new Voice(command.r, command.g, command.b, command.alpha,
+                        command.freq, command.volume, 0f, true);
+                sustainedVoices.put(touchId, created);
+                sustainedGenerations.put(touchId, command.generation);
+                voices.add(created);
             }
         }
+
+        VoiceCommand oneShot;
+        while ((oneShot = pendingOneShots.poll()) != null) {
+            if (oneShot.epoch != currentEpoch) continue;
+            dampReleasedRetrigger(oneShot.freq);
+            prepareVoiceSlot();
+            voices.add(new Voice(oneShot.r, oneShot.g, oneShot.b, oneShot.alpha,
+                    oneShot.freq, oneShot.volume, oneShot.durationMs, false));
+        }
+    }
+
+    /** Audio-thread metronome. Beat spacing follows BPM and the denominator of the time signature. */
+    public void setMetronome(boolean enabled, int beatsPerBar, int beatUnit, int bpm) {
+        metronomeBeatsPerBar = Math.max(1, Math.min(32, beatsPerBar));
+        int safeUnit = 4;
+        for (int candidate : new int[] {1, 2, 4, 8, 16, 32}) if (beatUnit == candidate) safeUnit = candidate;
+        metronomeBeatUnit = safeUnit;
+        metronomeBpm = Math.max(20, Math.min(320, bpm));
+        metronomeBeat = 0;
+        metronomeClickStart = -1;
+        metronomeNextSample = outputSampleClock;
+        metronomeEnabled = enabled;
     }
 
     /** 播放默认测试音（中等混合色 + 不透明）。 */
@@ -615,6 +858,30 @@ public class AudioSynth {
         return count;
     }
 
+    private void prepareVoiceSlot() {
+        if (activeVoiceCount() >= maxVoices) stealOldest();
+        while (voices.size() >= maxVoices + MAX_VOICE_TAILS) {
+            Voice retired = null;
+            for (Voice voice : voices) {
+                if (voice.isDeClicking()) { retired = voice; break; }
+            }
+            if (retired == null) {
+                for (Voice voice : voices) {
+                    if (!voice.isSustained()) { retired = voice; break; }
+                }
+            }
+            if (retired == null && !voices.isEmpty()) retired = voices.get(0);
+            if (retired == null) break;
+            voices.remove(retired);
+            final Voice dropped = retired;
+            sustainedVoices.entrySet().removeIf(entry -> {
+                if (entry.getValue() != dropped) return false;
+                sustainedGenerations.remove(entry.getKey());
+                return true;
+            });
+        }
+    }
+
     /** 同音高再次触发时，只快速收掉已释放/非持续的旧尾音，保留真正的多指持续合奏。 */
     private void dampReleasedRetrigger(float freq) {
         for (Voice voice : voices) {
@@ -643,7 +910,11 @@ public class AudioSynth {
 
         victim.deClickStop();
         final Voice retired = victim;
-        sustainedVoices.entrySet().removeIf(entry -> entry.getValue() == retired);
+        sustainedVoices.entrySet().removeIf(entry -> {
+            if (entry.getValue() != retired) return false;
+            sustainedGenerations.remove(entry.getKey());
+            return true;
+        });
     }
 
     /* ---------------- 渲染循环 ---------------- */
@@ -652,25 +923,39 @@ public class AudioSynth {
         android.os.Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
         float[] mixBuf = new float[CHUNK];
         float[] outputBuf = new float[CHUNK];
+        float[] metronomeBuf = new float[CHUNK];
         short[] stereoBuf = new short[CHUNK * 2];
         while (running) {
+            try {
+            applyPendingVoiceCommands();
             int mixedVoiceCount;
-            synchronized (voiceLock) {
-                java.util.Arrays.fill(mixBuf, 0f);
-                mixedVoiceCount = 0;
-                for (Voice v : voices) {
-                    if (v.remaining > 0) mixedVoiceCount++;
-                    v.render(mixBuf, CHUNK);
+            java.util.Arrays.fill(mixBuf, 0f);
+            mixedVoiceCount = 0;
+            for (Voice v : voices) {
+                if (v.remaining > 0) mixedVoiceCount++;
+                v.render(mixBuf, CHUNK);
+            }
+            // Voice ownership stays on this thread, so cleanup never blocks touch dispatch.
+            voices.removeIf(v -> v.remaining <= 0);
+            if (mixedVoiceCount > 0) {
+                outputIdleSamples = 0;
+                outputTailCleared = false;
+            } else if (!outputTailCleared) {
+                outputIdleSamples += CHUNK;
+                if (outputIdleSamples >= OUTPUT_TAIL_MAX_SAMPLES) {
+                    outputChain.resetState();
+                    outputTailCleared = true;
                 }
-                // 清理已结束的音符（释放后的持续音符 remaining 会递减到 0）
-                voices.removeIf(v -> v.remaining <= 0);
             }
             syncOutputFx();
-            float targetVoiceGain = 1f / (float) Math.sqrt(Math.max(1, mixedVoiceCount));
+            long blockStartClock = outputSampleClock;
+            float targetVoiceGain = mixedVoiceCount > 0 ? 1f / mixedVoiceCount : 1f;
+            if (targetVoiceGain < voiceBusGain) voiceBusGain = targetVoiceGain;
             float peak = 0f;
             for (int i = 0; i < CHUNK; i++) {
-                float smoothing = targetVoiceGain < voiceBusGain ? MIX_GAIN_ATTACK : MIX_GAIN_RELEASE;
-                voiceBusGain += (targetVoiceGain - voiceBusGain) * smoothing;
+                if (targetVoiceGain > voiceBusGain) {
+                    voiceBusGain += (targetVoiceGain - voiceBusGain) * MIX_GAIN_RELEASE;
+                }
                 float dry = mixBuf[i] * voiceBusGain;
                 float wet = outputChain.process(dry, 440.0 / SAMPLE_RATE, outputSampleClock / (float) SAMPLE_RATE);
                 if (Float.isNaN(wet) || Float.isInfinite(wet)) wet = 0f;
@@ -689,12 +974,110 @@ public class AudioSynth {
                 stereoBuf[i * 2 + 1] = pcm;
             }
             writeRecordingChunk(stereoBuf);
-            if (track != null) {
-                if (Build.VERSION.SDK_INT >= 23) {
-                    track.write(stereoBuf, 0, stereoBuf.length, AudioTrack.WRITE_BLOCKING);
-                } else {
-                    track.write(stereoBuf, 0, stereoBuf.length);
+
+            // The metronome is a monitor-only signal: add it after recording PCM is finalized.
+            java.util.Arrays.fill(metronomeBuf, 0f);
+            renderMetronome(metronomeBuf, CHUNK, blockStartClock);
+            float monitorPeak = 0f;
+            for (int i = 0; i < CHUNK; i++) {
+                float monitored = outputBuf[i] * outputLimiterGain + metronomeBuf[i];
+                outputBuf[i] = monitored;
+                monitorPeak = Math.max(monitorPeak, Math.abs(monitored));
+            }
+            float targetMonitorGain = monitorPeak > LIMITER_CEILING ? LIMITER_CEILING / monitorPeak : 1f;
+            if (targetMonitorGain < monitorLimiterGain) monitorLimiterGain = targetMonitorGain;
+            else monitorLimiterGain += (targetMonitorGain - monitorLimiterGain) * LIMITER_RELEASE_PER_BLOCK;
+            for (int i = 0; i < CHUNK; i++) {
+                float sample = Math.max(-LIMITER_CEILING,
+                        Math.min(LIMITER_CEILING, outputBuf[i] * monitorLimiterGain));
+                short pcm = (short) (sample * 32767f);
+                stereoBuf[i * 2] = pcm;
+                stereoBuf[i * 2 + 1] = pcm;
+            }
+            writeAudioBlock(stereoBuf);
+            } catch (Exception renderError) {
+                Log.e(TAG, "Audio renderer recovered from an unexpected DSP failure", renderError);
+                clearVoiceState();
+                java.util.Arrays.fill(stereoBuf, (short) 0);
+                voiceBusGain = 1f;
+                outputLimiterGain = 1f;
+                monitorLimiterGain = 1f;
+                writeAudioBlock(stereoBuf);
+            }
+        }
+    }
+
+    private void renderMetronome(float[] mix, int count, long blockStartClock) {
+        if (!metronomeEnabled) return;
+        double beatSeconds = 60.0 / metronomeBpm * 4.0 / metronomeBeatUnit;
+        long interval = Math.max(1, Math.round(beatSeconds * SAMPLE_RATE));
+        int clickLength = Math.max(1, SAMPLE_RATE * 35 / 1000);
+        for (int i = 0; i < count; i++) {
+            long clock = blockStartClock + i;
+            if (clock >= metronomeNextSample) {
+                metronomeClickStart = clock;
+                metronomeAccent = metronomeBeat == 0;
+                metronomeBeat = (metronomeBeat + 1) % metronomeBeatsPerBar;
+                metronomeNextSample = clock + interval;
+            }
+            long age = clock - metronomeClickStart;
+            if (age >= 0 && age < clickLength) {
+                float seconds = age / (float) SAMPLE_RATE;
+                float frequency = metronomeAccent ? 1760f : 1320f;
+                float level = metronomeAccent ? .24f : .17f;
+                mix[i] += (float) Math.sin(2.0 * Math.PI * frequency * seconds)
+                        * level * (float) Math.exp(-seconds * 105f);
+            }
+        }
+    }
+
+    /** Keep the renderer alive across vendor AudioTrack failures instead of leaving a stale sustained buffer. */
+    private void writeAudioBlock(short[] stereoBuf) {
+        if (track == null && running) {
+            try {
+                track = createTrack();
+                track.play();
+            } catch (Exception restartError) {
+                Log.e(TAG, "AudioTrack retry failed", restartError);
+                try { Thread.sleep(40); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+                return;
+            }
+        }
+        if (track == null) return;
+        try {
+            if (Build.VERSION.SDK_INT >= 23) {
+                int offset = 0;
+                long stallStartedNanos = 0;
+                while (offset < stereoBuf.length && running) {
+                    int written = track.write(stereoBuf, offset, stereoBuf.length - offset, AudioTrack.WRITE_NON_BLOCKING);
+                    if (written < 0) throw new IllegalStateException("AudioTrack write failed: " + written);
+                    if (written > 0) {
+                        offset += written;
+                        stallStartedNanos = 0;
+                    } else {
+                        if (stallStartedNanos == 0) stallStartedNanos = System.nanoTime();
+                        if (System.nanoTime() - stallStartedNanos >= 250_000_000L) {
+                            throw new IllegalStateException("AudioTrack stopped accepting PCM for 250ms");
+                        }
+                        try { Thread.sleep(2); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+                    }
                 }
+            } else {
+                int written = track.write(stereoBuf, 0, stereoBuf.length);
+                if (written < 0) throw new IllegalStateException("AudioTrack write failed: " + written);
+            }
+        } catch (Exception error) {
+            Log.e(TAG, "AudioTrack write failed; recreating output", error);
+            try { track.pause(); } catch (Exception ignored) { }
+            try { track.flush(); } catch (Exception ignored) { }
+            try { track.release(); } catch (Exception ignored) { }
+            track = null;
+            if (!running) return;
+            try {
+                track = createTrack();
+                track.play();
+            } catch (Exception restartError) {
+                Log.e(TAG, "AudioTrack recovery failed", restartError);
             }
         }
     }
@@ -725,7 +1108,7 @@ public class AudioSynth {
         java.util.List<Voice.ActiveFx> list = new java.util.ArrayList<>();
         for (int i = 0; i < Math.min(states.length, OUTPUT_FX_SLOTS); i++) {
             FxState st = states[i];
-            if (st == null || "none".equals(st.id)) continue;
+            if (st == null || st.kind == FX_NONE) continue;
             float depth = (st.invert ? 0f : 1f) * Math.max(0f, Math.min(1f, st.intensity));
             if (depth > 0.003f) list.add(new Voice.ActiveFx(st, depth));
         }
@@ -847,11 +1230,6 @@ public class AudioSynth {
         private float stringLpCoef;
         private double stringLpState = 0;
 
-        // 简易回声（空间感，alpha 越低回声越多）
-        private final float[] delayBuf;
-        private int delayIdx = 0;
-        private float delayMix;
-
         // 声部增益
         private float gStr, gFlu, gBell;
         private float targetGStr, targetGFlu, targetGBell;
@@ -871,10 +1249,20 @@ public class AudioSynth {
         // 效果器槽位（activeFx 在 updateParams 时按颜色重建；id/深度/参数引用）
         private static final class ActiveFx {
             final FxState st;
-            final float depth;
-            ActiveFx(FxState s, float d) { st = s; depth = d; }
+            final int kind;
+            final int triggerIndex;
+            float depth;
+            ActiveFx(FxState s, float d) { this(s, d, -1); }
+            ActiveFx(FxState s, float d, int triggerIndex) {
+                st = s;
+                kind = s.kind;
+                depth = d;
+                this.triggerIndex = triggerIndex;
+            }
         }
         private ActiveFx[] activeFx = new ActiveFx[0];
+        private int appliedVoiceFxVersion = 0;
+        private final float[] triggerInputs = new float[FX_TRIGGERED];
         /** 全局效果器链（0=R、1=G、2=B）：无触发条件，恒定作用于对应色相。每声道一条、状态独立。 */
         private final FxChain[] globalFx = { new FxChain(), new FxChain(), new FxChain() };
         private float envDepth = 0f;      // 包络器混合深度（与总体包络混合）
@@ -893,24 +1281,16 @@ public class AudioSynth {
         // 混响（4 梳状 + 1 全通）
         private boolean reverbActive = false;
         private float reverbFb = 0.7f, reverbWet = 0.5f;
-        private final float[][] combBuf;
-        private final int[] combIdx;
-        private final float[] apBuf;
+        private float[][] combBuf = new float[0][];
+        private int[] combIdx = new int[0];
+        private float[] apBuf = new float[0];
         private int apIdx = 0;
         // 延迟/合唱共用 0.4s 延迟线
-        private final float[] fxDelayBuf = new float[(int) (0.4f * SAMPLE_RATE)];
+        private float[] fxDelayBuf = new float[1];
         private int fxDelayIdx = 0;
 
         Voice(int r, int g, int b, int a, float freq, float volume, float durationMs, boolean sustained) {
             this.sustained = sustained;
-            delayBuf = new float[(int) (0.18 * SAMPLE_RATE)]; // 180ms 单延迟线
-            // 混响：4 条梳状延迟（30/37/44/51ms）+ 全通（6.8ms）
-            combBuf = new float[4][];
-            combIdx = new int[4];
-            int[] combLen = { (int) (0.030 * SAMPLE_RATE), (int) (0.037 * SAMPLE_RATE),
-                    (int) (0.044 * SAMPLE_RATE), (int) (0.051 * SAMPLE_RATE) };
-            for (int i = 0; i < 4; i++) combBuf[i] = new float[combLen[i]];
-            apBuf = new float[(int) (0.0068 * SAMPLE_RATE)];
             updateParams(r, g, b, a, freq, volume);
             if (sustained) {
                 totalSamples = Integer.MAX_VALUE; // 持续音符无固定时长
@@ -984,8 +1364,6 @@ public class AudioSynth {
 
             // 衰减（新 alpha=均匀度）：色彩饱和/暗 → 余音更长更远
             decayScale = 0.6f + 1.2f * (1f - avg) + 0.5f * (1f - even) + 0.3f * b01;
-            delayMix = 0f; // 基础回声并入"混响/延迟"效果器槽位（由用户配置）
-
             // 直接触摸使用 4~18ms 快速起音；测试短音仍保留原来的表现范围。
             attack = sustained
                     ? 0.018f + (0.004f - 0.018f) * even
@@ -1031,64 +1409,103 @@ public class AudioSynth {
             float inBLo = allLow && b <= r && b <= g ? (55 - b) / 55f : 0f;
             float even = pielouEvenness(r, g, b);
             float avg = (r + g + b) / 255f / 3f;
-            float[] inputs = { inRHi, inRLo, inGHi, inGLo, inBHi, inBLo, even, avg };
+            triggerInputs[0] = inRHi; triggerInputs[1] = inRLo;
+            triggerInputs[2] = inGHi; triggerInputs[3] = inGLo;
+            triggerInputs[4] = inBHi; triggerInputs[5] = inBLo;
+            triggerInputs[6] = even; triggerInputs[7] = avg;
 
             FxState[] slots = fxSlots;
-            java.util.List<ActiveFx> list = new java.util.ArrayList<>();
+            int version = voiceFxVersion;
+            if (appliedVoiceFxVersion != version) {
+                configureVoiceFx(slots);
+                appliedVoiceFxVersion = version;
+            }
+
             float effScale = 1f - drumWeight;
+            envDepth = 0f;
+            for (ActiveFx effect : activeFx) {
+                FxState st = effect.st;
+                float input = Math.max(0f, Math.min(1f, triggerInputs[effect.triggerIndex]));
+                effect.depth = (st.invert ? 1f - input : input)
+                        * Math.max(0f, Math.min(1f, st.intensity)) * effScale;
+                if (effect.kind == FX_ENV) envDepth = Math.max(envDepth, effect.depth);
+            }
+        }
+
+        /** Rebuild topology only when the user changes effect slots, never on ordinary touch moves. */
+        private void configureVoiceFx(FxState[] slots) {
+            java.util.List<ActiveFx> configured = new java.util.ArrayList<>();
             for (int i = 0; i < FX_TRIGGERED; i++) {
                 FxState st = slots[i];
-                if (st == null || "none".equals(st.id)) continue;
-                float input = Math.max(0f, Math.min(1f, inputs[i]));
-                float depth = (st.invert ? 1f - input : input)
-                        * Math.max(0f, Math.min(1f, st.intensity)) * effScale;
-                if (depth > 0.003f) list.add(new ActiveFx(st, depth));
+                if (st != null && st.kind != FX_NONE) configured.add(new ActiveFx(st, 0f, i));
             }
-            activeFx = list.toArray(new ActiveFx[0]);
+            activeFx = configured.toArray(new ActiveFx[0]);
 
-            // 全局效果器（无触发条件：input=1，depth=强度；作用于单色相，不受鼓权重门控）
-            for (int g = 0; g < FX_GLOBAL_COUNT; g++) {
-                java.util.List<ActiveFx> glist = new java.util.ArrayList<>();
+            for (int channel = 0; channel < FX_GLOBAL_COUNT; channel++) {
+                java.util.List<ActiveFx> global = new java.util.ArrayList<>();
                 for (int j = 0; j < FX_GLOBAL_PER_CHANNEL; j++) {
-                    FxState st = slots[FX_GLOBAL_BASE + g * FX_GLOBAL_PER_CHANNEL + j];
-                    if (st != null && !"none".equals(st.id)) {
-                        float depth = (st.invert ? 0f : 1f) * Math.max(0f, Math.min(1f, st.intensity));
-                        if (depth > 0.003f) glist.add(new ActiveFx(st, depth));
-                    }
+                    FxState st = slots[FX_GLOBAL_BASE + channel * FX_GLOBAL_PER_CHANNEL + j];
+                    if (st == null || st.kind == FX_NONE) continue;
+                    float depth = (st.invert ? 0f : 1f) * Math.max(0f, Math.min(1f, st.intensity));
+                    if (depth > 0.003f) global.add(new ActiveFx(st, depth));
                 }
-                globalFx[g].setFx(glist.toArray(new ActiveFx[0]));
+                globalFx[channel].setFx(global.toArray(new ActiveFx[0]));
             }
 
-            // 由槽位初始化 EQ / ADSR / 混响参数
+            ensureTriggeredEffectBuffers();
             eqActive = false;
             adsrActive = false;
-            envDepth = 0f;
             reverbActive = false;
-            for (ActiveFx f : activeFx) {
-                FxState st = f.st;
-                if ("filter".equals(st.id) && !eqActive) {
+            for (ActiveFx effect : activeFx) {
+                FxState st = effect.st;
+                if (effect.kind == FX_FILTER && !eqActive) {
                     eqActive = true;
                     eqMix = st.params.length > 0 ? Math.max(0f, Math.min(1f, st.params[0])) : 1f;
                     buildEqCoeffs(st.curve);
-                } else if ("env".equals(st.id)) {
+                } else if (effect.kind == FX_ENV) {
                     adsrActive = true;
                     parseAdsr(st.curve);
                     float atkT = st.params.length > 0 ? st.params[0] : 0.1f;
                     float relT = st.params.length > 1 ? st.params[1] : 0.3f;
                     adsrAtkDur = Math.max(0.005f, adsrAtkDur * atkT);
                     adsrRelDur = Math.max(0.02f, adsrRelDur * relT);
-                    if (f.depth > envDepth) envDepth = f.depth;
-                } else if ("reverb".equals(st.id) && !reverbActive) {
+                } else if (effect.kind == FX_REVERB && !reverbActive) {
                     reverbActive = true;
                     float size = st.params.length > 0 ? st.params[0] : 0.5f;
                     reverbFb = 0.5f + 0.35f * size;
                     reverbWet = 0.35f + 0.45f * size;
                 }
             }
-            for (double[] s : eqState) { s[0] = 0; s[1] = 0; s[2] = 0; s[3] = 0; }
+            resetTriggeredEffectState();
+        }
+
+        private void ensureTriggeredEffectBuffers() {
+            boolean needsDelay = false;
+            boolean needsReverb = false;
+            for (ActiveFx effect : activeFx) {
+                needsDelay |= effect.kind == FX_DELAY || effect.kind == FX_CHORUS;
+                needsReverb |= effect.kind == FX_REVERB;
+            }
+            if (needsDelay && fxDelayBuf.length <= 1) fxDelayBuf = new float[(int) (0.4f * SAMPLE_RATE)];
+            if (needsReverb && combBuf.length == 0) {
+                int[] lengths = { (int) (0.030 * SAMPLE_RATE), (int) (0.037 * SAMPLE_RATE),
+                        (int) (0.044 * SAMPLE_RATE), (int) (0.051 * SAMPLE_RATE) };
+                combBuf = new float[lengths.length][];
+                combIdx = new int[lengths.length];
+                for (int i = 0; i < lengths.length; i++) combBuf[i] = new float[lengths[i]];
+                apBuf = new float[(int) (0.0068 * SAMPLE_RATE)];
+            }
+        }
+
+        private void resetTriggeredEffectState() {
+            for (double[] state : eqState) java.util.Arrays.fill(state, 0);
             fxPsyPhase = fxGlitchPhase = fxPulsePhase = fxReesePhase = fxLaserPhase = fxLiquidPhase = fxChorusPhase = 0;
+            fxAirState = 0f;
             fxDelayIdx = 0;
-            for (int[] idx : new int[][]{combIdx}) for (int i = 0; i < idx.length; i++) idx[i] = 0;
+            java.util.Arrays.fill(fxDelayBuf, 0f);
+            for (int i = 0; i < combIdx.length; i++) combIdx[i] = 0;
+            for (float[] buffer : combBuf) java.util.Arrays.fill(buffer, 0f);
+            java.util.Arrays.fill(apBuf, 0f);
             apIdx = 0;
         }
 
@@ -1236,29 +1653,32 @@ public class AudioSynth {
         void render(float[] buf, int count) {
             if (releasePending && elapsed >= MIN_TAP_SAMPLES) beginRelease();
             int n = Math.min(count, remaining);
+            ChannelDrumState[] drumStates = channelDrumStates;
+            ChannelDrumState drumR = drumStates[0], drumG = drumStates[1], drumB = drumStates[2];
             for (int i = 0; i < n; i++) {
                 float t = (float) elapsed / SAMPLE_RATE;
                 smoothVoiceMix();
 
                 // 三个声部（各带自己的包络特征；先经各自通道的全局效果器塑形，再按通道增益混合）
-                ChannelDrumState[] drumStates = channelDrumStates;
-                ChannelDrumState drumR = drumStates[0], drumG = drumStates[1], drumB = drumStates[2];
-                float string = drumR.enabled() ? oneShot(drumR.id, elapsed, drumR.speed) * drumR.volume : stringPart(t);
-                float flute = drumG.enabled() ? oneShot(drumG.id, elapsed, drumG.speed) * drumG.volume : flutePart(t);
-                float bell = drumB.enabled() ? oneShot(drumB.id, elapsed, drumB.speed) * drumB.volume : bellPart(t);
-                if (Math.max(gStr, targetGStr) > 0.0005f) string = globalFx[0].process(string, step, t);
-                if (Math.max(gFlu, targetGFlu) > 0.0005f) flute = globalFx[1].process(flute, step, t);
-                if (Math.max(gBell, targetGBell) > 0.0005f) bell = globalFx[2].process(bell, step, t);
-                float base = (string * gStr * (drumR.enabled() ? 1f : pitchGain)
-                        + flute * gFlu * (drumG.enabled() ? 1f : pitchGain)
-                        + bell * gBell * (drumB.enabled() ? 1f : pitchGain)) * sumNorm;
+                boolean useR = Math.max(Math.abs(gStr), Math.abs(targetGStr)) > 0.0005f;
+                boolean useG = Math.max(Math.abs(gFlu), Math.abs(targetGFlu)) > 0.0005f;
+                boolean useB = Math.max(Math.abs(gBell), Math.abs(targetGBell)) > 0.0005f;
+                float string = useR ? (drumR.enabled ? oneShot(drumR.id, elapsed, drumR.speed) * drumR.volume : stringPart(t)) : 0f;
+                float flute = useG ? (drumG.enabled ? oneShot(drumG.id, elapsed, drumG.speed) * drumG.volume : flutePart(t)) : 0f;
+                float bell = useB ? (drumB.enabled ? oneShot(drumB.id, elapsed, drumB.speed) * drumB.volume : bellPart(t)) : 0f;
+                if (useR && !globalFx[0].isEmpty()) string = globalFx[0].process(string, step, t);
+                if (useG && !globalFx[1].isEmpty()) flute = globalFx[1].process(flute, step, t);
+                if (useB && !globalFx[2].isEmpty()) bell = globalFx[2].process(bell, step, t);
+                float base = (string * gStr * (drumR.enabled ? 1f : pitchGain)
+                        + flute * gFlu * (drumG.enabled ? 1f : pitchGain)
+                        + bell * gBell * (drumB.enabled ? 1f : pitchGain)) * sumNorm;
 
                 // 鼓组：snare/kick 与基础音色按权重叠加（互斥，取大者；黑/白鼓元素可配置）
                 float mixed = base;
                 if (drumWeight > 0.001f) {
                     boolean bright = snareWeight > kickWeight;
                     String did = bright ? drumWhite : drumBlack;
-                    float drum = drumSample(did, t);
+                    float drum = drumSample(did, t) * (bright ? 1f : THICK_KICK_DEFAULT_GAIN);
                     mixed = drum * drumWeight + base * (1f - drumWeight);
                 }
 
@@ -1273,65 +1693,65 @@ public class AudioSynth {
                 for (ActiveFx f : activeFx) {
                     FxState st = f.st;
                     float depth = f.depth;
-                    String id = st.id;
-                    if ("psy".equals(id)) {
+                    if (depth <= 0.0001f || f.kind == FX_ENV) continue;
+                    if (f.kind == FX_PSY) {
                         float rate = st.params.length > 0 ? st.params[0] : 8f;
                         fxPsyPhase += rate / SAMPLE_RATE * Math.PI * 2;
                         float trem = 1f - depth * 0.8f * (0.5f - 0.5f * (float) Math.cos(fxPsyPhase));
                         out *= trem;
-                    } else if ("glitch".equals(id)) {
+                    } else if (f.kind == FX_GLITCH) {
                         float duty = st.params.length > 0 ? st.params[0] : 0.5f;
                         float rate = 8f + 26f * depth;
                         fxGlitchPhase += rate / SAMPLE_RATE;
                         float gp = (float) (fxGlitchPhase - Math.floor(fxGlitchPhase));
                         float gate = gp < duty ? 1f : (0.10f + 0.08f * depth);
                         out *= gate;
-                    } else if ("pulse".equals(id)) {
+                    } else if (f.kind == FX_PULSE) {
                         float freq = st.params.length > 0 ? st.params[0] : 55f;
                         fxPulsePhase += freq / SAMPLE_RATE;
                         float sub = (float) Math.sin(2.0 * Math.PI * (fxPulsePhase - Math.floor(fxPulsePhase)));
                         out += sub * depth * 0.35f;
-                    } else if ("reese".equals(id)) {
+                    } else if (f.kind == FX_REESE) {
                         float detune = st.params.length > 0 ? st.params[0] : 1.2f;
                         fxReesePhase += step * (1f + detune * 0.03f);
                         double rp = fxReesePhase - Math.floor(fxReesePhase);
                         float det = (float) (2.0 * rp - 1.0);
                         out += det * depth * 0.2f;
-                    } else if ("laser".equals(id)) {
+                    } else if (f.kind == FX_LASER) {
                         float sweep = st.params.length > 0 ? st.params[0] : 1.6f;
                         float prog = Math.min(1f, t / 0.09f);
                         float lf = (float) ((2.6f - 1.6f * prog) * sweep * step);
                         fxLaserPhase += lf;
                         out += (float) Math.sin(2.0 * Math.PI * (fxLaserPhase - Math.floor(fxLaserPhase)))
                                 * depth * 0.35f * (1f - prog);
-                    } else if ("liquid".equals(id)) {
+                    } else if (f.kind == FX_LIQUID) {
                         float rate = st.params.length > 0 ? st.params[0] : 0.8f;
                         fxLiquidPhase += rate / SAMPLE_RATE * Math.PI * 2;
                         float swell = 1f + depth * 0.18f * (float) Math.sin(fxLiquidPhase);
                         out *= swell;
-                    } else if ("dist".equals(id)) {
+                    } else if (f.kind == FX_DIST) {
                         float d = depth * 1.6f;
                         float x = out * (1f + d * 3f);
                         out = (float) Math.tanh(x) / (1f + d * 3f) * (1f + d);
-                    } else if ("filter".equals(id)) {
+                    } else if (f.kind == FX_FILTER) {
                         float fout = out;
                         for (int bi = 0; bi < EQ_BANDS; bi++) fout = biquad(fout, eqCoef[bi], eqState[bi]);
                         out = fxFilterDry * (1f - depth * eqMix) + fout * (depth * eqMix);
-                    } else if ("delay".equals(id)) {
+                    } else if (f.kind == FX_DELAY) {
                         float time = st.params.length > 0 ? st.params[0] : 0.18f;
-                        float fb = st.params.length > 1 ? st.params[1] : 0.4f;
+                        float fb = Math.max(0f, Math.min(FX_FEEDBACK_LIMIT, st.params.length > 1 ? st.params[1] : 0.4f));
                         int dn = fxDelayBuf.length;
                         int read = (fxDelayIdx - (int) (time * SAMPLE_RATE) + dn) % dn;
                         float del = fxDelayBuf[read];
-                        fxDelayWrite = out + del * fb;
+                        fxDelayWrite = stableState(out + del * fb);
                         out += del * depth * 0.8f;
                         fxDelayWet = 1f;
-                    } else if ("reverb".equals(id)) {
+                    } else if (f.kind == FX_REVERB) {
                         float acc = 0f;
                         for (int ci = 0; ci < 4; ci++) {
                             int len = combBuf[ci].length;
                             float cb = combBuf[ci][combIdx[ci]];
-                            float sc = out + cb * reverbFb;
+                            float sc = stableState(out + cb * Math.min(FX_FEEDBACK_LIMIT, reverbFb));
                             combBuf[ci][combIdx[ci]] = sc;
                             combIdx[ci] = (combIdx[ci] + 1) % len;
                             acc += cb;
@@ -1340,10 +1760,10 @@ public class AudioSynth {
                         int al = apBuf.length;
                         float ap = apBuf[(apIdx + al - 1) % al];
                         float apOut = -0.5f * acc + ap;
-                        apBuf[apIdx] = acc + apOut * 0.5f;
+                        apBuf[apIdx] = stableState(acc + apOut * 0.5f);
                         apIdx = (apIdx + 1) % al;
                         out = out * (1f - depth * reverbWet) + apOut * depth * reverbWet * 1.4f;
-                    } else if ("chorus".equals(id)) {
+                    } else if (f.kind == FX_CHORUS) {
                         float rate = st.params.length > 0 ? st.params[0] : 0.8f;
                         float cdepth = st.params.length > 1 ? st.params[1] : 0.3f;
                         fxChorusPhase += rate / SAMPLE_RATE * Math.PI * 2;
@@ -1354,15 +1774,15 @@ public class AudioSynth {
                         fxDelayWrite = out;
                         out = out * (1f - depth * 0.5f) + del * depth * 0.5f;
                         fxDelayWet = 1f;
-                    } else if ("compressor".equals(id)) {
+                    } else if (f.kind == FX_COMPRESSOR) {
                         float threshold = (float) Math.pow(10.0, (st.params.length > 0 ? st.params[0] : -18f) / 20.0);
                         float ratio = st.params.length > 1 ? Math.max(1f, st.params[1]) : 4f;
                         float av = Math.abs(out);
                         if (av > threshold) {
                             float compressed = threshold + (av - threshold) / ratio;
-                            out = Math.signum(out) * (out * (1f - depth) + compressed * depth);
+                            out = Math.signum(out) * (av * (1f - depth) + compressed * depth);
                         }
-                    } else if ("air".equals(id)) {
+                    } else if (f.kind == FX_AIR) {
                         float amount = st.params.length > 0 ? st.params[0] : 0.08f;
                         float tone = st.params.length > 1 ? st.params[1] : 0.55f;
                         float nz = nextNoise();
@@ -1373,7 +1793,7 @@ public class AudioSynth {
                 // 延迟线统一写入（有 delay/chorus 才写；否则保持零避免爆音）
                 int fxDN = fxDelayBuf.length;
                 if (fxDelayWet > 0.001f) {
-                    fxDelayBuf[fxDelayIdx] = fxDelayWrite;
+                    fxDelayBuf[fxDelayIdx] = stableState(fxDelayWrite);
                 } else if (fxDelayBuf[fxDelayIdx] != 0f) {
                     fxDelayBuf[fxDelayIdx] = 0f;
                 }
@@ -1393,6 +1813,7 @@ public class AudioSynth {
                     p = Math.max(0f, Math.min(1f, p));
                     env *= p * p * (3f - 2f * p);
                 }
+                out = stableOutput(out);
                 float sample = out * amp * env;
 
                 buf[i] += sample;
@@ -1496,18 +1917,18 @@ public class AudioSynth {
         }
 
         private float presenceEnhancedWave(int channel) {
-            float fundamental = voiceWave(channel, phase);
+            float fundamental = voiceWave(channel, phase, step);
             if (lowPresence <= 0.0001f) return fundamental;
-            float harmonics = voiceWave(channel, phase * 2.0) * 0.30f
-                    + voiceWave(channel, phase * 3.0) * 0.10f;
-            return (fundamental + harmonics * lowPresence) / (1f + 0.12f * lowPresence);
+            float harmonics = voiceWave(channel, phase * 2.0, step * 2.0) * 0.30f
+                    + voiceWave(channel, phase * 3.0, step * 3.0) * 0.10f;
+            return (fundamental + harmonics * lowPresence) / (1f + 0.40f * lowPresence);
         }
 
-        private float voiceWave(int channel, double ph) {
-            if (mixLockBlend <= 0.0001f) return wt(channel, ph);
-            if (mixLockBlend >= 0.9999f) return wtPitchLocked(channel, ph);
-            float solo = wt(channel, ph);
-            float mixed = wtPitchLocked(channel, ph);
+        private float voiceWave(int channel, double ph, double phaseStep) {
+            if (mixLockBlend <= 0.0001f) return wt(channel, ph, phaseStep);
+            if (mixLockBlend >= 0.9999f) return wtPitchLocked(channel, ph, phaseStep);
+            float solo = wt(channel, ph, phaseStep);
+            float mixed = wtPitchLocked(channel, ph, phaseStep);
             // 等功率交叉淡化，避免波长倍率切换时在任意相位产生阶跃。
             float angle = mixLockBlend * (float) Math.PI * 0.5f;
             return solo * (float) Math.cos(angle) + mixed * (float) Math.sin(angle);
@@ -1546,6 +1967,23 @@ public class AudioSynth {
             return (noiseState & 0xFFFF) / 32768f - 1f;
         }
 
+        private static float stableState(float value) {
+            if (Float.isNaN(value) || Float.isInfinite(value)) return 0f;
+            return smoothEmergencyBound(value, 4f);
+        }
+
+        private static float stableOutput(float value) {
+            if (Float.isNaN(value) || Float.isInfinite(value)) return 0f;
+            return smoothEmergencyBound(value, 8f);
+        }
+
+        private static float smoothEmergencyBound(float value, float threshold) {
+            float magnitude = Math.abs(value);
+            if (magnitude <= threshold) return value;
+            float softened = threshold + 1f - (float) Math.exp(-(magnitude - threshold));
+            return Math.copySign(softened, value);
+        }
+
         /** 一条效果链（供全局效果器使用）：状态独立，作用于单一色相采样流。无 ADSR 包络（包络仅对触发链/整体起作用）。 */
         private static final class FxChain {
             ActiveFx[] fx = new ActiveFx[0];
@@ -1554,37 +1992,58 @@ public class AudioSynth {
             final float[][] eqCoef = new float[EQ_BANDS][5];
             final double[][] eqState = new double[EQ_BANDS][4];
             boolean reverbActive = false; float reverbFb = 0.7f, reverbWet = 0.5f;
-            float[][] combBuf; int[] combIdx; float[] apBuf; int apIdx = 0;
-            float[] fxDelayBuf; int fxDelayIdx = 0;
+            float[][] combBuf = new float[0][]; int[] combIdx = new int[0];
+            float[] apBuf = new float[0]; int apIdx = 0;
+            float[] fxDelayBuf = new float[1]; int fxDelayIdx = 0;
             long noiseState = 0xD1B54A32D192ED03L;
             float airState = 0f;
             float inputActivity = 0f;
 
-            FxChain() {
-                int[] combLen = { (int) (0.030 * SAMPLE_RATE), (int) (0.037 * SAMPLE_RATE),
-                        (int) (0.044 * SAMPLE_RATE), (int) (0.051 * SAMPLE_RATE) };
-                combBuf = new float[4][]; combIdx = new int[4];
-                for (int i = 0; i < 4; i++) combBuf[i] = new float[combLen[i]];
-                apBuf = new float[(int) (0.0068 * SAMPLE_RATE)];
-                fxDelayBuf = new float[(int) (0.4f * SAMPLE_RATE)];
-            }
+            FxChain() { }
 
             void setFx(ActiveFx[] list) {
                 fx = list;
+                ensureBuffers(list);
                 eqActive = false; reverbActive = false;
                 for (ActiveFx f : list) {
                     FxState st = f.st;
-                    if ("filter".equals(st.id) && !eqActive) {
+                    if (f.kind == FX_FILTER && !eqActive) {
                         eqActive = true;
                         eqMix = st.params.length > 0 ? Math.max(0f, Math.min(1f, st.params[0])) : 1f;
                         buildEqCoeffs(st.curve);
-                    } else if ("reverb".equals(st.id) && !reverbActive) {
+                    } else if (f.kind == FX_REVERB && !reverbActive) {
                         reverbActive = true;
                         float size = st.params.length > 0 ? st.params[0] : 0.5f;
                         reverbFb = 0.5f + 0.35f * size;
                         reverbWet = 0.35f + 0.45f * size;
                     }
                 }
+                resetState();
+            }
+
+            boolean isEmpty() {
+                return fx.length == 0;
+            }
+
+            private void ensureBuffers(ActiveFx[] list) {
+                boolean needsDelay = false;
+                boolean needsReverb = false;
+                for (ActiveFx effect : list) {
+                    needsDelay |= effect.kind == FX_DELAY || effect.kind == FX_CHORUS;
+                    needsReverb |= effect.kind == FX_REVERB;
+                }
+                if (needsDelay && fxDelayBuf.length <= 1) fxDelayBuf = new float[(int) (0.4f * SAMPLE_RATE)];
+                if (needsReverb && combBuf.length == 0) {
+                    int[] lengths = { (int) (0.030 * SAMPLE_RATE), (int) (0.037 * SAMPLE_RATE),
+                            (int) (0.044 * SAMPLE_RATE), (int) (0.051 * SAMPLE_RATE) };
+                    combBuf = new float[lengths.length][];
+                    combIdx = new int[lengths.length];
+                    for (int i = 0; i < lengths.length; i++) combBuf[i] = new float[lengths[i]];
+                    apBuf = new float[(int) (0.0068 * SAMPLE_RATE)];
+                }
+            }
+
+            void resetState() {
                 for (double[] s : eqState) { s[0] = 0; s[1] = 0; s[2] = 0; s[3] = 0; }
                 psyPhase = glitchPhase = pulsePhase = reesePhase = laserPhase = liquidPhase = chorusPhase = 0;
                 fxDelayIdx = 0; apIdx = 0;
@@ -1664,65 +2123,64 @@ public class AudioSynth {
                 for (ActiveFx f : fx) {
                     FxState st = f.st;
                     float depth = f.depth;
-                    String id = st.id;
-                    if ("psy".equals(id)) {
+                    if (f.kind == FX_PSY) {
                         float rate = st.params.length > 0 ? st.params[0] : 8f;
                         psyPhase += rate / SAMPLE_RATE * Math.PI * 2;
                         float trem = 1f - depth * 0.8f * (0.5f - 0.5f * (float) Math.cos(psyPhase));
                         out *= trem;
-                    } else if ("glitch".equals(id)) {
+                    } else if (f.kind == FX_GLITCH) {
                         float duty = st.params.length > 0 ? st.params[0] : 0.5f;
                         float rate = 8f + 26f * depth;
                         glitchPhase += rate / SAMPLE_RATE;
                         float gp = (float) (glitchPhase - Math.floor(glitchPhase));
                         float gate = gp < duty ? 1f : (0.10f + 0.08f * depth);
                         out *= gate;
-                    } else if ("pulse".equals(id)) {
+                    } else if (f.kind == FX_PULSE) {
                         float freq = st.params.length > 0 ? st.params[0] : 55f;
                         pulsePhase += freq / SAMPLE_RATE;
                         float sub = (float) Math.sin(2.0 * Math.PI * (pulsePhase - Math.floor(pulsePhase)));
                         out += sub * depth * 0.35f * inputActivity;
-                    } else if ("reese".equals(id)) {
+                    } else if (f.kind == FX_REESE) {
                         float detune = st.params.length > 0 ? st.params[0] : 1.2f;
                         reesePhase += step * (1f + detune * 0.03f);
                         double rp = reesePhase - Math.floor(reesePhase);
                         float det = (float) (2.0 * rp - 1.0);
                         out += det * depth * 0.2f * inputActivity;
-                    } else if ("laser".equals(id)) {
+                    } else if (f.kind == FX_LASER) {
                         float sweep = st.params.length > 0 ? st.params[0] : 1.6f;
                         float prog = Math.min(1f, t / 0.09f);
                         float lf = (float) ((2.6f - 1.6f * prog) * sweep * step);
                         laserPhase += lf;
                         out += (float) Math.sin(2.0 * Math.PI * (laserPhase - Math.floor(laserPhase)))
                                 * depth * 0.35f * (1f - prog) * inputActivity;
-                    } else if ("liquid".equals(id)) {
+                    } else if (f.kind == FX_LIQUID) {
                         float rate = st.params.length > 0 ? st.params[0] : 0.8f;
                         liquidPhase += rate / SAMPLE_RATE * Math.PI * 2;
                         float swell = 1f + depth * 0.18f * (float) Math.sin(liquidPhase);
                         out *= swell;
-                    } else if ("dist".equals(id)) {
+                    } else if (f.kind == FX_DIST) {
                         float d = depth * 1.6f;
                         float x = out * (1f + d * 3f);
                         out = (float) Math.tanh(x) / (1f + d * 3f) * (1f + d);
-                    } else if ("filter".equals(id)) {
+                    } else if (f.kind == FX_FILTER) {
                         float fout = out;
                         for (int bi = 0; bi < EQ_BANDS; bi++) fout = biquad(fout, eqCoef[bi], eqState[bi]);
                         out = fxFilterDry * (1f - depth * eqMix) + fout * (depth * eqMix);
-                    } else if ("delay".equals(id)) {
+                    } else if (f.kind == FX_DELAY) {
                         float time = st.params.length > 0 ? st.params[0] : 0.18f;
-                        float fb = st.params.length > 1 ? st.params[1] : 0.4f;
+                        float fb = Math.max(0f, Math.min(FX_FEEDBACK_LIMIT, st.params.length > 1 ? st.params[1] : 0.4f));
                         int dn = fxDelayBuf.length;
                         int read = (fxDelayIdx - (int) (time * SAMPLE_RATE) + dn) % dn;
                         float del = fxDelayBuf[read];
-                        fxDelayWrite = out + del * fb;
+                        fxDelayWrite = stableState(out + del * fb);
                         out += del * depth * 0.8f;
                         fxDelayWet = 1f;
-                    } else if ("reverb".equals(id)) {
+                    } else if (f.kind == FX_REVERB) {
                         float acc = 0f;
                         for (int ci = 0; ci < 4; ci++) {
                             int len = combBuf[ci].length;
                             float cb = combBuf[ci][combIdx[ci]];
-                            float sc = out + cb * reverbFb;
+                            float sc = stableState(out + cb * Math.min(FX_FEEDBACK_LIMIT, reverbFb));
                             combBuf[ci][combIdx[ci]] = sc;
                             combIdx[ci] = (combIdx[ci] + 1) % len;
                             acc += cb;
@@ -1731,10 +2189,10 @@ public class AudioSynth {
                         int al = apBuf.length;
                         float ap = apBuf[(apIdx + al - 1) % al];
                         float apOut = -0.5f * acc + ap;
-                        apBuf[apIdx] = acc + apOut * 0.5f;
+                        apBuf[apIdx] = stableState(acc + apOut * 0.5f);
                         apIdx = (apIdx + 1) % al;
                         out = out * (1f - depth * reverbWet) + apOut * depth * reverbWet * 1.4f;
-                    } else if ("chorus".equals(id)) {
+                    } else if (f.kind == FX_CHORUS) {
                         float rate = st.params.length > 0 ? st.params[0] : 0.8f;
                         float cdepth = st.params.length > 1 ? st.params[1] : 0.3f;
                         chorusPhase += rate / SAMPLE_RATE * Math.PI * 2;
@@ -1745,15 +2203,15 @@ public class AudioSynth {
                         fxDelayWrite = out;
                         out = out * (1f - depth * 0.5f) + del * depth * 0.5f;
                         fxDelayWet = 1f;
-                    } else if ("compressor".equals(id)) {
+                    } else if (f.kind == FX_COMPRESSOR) {
                         float threshold = (float) Math.pow(10.0, (st.params.length > 0 ? st.params[0] : -18f) / 20.0);
                         float ratio = st.params.length > 1 ? Math.max(1f, st.params[1]) : 4f;
                         float av = Math.abs(out);
                         if (av > threshold) {
                             float compressed = threshold + (av - threshold) / ratio;
-                            out = Math.signum(out) * (out * (1f - depth) + compressed * depth);
+                            out = Math.signum(out) * (av * (1f - depth) + compressed * depth);
                         }
-                    } else if ("air".equals(id)) {
+                    } else if (f.kind == FX_AIR) {
                         float amount = st.params.length > 0 ? st.params[0] : 0.08f;
                         float tone = st.params.length > 1 ? st.params[1] : 0.55f;
                         noiseState ^= (noiseState << 13); noiseState ^= (noiseState >>> 7); noiseState ^= (noiseState << 17);
@@ -1764,12 +2222,12 @@ public class AudioSynth {
                 }
                 int dn = fxDelayBuf.length;
                 if (fxDelayWet > 0.001f) {
-                    fxDelayBuf[fxDelayIdx] = fxDelayWrite;
+                    fxDelayBuf[fxDelayIdx] = stableState(fxDelayWrite);
                 } else if (fxDelayBuf[fxDelayIdx] != 0f) {
                     fxDelayBuf[fxDelayIdx] = 0f;
                 }
                 fxDelayIdx = (fxDelayIdx + 1) % dn;
-                return out;
+                return stableOutput(out);
             }
         }
     }

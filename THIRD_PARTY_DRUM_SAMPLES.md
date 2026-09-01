@@ -25,6 +25,14 @@ All WAV files bundled in `native/engine/android/app/drum-assets/drums` permit re
 | `lofi_kick` | Free Drum Samples | CC0-1.0 | `.tooling/sample-sources/free-drum-samples/drum-samples/03-soulful-vintage/kicks/vintage-kick-02.wav` |
 | `lofi_snare` | Free Drum Samples | CC0-1.0 | `.tooling/sample-sources/free-drum-samples/drum-samples/03-soulful-vintage/snares/vintage-snare-02.wav` |
 | `lofi_hat` | Free Drum Samples | CC0-1.0 | `.tooling/sample-sources/free-drum-samples/drum-samples/03-soulful-vintage/hi-hats/hi-hat-closed-01.wav` |
+| `percussion_shaker` | 0x808 | CC0 / royalty-free | `.tooling/sample-sources/0x808/samples/percussion/shaker.wav` |
+| `percussion_maracas` | Free Drum Samples | CC0-1.0 | `.tooling/sample-sources/free-drum-samples/drum-samples/03-soulful-vintage/percs/perc-maraca.wav` |
+| `percussion_tambourine` | 0x808 | CC0 / royalty-free | `.tooling/sample-sources/0x808/samples/percussion/tambourine.wav` |
+| `percussion_clave` | 0x808 | CC0 / royalty-free | `.tooling/sample-sources/0x808/samples/percussion/clave.wav` |
+| `percussion_rimshot` | 0x808 | CC0 / royalty-free | `.tooling/sample-sources/0x808/samples/percussion/rimshot.wav` |
+| `percussion_tom` | 0x808 | CC0 / royalty-free | `.tooling/sample-sources/0x808/samples/808-synth/808-tom-mid.wav` |
+| `percussion_cowbell` | 0x808 | CC0 / royalty-free | `.tooling/sample-sources/0x808/samples/cr-78-real/cowbell.wav` |
+| `percussion_bongo` | 0x808 | CC0 / royalty-free | `.tooling/sample-sources/0x808/samples/cr-78-real/bongo-h.wav` |
 
 Sources:
 

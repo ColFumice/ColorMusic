@@ -8,13 +8,14 @@ const DEFAULT_LANGUAGE: AppLanguage = 'en';
 /** Static UI translations shared by all programmatically-created panels. */
 const EN: Record<string, string> = {
     '选择图片': 'Choose Image', '测试音': 'Test Tone', '校准': 'Calibrate', '游玩说明': 'How to Play', '设置': 'Settings',
-    '波表': 'Wavetable', '网格': 'Grid', '输出效果器': 'Output FX', '关闭': 'Close', '重置': 'Reset', '撤回': 'Undo',
+    '波表': 'Wavetable', '网格': 'Grid', '输出效果器': 'Output FX', '节拍器': 'Metronome', '节拍器拍号': 'Metronome time signature', '关闭': 'Close', '重置': 'Reset', '撤回': 'Undo',
     '随机生成': 'Randomize', '随机': 'Randomize', '经典预设': 'Classic Preset', '经典': 'Classic',
     '试听': 'Preview', '试听 R': 'Preview R', '试听 G': 'Preview G', '试听 B': 'Preview B',
     '全部重置': 'Reset All', '自定义': 'Custom', '无': 'None',
     '快速开始': 'Quick Start', '触摸演奏': 'Touch Performance', '颜色与音色': 'Color & Timbre',
     '波表编辑器': 'Wavetable Editor', '效果器': 'Effects', '菜单与校准': 'Menu & Calibration',
     '查看目录': 'View Folder', '导出成功，音频已保存至游戏文件根目录': 'Export successful. Audio saved to the game file root.',
+    '清空轨道': 'Clear Tracks', '导出为 WAV 音频': 'Export WAV', '导出为 MP3 音频': 'Export MP3',
     '录音与混音': 'Recording & Mixer', '样式管理': 'Style Manager',
     '网格设置': 'Grid Settings', '显示网格线': 'Show Grid Lines', '显示音色提示': 'Show Tone Info',
     '横线颜色': 'Horizontal Color', '横线透明度': 'Horizontal Opacity', '竖线颜色': 'Vertical Color', '竖线透明度': 'Vertical Opacity',

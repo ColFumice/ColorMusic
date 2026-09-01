@@ -41,6 +41,20 @@ function saveStr(key: string, v: string) {
     try { sys.localStorage.setItem(key, v); } catch (e) { /* 忽略 */ }
 }
 
+/** Keep untouched, renameable defaults in the language currently used by the UI. */
+function localizeMutableDefaultName(name: string): string {
+    const exact: Record<string, [string, string]> = {
+        '新音频': ['新音频', 'New Audio'], 'New Audio': ['新音频', 'New Audio'],
+        '新样式': ['新样式', 'New Style'], 'New Style': ['新样式', 'New Style'],
+        '新样式流': ['新样式流', 'New Style Flow'], 'New Style Flow': ['新样式流', 'New Style Flow'],
+    };
+    const match = exact[name];
+    if (match) return match[isEnglish() ? 1 : 0];
+    if (name.endsWith(' 副本')) return `${localizeMutableDefaultName(name.slice(0, -3))}${isEnglish() ? ' Copy' : ' 副本'}`;
+    if (name.endsWith(' Copy')) return `${localizeMutableDefaultName(name.slice(0, -5))}${isEnglish() ? ' Copy' : ' 副本'}`;
+    return name;
+}
+
 // 设计分辨率 2000×900（20:9，EXACT_FIT 下在 20:9 屏上正好铺满、不变形、无黑边）
 const DESIGN_W = 2000;
 const DESIGN_H = 900;
@@ -50,6 +64,9 @@ const IMG_MAX_H = 900;           // 高度铺满
 const IMG_MAX_W_PORTRAIT = 900;  // 竖屏旋转后宽度铺满
 const IMG_MAX_H_PORTRAIT = 2000; // 竖屏旋转后高度铺满
 const SLIDE_MIN_DIST = 12;       // 滑音最小移动距离（设计单位）
+const TOUCH_AUDIO_INTERVAL_MS = 16;
+const TOUCH_VISUAL_INTERVAL_MS = 33;
+const TOUCH_INFO_INTERVAL_MS = 50;
 
 /** “自定义”预设：玩家自绘波形或点击重置后，预设槽显示该项。 */
 const CUSTOM_INST = { id: 'custom', label: '自定义' };
@@ -69,9 +86,13 @@ const MIN_GRID_LABEL_FONT_SIZE = 4;
 const MAX_GRID_LABEL_FONT_SIZE = 24;
 /** 屏幕状态边框约 2mm 的设计坐标圆角。 */
 const SCREEN_EDGE_RADIUS = 16;
+const MIXER_TRACK_HEAD_WIDTH = 36;
+/** 轨道音频块约 1mm 的设计坐标圆角。 */
+const MIXER_BLOCK_CORNER_RADIUS = 8;
+const MIXER_CONTENT_INSET = MIXER_TRACK_HEAD_WIDTH + 20;
 const LEGACY_DRUM_IDS: Record<string, string> = {
     kick: 'tr808_kick', snare: 'tr808_snare', clap: 'boombap_clap',
-    hihat: 'tr808_hat', tom: 'tr606_kick', maracas: 'lofi_hat',
+    hihat: 'tr808_hat', tom: 'percussion_tom', maracas: 'percussion_maracas',
 };
 
 interface CachedPickedImage {
@@ -91,6 +112,37 @@ interface AudioClipMeta {
     volume: number;
     trimStart: number;
     trimEnd: number;
+    color?: string;
+}
+
+interface MixerBlock {
+    id: string;
+    clipId: string;
+    startBeat: number;
+    color: string;
+    speed?: number;
+    trimStart?: number;
+    trimEnd?: number;
+    volumeAutomation?: number[];
+    pitchAutomation?: number[];
+    panAutomation?: number[];
+    volumeAutomationPoints?: AutomationPoint[];
+    pitchAutomationPoints?: AutomationPoint[];
+    panAutomationPoints?: AutomationPoint[];
+}
+
+interface AutomationPoint { x: number; y: number; }
+
+interface MixerEditorSnapshot {
+    tracks: MixerTrack[];
+    clips: AudioClipMeta[];
+}
+
+interface MixerTrack {
+    id: string;
+    muted: boolean;
+    solo: boolean;
+    blocks: MixerBlock[];
 }
 
 interface StyleSnapshot {
@@ -104,6 +156,7 @@ interface StyleSnapshot {
     outputFxSlots: FxSlot[];
     drumBlackId: string;
     drumWhiteId: string;
+    metronome?: { enabled: boolean; beatsPerBar: number; beatUnit: number; bpm: number };
     flowNodes?: Array<{ styleId: string; delaySec: number }>;
 }
 
@@ -126,6 +179,15 @@ export class GameManager extends Component {
     private playOnceBtn!: Node;
     private playLoopBtn!: Node;
     private styleBtn!: Node;
+    private metronomeBtn!: Node;
+    private metronomeIconGfx!: Graphics;
+    private metronomeEnabled = false;
+    private metronomeBeatsPerBar = Math.max(1, Math.min(32, Number(loadStr('cm_metronome_beats', '4')) || 4));
+    private metronomeBeatUnit = (() => {
+        const unit = Number(loadStr('cm_metronome_unit', '4')) || 4;
+        return [1, 2, 4, 8, 16, 32].indexOf(unit) >= 0 ? unit : 4;
+    })();
+    private metronomeBpm = Math.max(20, Math.min(320, Number(loadStr('cm_metronome_bpm', '120')) || 120));
     private lockBtn!: Node;
     private lockIconGfx!: Graphics;
     private consoleButtons: Node[] = [];
@@ -141,6 +203,67 @@ export class GameManager extends Component {
     private audioPanelOpen = false;
     private stylePanelOpen = false;
     private clipRows: Node[] = [];
+    private mixerTracks: MixerTrack[] = this.loadMixerTracks();
+    private mixerViewport: Node | null = null;
+    private mixerTimeline: Node | null = null;
+    private mixerSourcePane: Node | null = null;
+    private mixerSourcePanelCollapsed = false;
+    private mixerCollapsedContentInsetExtra = 0;
+    private mixerSourcePaneAnimating = false;
+    private mixerSelectedBlockId = '';
+    private mixerSelectionBorderTransition: Node | null = null;
+    private mixerPlaying = false;
+    private mixerPlayheadBeat = 0;
+    private mixerPlaybackAnchorBeat = 0;
+    private mixerPlaybackEndBeat = 0;
+    private mixerFollowPlayhead = false;
+    private mixerFollowPlayheadX = 0;
+    private mixerPlayTimer: number | null = null;
+    private mixerBeatWidth = 20;
+    private mixerRowHeight = 80;
+    private mixerScrollX = 0;
+    private mixerScrollY = 0;
+    private mixerRenderedScrollX = 0;
+    private mixerRenderedScrollY = 0;
+    private mixerRenderedBeatWidth = 20;
+    private mixerMagnet = false;
+    private mixerUndoStack: MixerTrack[][] = [];
+    private mixerLastBlockTap = { id: '', at: 0 };
+    private mixerTrackTapTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    private mixerGestureTouches = new Map<number, Vec3>();
+    private mixerAnimateFrom = new Map<string, Vec3>();
+    private mixerLastPinchDistance = 0;
+    private mixerLastPanCenter = new Vec3();
+    private mixerGestureMoved = false;
+    private mixerGestureStartPoint = new Vec3();
+    private mixerGestureStartScrollX = 0;
+    private mixerGestureStartScrollY = 0;
+    private mixerGestureStartBeatWidth = 20;
+    private mixerGestureVisualBasePosition = new Vec3();
+    private mixerGestureVisualBaseScaleX = 1;
+    private mixerPinchAnchorBeat = 0;
+    private mixerGestureLastPoint = new Vec3();
+    private mixerGestureLastAt = 0;
+    private mixerPanVelocity = new Vec3();
+    private mixerInertiaFrame: number | null = null;
+    private mixerInertiaGeneration = 0;
+    private mixerReturnFrame: number | null = null;
+    private mixerReturnGeneration = 0;
+    private mixerDeferredRedrawGeneration = 0;
+    private mixerLiveRedrawTimer: ReturnType<typeof setTimeout> | null = null;
+    private mixerDraggingBlockId = '';
+    private mixerDraggingPlayhead = false;
+    private mixerEditor: Node | null = null;
+    private mixerColorPalette: Node | null = null;
+    private mixerExpandedSourceId = '';
+    private mixerRedrawQueued = false;
+    private mixerDragGhost: Node | null = null;
+    private mixerEditorMode: 'volume' | 'pitch' | 'pan' = 'volume';
+    private mixerEditorUndo: MixerEditorSnapshot[] = [];
+    private mixerEditorInitial: MixerEditorSnapshot | null = null;
+    private mixerEditorCropping = false;
+    private mixerEditorCropStart = -1;
+    private mixerEditorCropEnd = -1;
     private styles: StyleSnapshot[] = [];
     private styleRows: Node[] = [];
     private expandedStyleId = '';
@@ -256,6 +379,10 @@ export class GameManager extends Component {
 
     /** 多指持续音/滑音状态：touchId → 该手指上一次发声的图片局部坐标 */
     private activeTouches = new Map<number, Vec3>();
+    private touchAudioUpdateMs = new Map<number, number>();
+    private touchVisualUpdateMs = new Map<number, number>();
+    private lastTouchInfoMs = 0;
+    private repeatedGridCache = new WeakMap<number[], { period: number; result: number[] }>();
 
     /** 图片自然尺寸（用于旋转后按比例重新铺满） */
     private imgNaturalW = 0;
@@ -317,6 +444,12 @@ export class GameManager extends Component {
         this.node.on(Node.EventType.NODE_DESTROYED, () => {
             game.off(Game.EVENT_HIDE, this.onAppHide, this);
             game.off(Game.EVENT_SHOW, this.onAppShow, this);
+            input.off(Input.EventType.TOUCH_END, this.onGlobalTouchEnd, this);
+            input.off(Input.EventType.TOUCH_CANCEL, this.onGlobalTouchEnd, this);
+            this.stopMixerInertia();
+            this.stopMixerTimelineReturnAnimation();
+            if (this.mixerLiveRedrawTimer) clearTimeout(this.mixerLiveRedrawTimer);
+            this.releaseAllActiveNotes();
         }, this);
         console.warn('[CM] onLoad 完成');
     }
@@ -324,6 +457,7 @@ export class GameManager extends Component {
     /** 应用进入后台：标记，用于区分"启动时的 SHOW"与"从后台恢复的 SHOW"。 */
     private onAppHide() {
         this.appWasHidden = true;
+        this.releaseAllActiveNotes();
         if (this.isRecording) {
             NativeBridge.stopRecording();
             this.isRecording = false;
@@ -465,7 +599,7 @@ export class GameManager extends Component {
         this.infoNode.active = this.gridState.showToneInfo && !this.uiLocked;
     }
 
-    /** 右上角五个常驻圆形控制台按钮：录音、混音、单次、循环、样式。 */
+    /** 右上角控制台按钮：节拍器位于原五按钮右侧。 */
     private buildConsoleButtons() {
         this.recordBtn = this.makeConsoleButton('RecordButton', '●', () => this.toggleRecording(), new Color(235, 55, 65, 255));
         this.mixerBtn = this.makeConsoleButton('MixerButton', '', () => this.openAudioPanel(), new Color(255, 255, 255, 255));
@@ -481,7 +615,30 @@ export class GameManager extends Component {
         const styleGlyph = styleIcon.addComponent(Graphics);
         styleGlyph.lineWidth = 1.5; styleGlyph.strokeColor = new Color(255, 255, 255, 255);
         for (const y of [-6, 0, 6]) { styleGlyph.moveTo(-7, y); styleGlyph.lineTo(7, y); styleGlyph.stroke(); }
-        this.consoleButtons = [this.recordBtn, this.mixerBtn, this.playOnceBtn, this.playLoopBtn, this.styleBtn];
+        this.metronomeBtn = this.makeConsoleButton('MetronomeButton', '', () => this.toggleMetronome(), new Color(255, 255, 255, 255));
+        const metronomeIcon = new Node('MetronomeTridentIcon'); metronomeIcon.layer = Layers.Enum.UI_2D; metronomeIcon.addComponent(UITransform).setContentSize(24, 24); this.metronomeBtn.addChild(metronomeIcon);
+        this.metronomeIconGfx = metronomeIcon.addComponent(Graphics);
+        this.redrawMetronomeButton();
+        this.consoleButtons = [this.metronomeBtn, this.recordBtn, this.mixerBtn, this.playOnceBtn, this.playLoopBtn, this.styleBtn];
+    }
+
+    private redrawMetronomeButton() {
+        if (!this.metronomeBtn || !this.metronomeIconGfx) return;
+        const bg = this.metronomeBtn.getComponent(Graphics)!;
+        bg.clear(); bg.circle(0, 0, 15.5); bg.fillColor = this.metronomeEnabled ? new Color(255, 255, 255, 255) : new Color(0, 0, 0, 255); bg.fill();
+        const g = this.metronomeIconGfx; g.clear(); g.lineWidth = 1.8; g.lineCap = Graphics.LineCap.ROUND;
+        g.strokeColor = this.metronomeEnabled ? new Color(0, 0, 0, 255) : new Color(255, 255, 255, 255);
+        g.moveTo(0, 9); g.lineTo(0, -9); g.moveTo(0, -3); g.lineTo(-7, -9); g.moveTo(0, -3); g.lineTo(7, -9);
+        g.moveTo(-7, -9); g.lineTo(-7, -5); g.moveTo(7, -9); g.lineTo(7, -5); g.stroke();
+    }
+
+    private toggleMetronome() {
+        this.metronomeEnabled = !this.metronomeEnabled;
+        NativeBridge.setMetronome(this.metronomeEnabled, this.metronomeBeatsPerBar, this.metronomeBeatUnit, this.metronomeBpm);
+        this.redrawMetronomeButton();
+        this.setInfo(this.metronomeEnabled
+            ? t(`节拍器已开启（${this.metronomeBeatsPerBar}/${this.metronomeBeatUnit}）`, `Metronome on (${this.metronomeBeatsPerBar}/${this.metronomeBeatUnit})`)
+            : t('节拍器已关闭', 'Metronome off'), new Color(220, 225, 235, 255));
     }
 
     /** 沉浸模式锁：位于控制台最右按钮和菜单按钮的正中间。 */
@@ -712,14 +869,10 @@ export class GameManager extends Component {
         buttonNode.addComponent(UIOpacity).opacity = 204;
 
         buttonNode.on(Button.EventType.CLICK, () => {
-            for (const id of this.activeTouches.keys()) {
-                if (NativeBridge.isAndroidNative) NativeBridge.noteOff(id); else this.webSynth?.noteOff(id);
-            }
+            this.releaseAllActiveNotes();
             for (const id of [-9000, -9100, -9101, -9102]) {
                 if (NativeBridge.isAndroidNative) NativeBridge.noteOff(id); else this.webSynth?.noteOff(id);
             }
-            this.activeTouches.clear();
-            this.clearTouchRipples();
             if (this.isRecording) { NativeBridge.stopRecording(); this.isRecording = false; }
             NativeBridge.stopAudioFiles();
             toggleLanguage();
@@ -817,16 +970,17 @@ export class GameManager extends Component {
     private buildSettingsMenu() {
         const menu = new Node('SettingsMenu');
         menu.layer = Layers.Enum.UI_2D;
-        menu.addComponent(UITransform).setContentSize(230, 188);
+        menu.addComponent(UITransform).setContentSize(230, 249);
         const g = menu.addComponent(Graphics);
-        g.roundRect(-115, -94, 230, 188, 8);
+        g.roundRect(-115, -124.5, 230, 249, 8);
         g.fillColor = new Color(10, 16, 30, 245); g.fill();
         g.lineWidth = 1.5; g.strokeColor = new Color(120, 140, 180, 255); g.stroke();
         this.uiRoot.addChild(menu);
         const entries: Array<[string, number, () => void]> = [
-            ['波表', 61, () => { menu.active = false; this.openWavePanel(); }],
-            ['网格', 0, () => { menu.active = false; this.openGridSettings(); }],
-            ['输出效果器', -61, () => { menu.active = false; this.openOutputPanel(); }],
+            ['波表', 91.5, () => { menu.active = false; this.openWavePanel(); }],
+            ['网格', 30.5, () => { menu.active = false; this.openGridSettings(); }],
+            ['输出效果器', -30.5, () => { menu.active = false; this.openOutputPanel(); }],
+            ['节拍器', -91.5, () => { menu.active = false; this.editMetronomeSignature(); }],
         ];
         for (const [text, y, cb] of entries) {
             const b = this.makeButton('Settings' + text, text, 0, y, 210, 52, cb,
@@ -847,8 +1001,28 @@ export class GameManager extends Component {
     }
 
     private redrawSettingsMenu() {
-        const g=this.settingsMenu.getComponent(Graphics)!;g.clear();g.roundRect(-115,-94,230,188,8);g.fillColor=new Color(10,16,30,245);g.fill();g.lineWidth=1.5;g.strokeColor=new Color(120,140,180,255);g.stroke();
+        const g=this.settingsMenu.getComponent(Graphics)!;g.clear();g.roundRect(-115,-124.5,230,249,8);g.fillColor=new Color(10,16,30,245);g.fill();g.lineWidth=1.5;g.strokeColor=new Color(120,140,180,255);g.stroke();
         for(const b of this.settingsMenu.children){const bg=b.getChildByName('Bg')?.getComponent(Graphics);if(!bg)continue;bg.clear();bg.roundRect(-105,-26,210,52,10);bg.fillColor=new Color(34,48,78,255);bg.fill();}
+    }
+
+    private editMetronomeSignature() {
+        NativeBridge.promptMetronome(this.metronomeBeatsPerBar, this.metronomeBeatUnit, this.metronomeBpm, (beats, unit, bpm) => {
+                if (beats < 1 || beats > 32 || [1, 2, 4, 8, 16, 32].indexOf(unit) < 0) {
+                    this.setInfo(t('拍号格式无效，请输入如 4/4 或 6/8', 'Invalid signature. Enter a value such as 4/4 or 6/8.'), new Color(255, 190, 120, 255));
+                    return;
+                }
+                bpm = Math.round(bpm);
+                if (!Number.isFinite(bpm) || bpm < 20 || bpm > 320) {
+                    this.setInfo(t('BPM 必须在 20 到 320 之间', 'BPM must be between 20 and 320.'), new Color(255, 190, 120, 255));
+                    return;
+                }
+                this.metronomeBeatsPerBar = beats;
+                this.metronomeBeatUnit = unit;
+                this.metronomeBpm = bpm;
+                saveStr('cm_metronome_beats', String(beats)); saveStr('cm_metronome_unit', String(unit)); saveStr('cm_metronome_bpm', String(bpm));
+                if (this.metronomeEnabled) NativeBridge.setMetronome(true, beats, unit, bpm);
+                this.setInfo(t(`节拍器已设为 ${beats}/${unit}，${bpm} BPM`, `Metronome set to ${beats}/${unit}, ${bpm} BPM`), new Color(220, 225, 235, 255));
+        });
     }
 
     private openWavePanel() {
@@ -1857,12 +2031,12 @@ export class GameManager extends Component {
                 content: '一.RGB 全局效果器\n1. 在波表编辑器中分别塑造红、绿、蓝声部。\n2. 每个声部最多四个串联槽位，效果器按从上到下的顺序处理。\n3. 点击槽内文本进入参数设置，点击加号添加下一个效果器。\n\n二.输出效果器\n1. 通过“设置→输出效果器”处理 RGB 混音后的最终声音。\n2. 输出端最多四个槽位，适合做总音量、空间感、动态和最终染色。\n3. 支持重置、随机和撤回，调整后立即作用于游玩声音。\n\n三.使用建议\n1. 先调整单个 RGB 声部，再用输出效果器做整体统一。\n2. 多个高增益效果器串联可能造成削波，应适当降低参数或输出音量。',
             },
             {
-                title: '录音与混音',
-                content: '一.主界面控制台\n1. 红点开始或结束录音；小喇叭打开混音台；单三角播放一次；双三角循环播放。\n2. 录音时屏幕边框为红色，播放时为绿色，同时录音与播放时为橙色。\n3. 单次播放会在所有已启用片段结束后停止；循环播放以最长片段为一轮。\n\n二.混音台\n1. 最多保存 13 个音频片段，点击名称可重命名，左侧圆点控制启用或静音。\n2. 音量滑块调整片段增益；“始”和“末”可精确输入裁剪时间，中间双向滑块可快速裁剪头尾。\n3. 每栏右侧依次提供试听、克隆、删除和导出。克隆会复制当前片段设置。\n4. 导出时可选择无损 WAV 或便于分享的 MP3，MP3 使用 LAME 转换。',
+                title: '录音与音频编辑',
+                content: '一.录音与节拍器\n1. 红点开始或结束录音；小喇叭打开音频编辑轨道；单三角播放一次；双三角循环播放。\n2. 倒置三叉戟按钮控制节拍器。可在“设置→节拍器”输入拍号与 BPM，节拍器声音不会录入成品。\n3. 录音时屏幕边框为红色，播放时为绿色，同时录音与播放时为橙色。\n\n二.左侧音频栏\n1. 点击音频栏可向下展开音量、起止裁剪、颜色、导出和删除设置；修改会实时同步到由该音频生成的所有轨道块。\n2. 小按钮依次用于重置、试听和克隆；拖动音频栏可在右侧新建轨道块，也可放入已有轨道。\n3. 底部可清空轨道、导出右侧编排为 WAV 或 MP3、查看目录及撤回操作。\n\n三.轨道编排\n1. 单击轨道头切换静音，沿轨道头上下滑动可连续设置；双击轨道头切换独奏。\n2. 单击音频块选中并显示克隆、左对齐、删除和颜色按钮；再次点击名称可编辑音量、音高、声相、速度及裁剪自动化。\n3. 长按一秒后拖动音频块，双击可单独试听；磁铁按钮控制节拍吸附。\n4. 单指拖动画布，双指横向缩放；点击或拖动时间轴可定位时间戳，播放与停止按钮分别从记录点播放和停在当前位置。\n5. 左下角箭头可收起或展开音频栏。导出只合成右侧当前可听的轨道内容。',
             },
             {
                 title: '样式管理',
-                content: '一.样式\n1. 点击控制台的横线图标进入样式管理；保存内容包括波表、网格和效果器设置，不包含录音片段。\n2. 绿色边框表示样式，蓝色边框表示样式流；点击名称重命名，展开按钮显示预览。\n3. 样式预览按 R、G、B 左中右排列；每栏可导出、载入或删除。导出后可从中央提示直接查看目录。\n\n二.样式流\n1. 新样式流默认有 5 个节点，最多 13 个；每个节点选择一个已有样式并设置切换时间。\n2. 样式流随循环播放运行，切换时屏幕边框会在 1.3 秒内过渡为蓝色再恢复。\n\n三.文件管理\n1. 导入可从设备中选择样式数据包；导出的数据包保存在游戏文件根目录。\n2. “清空样式栏”和“清空数据包”都会连续询问两次，确认后操作不可撤回。',
+                content: '一.样式\n1. 点击控制台的横线图标进入样式管理；保存内容包括波表、网格、效果器和节拍器设置，不包含录音片段。\n2. 绿色边框表示样式，蓝色边框表示样式流；点击名称重命名，展开按钮显示预览。\n3. 样式预览按 R、G、B 左中右排列；每栏可导出、载入或删除。导出后可从中央提示直接查看目录。\n\n二.样式流\n1. 新样式流默认有 5 个节点，最多 13 个；每个节点选择一个已有样式并设置切换时间。\n2. 样式流随循环播放运行，切换时屏幕边框会在 1.3 秒内过渡为蓝色再恢复。\n\n三.文件管理\n1. 导入可从设备中选择样式数据包；导出的数据包保存在游戏文件根目录。\n2. “清空样式栏”和“清空数据包”都会连续询问两次，确认后操作不可撤回。',
             },
             {
                 title: '菜单与校准',
@@ -1896,12 +2070,12 @@ export class GameManager extends Component {
                     content: 'I. RGB Global Effects\n1. Shape the red, green and blue voices independently in the wavetable editor.\n2. Each voice supports four serial slots processed from top to bottom.\n3. Tap slot text to edit parameters; tap + to reveal the next slot.\n\nII. Output Effects\n1. Settings → Output FX processes the final sound after RGB mixing.\n2. Four serial slots can shape overall space, dynamics and color.\n3. Reset, Randomize and Undo apply immediately to performance audio.\n\nIII. Tips\n1. Shape individual voices first, then use Output FX to unify the mix.\n2. Several high-gain effects in series can clip; reduce effect intensity or output level when needed.',
                 },
                 {
-                    title: 'Recording & Mixer',
-                    content: 'I. Console Controls\n1. The red dot starts or stops recording; the speaker opens the mixer; the single triangle plays once; the double triangle loops.\n2. The screen border is red while recording, green while playing, and orange when both are active.\n3. Play Once stops after all enabled clips finish. Loop Playback uses the longest enabled clip as one cycle.\n\nII. Mixer\n1. Store up to 13 clips. Tap a name to rename it; use the left dot to enable or mute it.\n2. The volume slider changes clip gain. Start and End accept exact trim times, while the dual-handle range provides quick trimming.\n3. Row actions provide preview, clone, delete and export. Choose lossless WAV or shareable MP3 when exporting; MP3 uses LAME conversion.',
+                    title: 'Recording & Audio Editing',
+                    content: 'I. Recording & Metronome\n1. The red dot starts or stops recording; the speaker opens Audio Edit Tracks; the single triangle plays once; the double triangle loops.\n2. The inverted trident toggles the metronome. Set its time signature and BPM in Settings → Metronome; its clicks are excluded from recordings.\n3. The border is red while recording, green while playing, and orange when both are active.\n\nII. Source Pane\n1. Tap a source row to expand volume, trim, color, export and delete controls. Changes update every track block made from that source.\n2. The small buttons reset, preview and clone. Drag a source into the track area to create a block or add it to an existing track.\n3. Footer controls clear tracks, export the arrangement as WAV or MP3, open the folder and undo.\n\nIII. Track Arrangement\n1. Tap a track head to mute it, slide vertically across heads for continuous selection, or double-tap for solo.\n2. Select a block for Clone, Align Left, Delete and Color. Tap its name again to edit volume, pitch, pan, speed and trim automation.\n3. Hold for one second to drag a block, double-tap to preview it, and use the magnet for beat snapping.\n4. Drag the canvas with one finger and zoom horizontally with two. Tap or drag the ruler to seek; Play returns to its recorded start point while Stop holds the current position.\n5. The lower-left arrow collapses or restores the source pane. Export renders only currently audible arranged tracks.',
                 },
                 {
                     title: 'Style Manager',
-                    content: 'I. Styles\n1. Open Style Manager with the console lines icon. A style stores wavetable, grid and effect settings, but not recorded clips.\n2. Green borders identify styles and blue borders identify flows. Tap names to rename and expand rows for previews.\n3. RGB previews run left, center and right. Each row can export, load or delete; after export, View Folder opens the package directory.\n\nII. Style Flows\n1. A new flow starts with five nodes and supports up to 13. Each node selects an owned style and a switch delay.\n2. Flows run with loop playback. A style switch flashes the border blue and restores it within 1.3 seconds.\n\nIII. Files\n1. Import selects a style package from the device. Exported packages are stored in the game file root.\n2. Clear Style List and Clear Packages both require two confirmations and cannot be undone.',
+                    content: 'I. Styles\n1. Open Style Manager with the console lines icon. A style stores wavetable, grid, effect and metronome settings, but not recorded clips.\n2. Green borders identify styles and blue borders identify flows. Tap names to rename and expand rows for previews.\n3. RGB previews run left, center and right. Each row can export, load or delete; after export, View Folder opens the package directory.\n\nII. Style Flows\n1. A new flow starts with five nodes and supports up to 13. Each node selects an owned style and a switch delay.\n2. Flows run with loop playback. A style switch flashes the border blue and restores it within 1.3 seconds.\n\nIII. Files\n1. Import selects a style package from the device. Exported packages are stored in the game file root.\n2. Clear Style List and Clear Packages both require two confirmations and cannot be undone.',
                 },
                 {
                     title: 'Menu & Calibration',
@@ -2584,7 +2758,7 @@ export class GameManager extends Component {
                     return;
                 }
                 const clip: AudioClipMeta = {
-                    id: `clip_${Date.now()}`, name: '新音频', path: this.recordingPath,
+                    id: `clip_${Date.now()}`, name: t('新音频', 'New Audio'), path: this.recordingPath,
                     duration: Math.max(.1, (Date.now() - this.recordingStartedAt) / 1000), enabled: true, volume: 1, trimStart: 0, trimEnd: 0,
                 };
                 this.recordedClips.unshift(clip);
@@ -2651,9 +2825,56 @@ export class GameManager extends Component {
     }
 
     private loadAudioClips(): AudioClipMeta[] {
-        try { const raw = sys.localStorage.getItem('cm_audio_clips'); const v = raw ? JSON.parse(raw) : []; return Array.isArray(v) ? v : []; } catch (e) { return []; }
+        try {
+            const raw = sys.localStorage.getItem('cm_audio_clips'); const value = raw ? JSON.parse(raw) : [];
+            return Array.isArray(value) ? value.map((clip) => ({ ...clip, name: localizeMutableDefaultName(String(clip.name ?? t('新音频', 'New Audio'))) })) : [];
+        } catch (e) { return []; }
     }
     private saveAudioClips() { try { sys.localStorage.setItem('cm_audio_clips', JSON.stringify(this.recordedClips.slice(0, 13))); } catch (e) { /* ignore */ } }
+
+    private loadMixerTracks(): MixerTrack[] {
+        try {
+            const raw = sys.localStorage.getItem('cm_mixer_tracks_v15');
+            const value = raw ? JSON.parse(raw) : [];
+            if (Array.isArray(value)) return value.slice(0, 13);
+        } catch (e) { /* ignore */ }
+        return [];
+    }
+
+    private saveMixerTracks() {
+        try { sys.localStorage.setItem('cm_mixer_tracks_v15', JSON.stringify(this.mixerTracks.slice(0, 13))); } catch (e) { /* ignore */ }
+    }
+
+    private pushMixerUndo() {
+        this.mixerUndoStack.push(JSON.parse(JSON.stringify(this.mixerTracks)));
+        if (this.mixerUndoStack.length > 30) this.mixerUndoStack.shift();
+    }
+
+    private undoMixer() {
+        const state = this.mixerUndoStack.pop();
+        if (!state) return;
+        this.mixerTracks = state;
+        this.saveMixerTracks();
+        this.redrawMixerTimeline();
+    }
+
+    private timelineBlocks(includeSilentTracks = false) {
+        const solo = this.mixerTracks.some(track => track.solo);
+        const result: Array<AudioClipMeta & { startBeat: number; bpm: number; speed: number; trackId: string; trackAudible: boolean; volumeAutomation?: number[]; pitchAutomation?: number[]; panAutomation?: number[] }> = [];
+        for (const track of this.mixerTracks) {
+            const trackAudible = !track.muted && (!solo || track.solo);
+            if (!trackAudible && !includeSilentTracks) continue;
+            for (const block of track.blocks) {
+                const clip = this.recordedClips.find(item => item.id === block.clipId);
+                if (clip?.path && clip.enabled !== false) {
+                    const volumeAutomation = block.volumeAutomation?.length ? block.volumeAutomation : [1];
+                    const automationGain = volumeAutomation.reduce((sum, value) => sum + Math.max(0, Math.min(1, value)), 0) / volumeAutomation.length;
+                    result.push({ ...clip, trimStart: block.trimStart ?? clip.trimStart, trimEnd: block.trimEnd ?? clip.trimEnd, volume: clip.volume * automationGain, enabled: true, startBeat: block.startBeat, bpm: this.metronomeBpm, speed: Math.max(.25, Math.min(4, block.speed ?? 1)), trackId: track.id, trackAudible, volumeAutomation, pitchAutomation: block.pitchAutomation, panAutomation: block.panAutomation });
+                }
+            }
+        }
+        return result;
+    }
 
     private openAudioPanel() {
         if (this.stylePanelOpen) this.closeStylePanel();
@@ -2669,9 +2890,27 @@ export class GameManager extends Component {
         const panel = new Node('AudioMixerPanel'); panel.layer = Layers.Enum.UI_2D;
         panel.addComponent(UITransform).setContentSize(1400, 860); const initialBg = panel.addComponent(Graphics);
         initialBg.rect(-700, -430, 1400, 860); initialBg.fillColor = new Color(8, 12, 24, 255); initialBg.fill();
-        const title = this.makeLabel('AudioMixerTitle', isEnglish() ? 'Audio Mixer' : '混音台', 30, 38, new Color(240, 244, 252, 255), 700, 50); panel.addChild(title);
-        const close = this.makePanelButton(panel, isEnglish() ? 'Close' : '关闭', 0, 0, 110, 42, () => this.closeAudioPanel(), new Color(45, 58, 88, 255)); close.name = 'AudioClose';
-        const swallow = (e: EventTouch) => { e.propagationStopped = true; };
+        const sourcePane = new Node('AudioSourcePane'); sourcePane.layer = Layers.Enum.UI_2D; sourcePane.addComponent(UITransform).setContentSize(1400, 860); sourcePane.addComponent(UIOpacity).opacity = 255; sourcePane.addComponent(Graphics); panel.addChild(sourcePane); this.mixerSourcePane = sourcePane;
+        const title = this.makeLabel('AudioMixerTitle', isEnglish() ? 'Audio Edit Tracks' : '音频编辑轨道', 22, 38, new Color(240, 244, 252, 255), 180, 50); sourcePane.addChild(title);
+        const close = this.makePanelButton(sourcePane, isEnglish() ? 'Close' : '关闭', 0, 0, 77, 30, () => this.closeAudioPanel(), new Color(45, 58, 88, 255)); close.name = 'AudioClose';
+        const clear = this.makePanelButton(sourcePane, t('清空轨道', 'Clear Tracks'), 0, 0, 170, 42, () => this.clearAudioTracks(), new Color(105, 45, 55, 255)); clear.name = 'AudioClearTracks';
+        const wav = this.makePanelButton(sourcePane, t('导出为 WAV 音频', 'Export WAV'), 0, 0, 220, 42, () => this.exportEnabledMix('wav'), new Color(36, 92, 78, 255)); wav.name = 'AudioExportWav';
+        const mp3 = this.makePanelButton(sourcePane, t('导出为 MP3 音频', 'Export MP3'), 0, 0, 220, 42, () => this.exportEnabledMix('mp3'), new Color(42, 72, 115, 255)); mp3.name = 'AudioExportMp3';
+        const folder = this.makePanelButton(sourcePane, t('查看目录', 'View Folder'), 0, 0, 150, 42, () => NativeBridge.openExportDirectory(), new Color(55, 62, 82, 255)); folder.name = 'AudioViewFolder';
+        const undo = this.makePanelButton(sourcePane, t('撤回', 'Undo'), 0, 0, 100, 42, () => this.undoMixer(), new Color(45, 58, 88, 255)); undo.name = 'AudioUndo';
+        for (const footerButton of [clear, wav, mp3, folder, undo]) this.setPanelButtonBlackFill(footerButton);
+        const follow = this.makePanelButton(panel, '→', 0, 0, 44, 44, () => this.toggleMixerPlayheadFollow(), new Color(8, 10, 15, 255)); follow.name = 'AudioTimelineFollow';
+        const play = this.makePanelButton(panel, '▶', 0, 0, 44, 44, () => this.toggleMixerTimelinePlayback(), new Color(8, 10, 15, 255)); play.name = 'AudioTimelinePlay';
+        const stop = this.makePanelButton(panel, '■', 0, 0, 44, 44, () => this.stopMixerTimelinePlayback(), new Color(8, 10, 15, 255)); stop.name = 'AudioTimelineStop';
+        const home = this.makePanelButton(panel, '◀', 0, 0, 42, 42, () => this.returnMixerTimelineToStart(), new Color(8, 10, 15, 255)); home.name = 'AudioTimelineHome';
+        const magnet = this.makePanelButton(panel, '∪', 0, 0, 42, 42, () => { this.mixerMagnet = !this.mixerMagnet; this.queueMixerRedraw(); }, new Color(8, 10, 15, 255)); magnet.name = 'AudioMagnet';
+        const collapse = new Node('AudioSourceCollapse'); collapse.layer = Layers.Enum.UI_2D; collapse.addComponent(UITransform).setContentSize(64, 64); const collapseDisc = this.makeLabel('AudioSourceCollapseDisc', '●', 64, 68, new Color(0, 0, 0, 255), 68, 68); collapse.addChild(collapseDisc); const collapseLabel = this.makeLabel('Arrow', '←', 25, 36, new Color(255, 255, 255, 255), 34, 34); collapse.addChild(collapseLabel); collapse.addComponent(Button).transition = Button.Transition.SCALE; collapse.on(Button.EventType.CLICK, () => this.toggleMixerSourcePane(), this);
+        const viewport = new Node('AudioTimelineViewport'); viewport.layer = Layers.Enum.UI_2D; viewport.addComponent(UITransform).setContentSize(1000, 700); (viewport.addComponent(Mask) as any).type = 0; panel.addChild(viewport); this.mixerViewport = viewport;
+        const timeline = new Node('AudioTimeline'); timeline.layer = Layers.Enum.UI_2D; timeline.addComponent(UITransform).setContentSize(6000, 1200); viewport.addChild(timeline); this.mixerTimeline = timeline;
+        this.attachMixerViewportGestures(viewport);
+        viewport.setSiblingIndex(0);
+        const frame = new Node('AudioPanelTopBorder'); frame.layer = Layers.Enum.UI_2D; frame.addComponent(UITransform).setContentSize(1400, 860); frame.addComponent(Graphics); frame.addChild(collapse); panel.addChild(frame);
+        const swallow = (e: EventTouch) => { if (e.target === panel) e.propagationStopped = true; };
         panel.on(Node.EventType.TOUCH_START, swallow, this); panel.on(Node.EventType.TOUCH_MOVE, swallow, this); panel.on(Node.EventType.TOUCH_END, swallow, this);
         this.uiRoot.addChild(panel); panel.active = false;
         initialBg.clear(); initialBg.rect(-700, -430, 1400, 860); initialBg.fillColor = new Color(8, 12, 24, 255); initialBg.fill();
@@ -2683,20 +2922,190 @@ export class GameManager extends Component {
         const view = this.userViewport(false); const panel = this.audioPanel;
         panel.getComponent(UITransform)!.setContentSize(view.w, view.h);
         const g = panel.getComponent(Graphics)!; g.clear(); g.rect(-view.w / 2, -view.h / 2, view.w, view.h); g.fillColor = new Color(8, 12, 24, 255); g.fill();
-        g.lineWidth = 1.5; g.strokeColor = new Color(95, 125, 165, 255); g.rect(-view.w / 2 + 1, -view.h / 2 + 1, view.w - 2, view.h - 2); g.stroke();
-        panel.getChildByName('AudioMixerTitle')?.setPosition(0, view.h / 2 - 34);
-        panel.getChildByName('AudioClose')?.setPosition(view.w / 2 - 68, view.h / 2 - 34);
+        const frame = panel.getChildByName('AudioPanelTopBorder'), frameG = frame?.getComponent(Graphics); frame?.getComponent(UITransform)?.setContentSize(view.w, view.h);
+        if (frameG) { frameG.clear(); frameG.lineWidth = 1.6; frameG.strokeColor = new Color(255, 255, 255, 255); frameG.roundRect(-view.w / 2 + .8, -view.h / 2 + .8, view.w - 1.6, view.h - 1.6, SCREEN_EDGE_RADIUS); frameG.stroke(); }
+        const leftWidth = view.w / 5;
+        const sourcePane = this.mixerSourcePane;
+        sourcePane?.getComponent(UITransform)?.setContentSize(view.w, view.h);
+        const sourcePaneG = sourcePane?.getComponent(Graphics);
+        if (sourcePaneG) { sourcePaneG.clear(); sourcePaneG.rect(-view.w / 2, -view.h / 2, leftWidth, view.h); sourcePaneG.fillColor = new Color(8, 12, 24, 255); sourcePaneG.fill(); }
+        sourcePane?.setPosition(this.mixerSourcePanelCollapsed ? -leftWidth : 0, 0);
+        if (!this.mixerSourcePaneAnimating) { const sourceOpacity = sourcePane?.getComponent(UIOpacity); if (sourceOpacity) sourceOpacity.opacity = 255; }
+        sourcePane?.getChildByName('AudioMixerTitle')?.setPosition(-view.w / 2 + leftWidth / 2 - 44, view.h / 2 - 34);
+        sourcePane?.getChildByName('AudioClose')?.setPosition(-view.w / 2 + leftWidth - 48, view.h / 2 - 34);
+        panel.getChildByName('AudioTimelineFollow')?.setPosition(view.w / 2 - 166, view.h / 2 - 35);
+        panel.getChildByName('AudioTimelinePlay')?.setPosition(view.w / 2 - 112, view.h / 2 - 35);
+        panel.getChildByName('AudioTimelineStop')?.setPosition(view.w / 2 - 58, view.h / 2 - 35);
+        panel.getChildByName('AudioTimelineHome')?.setPosition(view.w / 2 - 78, -view.h / 2 + 30);
+        panel.getChildByName('AudioMagnet')?.setPosition(view.w / 2 - 28, -view.h / 2 + 30);
+        const viewportWidth = this.mixerSourcePanelCollapsed ? view.w : view.w - leftWidth - 8;
+        this.mixerViewport?.getComponent(UITransform)?.setContentSize(viewportWidth, view.h);
+        this.mixerViewport?.setPosition(this.mixerSourcePanelCollapsed ? 0 : -view.w / 2 + leftWidth + (view.w - leftWidth) / 2, 0);
+        const footerY = -view.h / 2 + 145;
+        const leftX = -view.w / 2 + leftWidth / 2;
+        sourcePane?.getChildByName('AudioClearTracks')?.setPosition(leftX, footerY + 72);
+        sourcePane?.getChildByName('AudioExportWav')?.setPosition(leftX, footerY + 24);
+        sourcePane?.getChildByName('AudioExportMp3')?.setPosition(leftX, footerY - 24);
+        sourcePane?.getChildByName('AudioViewFolder')?.setPosition(leftX, footerY - 72);
+        sourcePane?.getChildByName('AudioUndo')?.setPosition(leftX, footerY - 120);
+        const collapseInset = MIXER_CONTENT_INSET + 12;
+        const collapsePosition = new Vec3(this.mixerSourcePanelCollapsed ? -view.w / 2 + collapseInset : -view.w / 2 + leftWidth + collapseInset, -view.h / 2 + 42, 0);
+        const collapse = frame?.getChildByName('AudioSourceCollapse');
+        collapse?.setPosition(collapsePosition);
+        if (frame) frame.setSiblingIndex(panel.children.length - 1);
+        const arrow = collapse?.getChildByName('Arrow')?.getComponent(Label); if (arrow) arrow.string = this.mixerSourcePanelCollapsed ? '→' : '←';
         this.redrawPanelButtons(panel);
+        this.queueMixerRedraw();
     }
 
-    private closeAudioPanel() { if (this.audioPanel) { this.audioPanel.active = false; this.audioPanelOpen = false; } }
+    private closeAudioPanel() { if (this.audioPanel) { this.stopMixerInertia(); this.stopMixerTimelineReturnAnimation(); this.stopMixerTimelinePlayback(); this.mixerColorPalette?.destroy(); this.mixerColorPalette = null; this.audioPanel.active = false; this.audioPanelOpen = false; } }
+
+    private mixerTimelineContentInset() { return MIXER_CONTENT_INSET + (this.mixerSourcePanelCollapsed ? this.mixerCollapsedContentInsetExtra : 0); }
+
+    private toggleMixerSourcePane() {
+        if (!this.audioPanel || !this.mixerViewport || !this.mixerSourcePane || this.mixerSourcePaneAnimating) return;
+        this.stopMixerTimelineReturnAnimation();
+        this.stopMixerInertia(true);
+        const view = this.userViewport(false), leftWidth = view.w / 5, viewport = this.mixerViewport, pane = this.mixerSourcePane;
+        const button = this.audioPanel.getChildByName('AudioPanelTopBorder')?.getChildByName('AudioSourceCollapse');
+        const timeline = this.mixerTimeline, duration = .54, dividerTravel = leftWidth + 8;
+        const collapseInset = MIXER_CONTENT_INSET + 12;
+        const sourceOpacity = pane.getComponent(UIOpacity);
+        if (sourceOpacity) sourceOpacity.opacity = 255;
+        this.mixerSourcePaneAnimating = true;
+        if (!this.mixerSourcePanelCollapsed) {
+            this.mixerCollapsedContentInsetExtra = Math.min(this.mixerScrollX, dividerTravel);
+            this.mixerSourcePanelCollapsed = true;
+            viewport.getComponent(UITransform)!.setContentSize(view.w, view.h); viewport.setPosition(0, 0); this.redrawMixerTimeline();
+            const contentTravel = dividerTravel - this.mixerCollapsedContentInsetExtra;
+            if (timeline) {
+                timeline.setPosition(contentTravel, 0, 0);
+                for (const head of timeline.children.filter(child => child.name.startsWith('TrackHead'))) { const target = head.position.clone(); head.setPosition(target.x + this.mixerCollapsedContentInsetExtra, target.y, 0); tween(head).to(duration, { position: target }, { easing: 'quadInOut' }).start(); }
+                tween(timeline).to(duration, { position: Vec3.ZERO }, { easing: 'quadInOut' }).call(() => { timeline.setPosition(Vec3.ZERO); this.mixerSourcePaneAnimating = false; this.redrawMixerTimeline(); }).start();
+            }
+            tween(pane).to(duration, { position: new Vec3(-leftWidth, 0, 0) }, { easing: 'quadInOut' }).start();
+            if (button) tween(button).to(duration, { position: new Vec3(-view.w / 2 + collapseInset, -view.h / 2 + 42, 0) }, { easing: 'quadInOut' }).start();
+            const arrow = button?.getChildByName('Arrow')?.getComponent(Label); if (arrow) arrow.string = '→';
+            if (!timeline) this.scheduleOnce(() => { this.mixerSourcePaneAnimating = false; this.redrawMixerTimeline(); }, duration);
+        } else {
+            const contentTravel = dividerTravel - this.mixerCollapsedContentInsetExtra;
+            if (timeline) {
+                for (const head of timeline.children.filter(child => child.name.startsWith('TrackHead'))) tween(head).to(duration, { position: new Vec3(head.position.x + this.mixerCollapsedContentInsetExtra, head.position.y, 0) }, { easing: 'quadInOut' }).start();
+                tween(timeline).to(duration, { position: new Vec3(contentTravel, 0, 0) }, { easing: 'quadInOut' }).call(() => {
+                    this.mixerSourcePanelCollapsed = false; this.mixerCollapsedContentInsetExtra = 0;
+                    viewport.getComponent(UITransform)!.setContentSize(view.w - leftWidth - 8, view.h);
+                    viewport.setPosition(-view.w / 2 + leftWidth + (view.w - leftWidth) / 2, 0);
+                    timeline.setPosition(Vec3.ZERO); this.mixerSourcePaneAnimating = false; this.redrawMixerTimeline();
+                }).start();
+            }
+            pane.setPosition(-leftWidth, 0, 0); if (sourceOpacity) sourceOpacity.opacity = 255;
+            tween(pane).to(duration, { position: Vec3.ZERO }, { easing: 'quadInOut' }).start();
+            if (button) tween(button).to(duration, { position: new Vec3(-view.w / 2 + leftWidth + collapseInset, -view.h / 2 + 42, 0) }, { easing: 'quadInOut' }).start();
+            const arrow = button?.getChildByName('Arrow')?.getComponent(Label); if (arrow) arrow.string = '←';
+            if (!timeline) this.scheduleOnce(() => { this.mixerSourcePanelCollapsed = false; this.mixerCollapsedContentInsetExtra = 0; viewport.getComponent(UITransform)!.setContentSize(view.w - leftWidth - 8, view.h); viewport.setPosition(-view.w / 2 + leftWidth + (view.w - leftWidth) / 2, 0); this.mixerSourcePaneAnimating = false; this.redrawMixerTimeline(); }, duration);
+        }
+    }
+
+    private resetAudioSource(clip: AudioClipMeta) {
+        clip.volume = 1; clip.trimStart = 0; clip.trimEnd = Math.max(.1, clip.duration);
+        this.saveAudioClips(); this.rebuildAudioRows(); this.queueMixerRedraw();
+    }
+
+    private queueMixerLiveRedraw() {
+        if (this.mixerLiveRedrawTimer) return;
+        this.mixerLiveRedrawTimer = setTimeout(() => { this.mixerLiveRedrawTimer = null; this.redrawMixerTimeline(); }, 33);
+    }
+
+    private flushMixerLiveRedraw() {
+        if (this.mixerLiveRedrawTimer) clearTimeout(this.mixerLiveRedrawTimer);
+        this.mixerLiveRedrawTimer = null; this.redrawMixerTimeline();
+    }
+
+    private clearAudioTracks() {
+        if (!this.recordedClips.length && !this.mixerTracks.some(track => track.blocks.length)) {
+            this.setInfo(t('混音台中没有轨道', 'The mixer has no tracks.'), new Color(255, 190, 120, 255));
+            return;
+        }
+        NativeBridge.confirm(t('清空轨道', 'Clear Tracks'), t('确定清空混音台中的全部轨道吗？', 'Clear every track from the mixer?'), confirmed => {
+            if (!confirmed) return;
+            NativeBridge.stopAudioFiles();
+            this.pushMixerUndo();
+            this.recordedClips = [];
+            this.mixerTracks = [];
+            this.clipsPlaying = false; this.activePlaybackLoop = false;
+            this.saveAudioClips(); this.saveMixerTracks(); this.rebuildAudioRows(); this.updateConsoleGlyphs(); this.redrawMixerTimeline();
+            this.setEdgeMode(this.isRecording ? 'record' : 'idle');
+            this.setInfo(t('已清空全部轨道', 'All mixer tracks cleared.'), new Color(220, 225, 235, 255));
+        });
+    }
+
+    private exportEnabledMix(format: 'wav' | 'mp3') {
+        const enabled = this.audioPanel
+            ? this.timelineBlocks()
+            : this.recordedClips.filter(clip => clip.enabled && !!clip.path).map(clip => ({ ...clip, startBeat: 0, bpm: this.metronomeBpm }));
+        if (!enabled.length) {
+            this.setInfo(t('没有点亮绿点的轨道', 'No green-dot tracks are enabled.'), new Color(255, 190, 120, 255));
+            return;
+        }
+        if (!NativeBridge.isAndroidNative) {
+            this.setInfo(t('浏览器预览不支持导出混音', 'Mix export is unavailable in browser preview.'), new Color(255, 190, 120, 255));
+            return;
+        }
+        this.setInfo(t('正在合成并导出音频…', 'Rendering and exporting audio…'), new Color(220, 225, 235, 255));
+        const name = `ColorMusic_Mix_${Date.now()}`;
+        NativeBridge.mixAndExportAudioAsync(enabled, name, format, path => {
+            const failed = !path || path.startsWith('ERROR:');
+            if (failed) this.setInfo(path.replace(/^ERROR:/, '') || t('混音导出失败', 'Mix export failed.'), new Color(255, 150, 150, 255));
+            else { this.setInfo(t('混音导出成功', 'Mix exported successfully.'), new Color(200, 235, 205, 255)); NativeBridge.showAudioExportResult(path); }
+        });
+    }
 
     private rebuildAudioRows() {
         if (!this.audioPanel) return;
+        const previousPositions = new Map<string, Vec3>();
+        const previousHeights = new Map<string, number>();
+        for (const row of this.clipRows) { previousPositions.set(row.name, row.position.clone()); previousHeights.set(row.name, row.getComponent(UITransform)?.contentSize.height ?? 48); }
         for (const row of this.clipRows) row.destroy();
         this.clipRows = [];
-        const panel = this.audioPanel;
+        const panel = this.mixerSourcePane ?? this.audioPanel;
         const view = this.userViewport(false); const rowW = view.w - 40;
+        const leftWidth = view.w / 5;
+        let sourceY = view.h / 2 - 92;
+        this.recordedClips.slice(0, 13).forEach((clip, i) => {
+            const expanded = this.mixerExpandedSourceId === clip.id;
+            const rowHeight = expanded ? 178 : 48;
+            const row = new Node(`AudioSource${clip.id}`); row.layer = Layers.Enum.UI_2D;
+            row.addComponent(UITransform).setContentSize(leftWidth - 18, rowHeight);
+            const targetPosition = new Vec3(-view.w / 2 + leftWidth / 2, sourceY - rowHeight / 2 + 24, 0);
+            const wasExpanded = (previousHeights.get(row.name) ?? 48) > 100;
+            row.setPosition(wasExpanded === expanded ? (previousPositions.get(row.name) ?? targetPosition) : targetPosition);
+            const g = row.addComponent(Graphics); g.roundRect(-(leftWidth - 18) / 2, -rowHeight / 2, leftWidth - 18, rowHeight, 4); g.fillColor = new Color(18, 23, 34, 255); g.fill(); g.lineWidth = 1.5; g.strokeColor = this.mixerColor(clip.color ?? 'white'); g.stroke();
+            const enabled = this.makePanelButton(row, clip.enabled !== false ? '●' : '○', -(leftWidth - 18) / 2 + 22, rowHeight / 2 - 24, 34, 34, () => { clip.enabled = clip.enabled === false; this.saveAudioClips(); this.queueMixerRedraw(); this.rebuildAudioRows(); }, clip.enabled !== false ? new Color(40, 150, 80, 255) : new Color(55, 65, 80, 255));
+            const enabledLabel = enabled.getChildByName('Text')?.getComponent(Label); if (enabledLabel) enabledLabel.fontSize = 20;
+            const label = this.makeLabel('SourceName', clip.name, 15, 22, new Color(240, 244, 250, 255), leftWidth - 155, 24); label.setPosition(-48, rowHeight / 2 - 16); row.addChild(label);
+            const detail = this.makeLabel('SourceDetail', `${Math.max(.1, clip.duration).toFixed(1)}s  ${Math.round(clip.volume * 100)}%`, 11, 16, new Color(160, 170, 190, 255), leftWidth - 155, 18); detail.setPosition(-48, rowHeight / 2 - 36); row.addChild(detail);
+            const reset = this.makePanelButton(row, '↻', (leftWidth - 18) / 2 - 113, rowHeight / 2 - 24, 34, 34, () => this.resetAudioSource(clip), new Color(48, 58, 78, 255)); (reset as any).__mixerSourceControl = true;
+            const resetLabel = reset.getChildByName('Text')?.getComponent(Label); if (resetLabel) resetLabel.fontSize = 19;
+            const preview = this.makePanelButton(row, '▶', (leftWidth - 18) / 2 - 69, rowHeight / 2 - 24, 34, 34, () => NativeBridge.playAudioFiles([clip], false), new Color(42, 72, 115, 255));
+            const previewLabel = preview.getChildByName('Text')?.getComponent(Label); if (previewLabel) previewLabel.fontSize = 16;
+            this.makeCloneButton(row, (leftWidth - 18) / 2 - 25, rowHeight / 2 - 24, () => this.cloneAudioClip(clip));
+            if (expanded) {
+                const content = new Node('SourceExpandedContent'); content.layer = Layers.Enum.UI_2D; content.addComponent(UITransform).setContentSize(leftWidth - 18, 124); const contentOpacity = content.addComponent(UIOpacity); row.addChild(content);
+                this.makeSourceVolumeSlider(content, clip, 0, -rowHeight / 2 + 116, leftWidth - 70);
+                this.makeTrimRangeSlider(content, clip, 0, -rowHeight / 2 + 78, leftWidth - 70, () => this.queueMixerLiveRedraw());
+                this.makeSourceColorButton(content, clip, -115, -rowHeight / 2 + 28);
+                this.makePanelButton(content, t('导出', 'Export'), -35, -rowHeight / 2 + 28, 82, 30, () => this.exportAudioClip(clip), new Color(42, 72, 115, 255));
+                this.makePanelButton(content, t('删除', 'Delete'), 65, -rowHeight / 2 + 28, 82, 30, () => this.deleteAudioSource(clip), new Color(110, 45, 55, 255));
+                if (!wasExpanded) { content.setPosition(0, 18); contentOpacity.opacity = 0; tween(content).to(.32, { position: Vec3.ZERO }, { easing: 'quadOut' }).start(); tween(contentOpacity).to(.2, { opacity: 255 }, { easing: 'quadOut' }).start(); }
+            }
+            this.attachMixerSourceDrag(row, clip);
+            panel.addChild(row); this.clipRows.push(row);
+            const previous = previousPositions.get(row.name);
+            if (previous && wasExpanded === expanded && !previous.equals(targetPosition)) tween(row).to(.34, { position: targetPosition }, { easing: 'quadOut' }).start();
+            else row.setPosition(targetPosition);
+            sourceY -= rowHeight + 6;
+        });
+        return;
         this.recordedClips.slice(0, 13).forEach((clip, i) => {
             const row = new Node(`ClipRow${clip.id}`); row.layer = Layers.Enum.UI_2D; row.addComponent(UITransform).setContentSize(rowW, 48); row.setPosition(0, view.h / 2 - 92 - i * 58);
             const rg = row.addComponent(Graphics); rg.roundRect(-rowW / 2, -23, rowW, 46, 6); rg.fillColor = new Color(22, 30, 48, 255); rg.fill(); rg.lineWidth = 1; rg.strokeColor = new Color(60, 80, 110, 255); rg.stroke();
@@ -2733,11 +3142,852 @@ export class GameManager extends Component {
         });
     }
 
-    private renameAudioClip(clip: AudioClipMeta) { NativeBridge.promptText('重命名音频', clip.name, (value) => { if (value.trim()) clip.name = value.trim(); this.saveAudioClips(); this.rebuildAudioRows(); }); }
-    private editClipTrim(clip: AudioClipMeta, start: boolean) { const duration = Math.max(.1, clip.duration); const initial = start ? clip.trimStart : (clip.trimEnd || duration); NativeBridge.promptText(start ? '首端裁剪（秒）' : '末端裁剪（秒）', initial.toFixed(2), (value) => { const n = Number(value); if (!Number.isFinite(n)) return; if (start) clip.trimStart = Math.max(0, Math.min(n, (clip.trimEnd || duration) - .05)); else clip.trimEnd = Math.max(clip.trimStart + .05, Math.min(n, duration)); this.saveAudioClips(); this.rebuildAudioRows(); }); }
+    private makeSourceVolumeSlider(parent: Node, clip: AudioClipMeta, x: number, y: number, width: number) {
+        const node = new Node('SourceVolumeSlider'); node.layer = Layers.Enum.UI_2D;
+        (node as any).__mixerSourceControl = true;
+        const transform = node.addComponent(UITransform); transform.setContentSize(width, 30); node.setPosition(x, y);
+        const g = node.addComponent(Graphics);
+        const draw = () => { g.clear(); g.roundRect(-width / 2, -4, width, 8, 4); g.fillColor = new Color(55, 65, 82, 255); g.fill(); g.roundRect(-width / 2, -4, width * clip.volume, 8, 4); g.fillColor = new Color(70, 190, 120, 255); g.fill(); g.circle(-width / 2 + width * clip.volume, 0, 7); g.fillColor = new Color(240, 245, 252, 255); g.fill(); };
+        const update = (event: EventTouch) => { const p = event.getUILocation(); const local = transform.convertToNodeSpaceAR(new Vec3(p.x, p.y, 0)); clip.volume = Math.max(0, Math.min(1, (local.x + width / 2) / width)); draw(); this.queueMixerLiveRedraw(); event.propagationStopped = true; };
+        const finish = (event: EventTouch) => { this.saveAudioClips(); this.flushMixerLiveRedraw(); event.propagationStopped = true; };
+        node.on(Node.EventType.TOUCH_START, update, this); node.on(Node.EventType.TOUCH_MOVE, update, this); node.on(Node.EventType.TOUCH_END, finish, this); node.on(Node.EventType.TOUCH_CANCEL, finish, this); draw(); parent.addChild(node);
+    }
+
+    private makeSourceColorButton(parent: Node, clip: AudioClipMeta, x: number, y: number) {
+        const node = new Node('SourceColor'); node.layer = Layers.Enum.UI_2D; (node as any).__mixerSourceControl = true;
+        node.addComponent(UITransform).setContentSize(30, 30); node.setPosition(x, y);
+        const g = node.addComponent(Graphics); g.circle(0, 0, 12); g.fillColor = this.mixerColor(clip.color ?? 'white'); g.fill(); g.lineWidth = 2; g.strokeColor = new Color(215, 222, 235, 235); g.stroke();
+        node.addComponent(Button).transition = Button.Transition.SCALE; node.on(Button.EventType.CLICK, () => this.openMixerSourceColorPalette(clip), this); parent.addChild(node);
+    }
+
+    private deleteAudioSource(clip: AudioClipMeta) {
+        this.pushMixerUndo();
+        this.recordedClips = this.recordedClips.filter(item => item.id !== clip.id);
+        this.mixerTracks = this.mixerTracks.map(track => ({ ...track, blocks: track.blocks.filter(block => block.clipId !== clip.id) }));
+        this.mixerExpandedSourceId = '';
+        this.saveAudioClips(); this.saveMixerTracks(); this.rebuildAudioRows(); this.queueMixerRedraw();
+    }
+
+    private attachMixerSourceDrag(row: Node, clip: AudioClipMeta) {
+        let dragging = false; let moved = false; let start = new Vec3();
+        let renameHoldTimer: ReturnType<typeof setTimeout> | null = null;
+        let renameTriggered = false;
+        const isControl = (event: EventTouch) => { let target = event.target as Node | null; while (target && target !== row) { if ((target as any).__mixerSourceControl || target.getComponent(Button)) return true; target = target.parent; } return false; };
+        const isSourceName = (event: EventTouch) => {
+            const nameNode = row.getChildByName('SourceName');
+            const transform = nameNode?.getComponent(UITransform);
+            if (!nameNode || !transform) return false;
+            const p = event.getUILocation();
+            const local = transform.convertToNodeSpaceAR(new Vec3(p.x, p.y, 0));
+            return Math.abs(local.x) <= transform.contentSize.width / 2 && Math.abs(local.y) <= transform.contentSize.height / 2;
+        };
+        const cancelRenameHold = () => { if (renameHoldTimer !== null) clearTimeout(renameHoldTimer); renameHoldTimer = null; };
+        row.on(Node.EventType.TOUCH_START, (event: EventTouch) => {
+            if (isControl(event)) return;
+            const p = event.getUILocation(); start.set(p.x, p.y, 0); dragging = false; moved = false; renameTriggered = false;
+            cancelRenameHold();
+            if (isSourceName(event)) renameHoldTimer = setTimeout(() => {
+                renameHoldTimer = null;
+                if (moved || dragging || !row.isValid) return;
+                renameTriggered = true;
+                this.renameAudioClip(clip);
+            }, 700);
+            event.propagationStopped = true;
+        }, this);
+        row.on(Node.EventType.TOUCH_MOVE, (event: EventTouch) => {
+            if (isControl(event)) return;
+            const p = event.getUILocation(); const point = new Vec3(p.x, p.y, 0); if (!moved && Math.abs(p.x - start.x) + Math.abs(p.y - start.y) > 12) { moved = true; dragging = true; cancelRenameHold(); this.beginMixerDragGhost(clip, point); }
+            if (dragging) this.updateMixerDragGhost(point);
+            event.propagationStopped = true;
+        }, this);
+        const finish = (event: EventTouch) => {
+            if (isControl(event)) return;
+            cancelRenameHold();
+            if (dragging) { const target = this.mixerLocation(event); if (target) this.addMixerBlock(clip, target.track, target.beat); this.mixerDragGhost?.destroy(); this.mixerDragGhost = null; }
+            else if (!moved && !renameTriggered) {
+                if (this.mixerExpandedSourceId === clip.id) { const content = row.getChildByName('SourceExpandedContent'); if (content) { const opacity = content.getComponent(UIOpacity); Tween.stopAllByTarget(content); if (opacity) { Tween.stopAllByTarget(opacity); tween(opacity).to(.12, { opacity: 0 }, { easing: 'quadIn' }).start(); } tween(content).to(.16, { position: new Vec3(0, 18, 0) }, { easing: 'quadIn' }).call(() => { this.mixerExpandedSourceId = ''; this.rebuildAudioRows(); }).start(); } else { this.mixerExpandedSourceId = ''; this.rebuildAudioRows(); } }
+                else { this.mixerExpandedSourceId = clip.id; this.rebuildAudioRows(); }
+            }
+            dragging = false; moved = false; renameTriggered = false;
+            event.propagationStopped = true;
+        };
+        row.on(Node.EventType.TOUCH_END, finish, this); row.on(Node.EventType.TOUCH_CANCEL, finish, this);
+    }
+
+    private beginMixerDragGhost(clip: AudioClipMeta, point: Vec3) {
+        this.mixerDragGhost?.destroy();
+        if (!this.audioPanel) return;
+        const ghost = new Node('MixerDragGhost'); ghost.layer = Layers.Enum.UI_2D; ghost.addComponent(UITransform).setContentSize(190, 52);
+        const g = ghost.addComponent(Graphics); g.roundRect(-95, -26, 190, 52, MIXER_BLOCK_CORNER_RADIUS); g.fillColor = new Color(2, 3, 5, 235); g.fill(); g.lineWidth = 2; g.strokeColor = new Color(245, 245, 245, 230); g.stroke();
+        ghost.addChild(this.makeLabel('GhostName', clip.name, 14, 22, new Color(255, 255, 255, 255), 176, 22));
+        this.audioPanel.addChild(ghost); this.mixerDragGhost = ghost; this.updateMixerDragGhost(point);
+    }
+
+    private updateMixerDragGhost(point: Vec3) {
+        if (!this.mixerDragGhost || !this.audioPanel) return;
+        const local = this.audioPanel.getComponent(UITransform)!.convertToNodeSpaceAR(point);
+        this.mixerDragGhost.setPosition(local.x, local.y, 0);
+    }
+
+    private mixerLocation(event: EventTouch): { track: number; beat: number } | null {
+        if (!this.mixerViewport) return null;
+        const point = event.getUILocation();
+        const local = this.mixerViewport.getComponent(UITransform)!.convertToNodeSpaceAR(new Vec3(point.x, point.y, 0));
+        const size = this.mixerViewport.getComponent(UITransform)!.contentSize;
+        if (Math.abs(local.x) > size.width / 2 || Math.abs(local.y) > size.height / 2) return null;
+        const beat = Math.max(0, (local.x + size.width / 2 - this.mixerTimelineContentInset() + this.mixerScrollX) / this.mixerBeatWidth);
+        const track = Math.max(0, Math.min(12, Math.floor((size.height / 2 - local.y - 38 + this.mixerScrollY) / this.mixerRowHeight)));
+        return { track, beat: this.mixerMagnet ? Math.round(beat) : beat };
+    }
+
+    private clipBeats(clip: AudioClipMeta, block?: MixerBlock): number {
+        const start = block?.trimStart ?? clip.trimStart;
+        const blockEnd = block?.trimEnd ?? clip.trimEnd;
+        const seconds = Math.max(.05, (blockEnd > start ? blockEnd : clip.duration) - start);
+        return Math.max(.1, seconds * this.metronomeBpm / 60 / Math.max(.25, Math.min(4, block?.speed ?? 1)));
+    }
+
+    private ensureMixerTrack(index: number): MixerTrack | null {
+        while (this.mixerTracks.length <= index && this.mixerTracks.length < 13) this.mixerTracks.push({ id: `track_${Date.now()}_${this.mixerTracks.length}`, muted: false, solo: false, blocks: [] });
+        return this.mixerTracks[index] ?? null;
+    }
+
+    private findFreeMixerTrack(start: number, beat: number, length: number, ignoreId = ''): number {
+        for (let index = Math.max(0, start); index < 13; index++) {
+            const track = this.ensureMixerTrack(index); if (!track) break;
+            const overlaps = track.blocks.some(block => {
+                if (block.id === ignoreId) return false;
+                const clip = this.recordedClips.find(item => item.id === block.clipId); if (!clip) return false;
+                const end = block.startBeat + this.clipBeats(clip, block);
+                return beat < end - .001 && beat + length > block.startBeat + .001;
+            });
+            if (!overlaps) return index;
+        }
+        return Math.min(12, Math.max(0, start));
+    }
+
+    private addMixerBlock(clip: AudioClipMeta, requestedTrack: number, beat: number) {
+        this.pushMixerUndo();
+        const block: MixerBlock = { id: `block_${Date.now()}_${Math.floor(Math.random() * 1000)}`, clipId: clip.id, startBeat: Math.max(0, beat), color: clip.color ?? 'white', speed: 1, volumeAutomation: [1, 1] };
+        const trackIndex = this.findFreeMixerTrack(requestedTrack, block.startBeat, this.clipBeats(clip, block));
+        this.ensureMixerTrack(trackIndex)?.blocks.push(block);
+        this.mixerSelectedBlockId = block.id;
+        this.saveMixerTracks(); this.redrawMixerTimeline();
+    }
+
+    private findMixerBlock(blockId: string): { block: MixerBlock; track: MixerTrack; trackIndex: number } | null {
+        for (let i = 0; i < this.mixerTracks.length; i++) {
+            const block = this.mixerTracks[i].blocks.find(item => item.id === blockId);
+            if (block) return { block, track: this.mixerTracks[i], trackIndex: i };
+        }
+        return null;
+    }
+
+    private mixerColor(name: string): Color {
+        const colors: Record<string, Color> = { black: new Color(35, 35, 38, 255), white: new Color(245, 245, 245, 255), red: new Color(240, 70, 75, 255), orange: new Color(245, 145, 50, 255), pink: new Color(245, 105, 165, 255), yellow: new Color(240, 215, 55, 255), blue: new Color(75, 135, 245, 255), green: new Color(70, 195, 110, 255), cyan: new Color(55, 205, 205, 255), brown: new Color(145, 95, 60, 255) };
+        return colors[name] ?? colors.white;
+    }
+
+    private queueMixerRedraw() {
+        if (this.mixerRedrawQueued) return;
+        this.mixerRedrawQueued = true;
+        this.scheduleOnce(() => { this.mixerRedrawQueued = false; this.redrawMixerTimeline(); }, 0);
+    }
+
+    private deferMixerGestureRedraw(inertiaGeneration = this.mixerInertiaGeneration) {
+        const request = ++this.mixerDeferredRedrawGeneration;
+        this.scheduleOnce(() => {
+            if (request !== this.mixerDeferredRedrawGeneration || inertiaGeneration !== this.mixerInertiaGeneration
+                || this.mixerGestureTouches.size > 0 || this.mixerInertiaFrame !== null) return;
+            this.redrawMixerTimeline();
+        }, 0);
+    }
+
+    private mixerBeatAccent(beat: number) {
+        const beatsPerBar = Math.max(1, this.metronomeBeatsPerBar), position = ((Math.round(beat) % beatsPerBar) + beatsPerBar) % beatsPerBar;
+        const compoundSecondary = this.metronomeBeatUnit === 8 && beatsPerBar >= 6 && beatsPerBar % 3 === 0 && position > 0 && position % 3 === 0;
+        const simpleSecondary = !compoundSecondary && beatsPerBar >= 4 && position === Math.ceil(beatsPerBar / 2);
+        return position === 0 ? 2 : (compoundSecondary || simpleSecondary ? 1 : 0);
+    }
+
+    private redrawMixerTimeline() {
+        const timeline = this.mixerTimeline, viewport = this.mixerViewport;
+        if (!timeline || !viewport || !this.audioPanelOpen || this.mixerDraggingBlockId) return;
+        this.mixerDeferredRedrawGeneration++;
+        if (this.mixerSelectionBorderTransition) Tween.stopAllByTarget(this.mixerSelectionBorderTransition);
+        this.mixerSelectionBorderTransition = null;
+        const staleChildren = timeline.children.slice();
+        for (const child of staleChildren) { child.active = false; child.removeFromParent(); }
+        for (const child of staleChildren) child.destroy();
+        timeline.setPosition(0, 0, 0); timeline.setScale(Vec3.ONE);
+        this.mixerRenderedScrollX = this.mixerScrollX; this.mixerRenderedScrollY = this.mixerScrollY; this.mixerRenderedBeatWidth = this.mixerBeatWidth;
+        this.mixerGestureVisualBasePosition.set(0, 0, 0); this.mixerGestureVisualBaseScaleX = 1;
+        const size = viewport.getComponent(UITransform)!.contentSize; const w = size.width, h = size.height, contentInset = this.mixerTimelineContentInset();
+        const grid = new Node('TimelineGrid'); grid.layer = Layers.Enum.UI_2D; grid.addComponent(UITransform).setContentSize(w, h); const gg = grid.addComponent(Graphics);
+        grid.on(Node.EventType.TOUCH_END, (event: EventTouch) => {
+            if (!this.mixerGestureMoved) {
+                const p = event.getUILocation(); const local = grid.getComponent(UITransform)!.convertToNodeSpaceAR(new Vec3(p.x, p.y, 0));
+                if (local.y >= h / 2 - 42) { if (this.mixerPlaying) this.stopMixerTimelinePlayback(true); this.setMixerPlayheadFromLocalX(local.x, w, true); }
+                else this.deselectMixerBlockImmediately();
+            }
+        }, this);
+        const preloadStartBeat = Math.max(0, (this.mixerScrollX - contentInset - w * .5) / this.mixerBeatWidth), preloadEndBeat = Math.max(preloadStartBeat, (this.mixerScrollX - contentInset + w * 1.5) / this.mixerBeatWidth);
+        const firstBeat = Math.max(0, Math.floor(preloadStartBeat)); const lastBeat = Math.ceil(preloadEndBeat) + 1;
+        gg.lineWidth = 1; gg.strokeColor = new Color(255, 255, 255, 84);
+        for (let row = 0; row <= 13; row++) { const y = h / 2 - 34 - row * this.mixerRowHeight + this.mixerScrollY; gg.moveTo(-w / 2 - w * .5, y); gg.lineTo(w / 2 + w * .5, y); } gg.stroke();
+        const verticalGroups = [1, 1.5, 2].map((lineWidth, index) => { const layer = new Node(`BeatLines${index}`); layer.layer = Layers.Enum.UI_2D; layer.addComponent(UITransform).setContentSize(w * 2, h); const graphics = layer.addComponent(Graphics); graphics.lineWidth = lineWidth; graphics.strokeColor = new Color(255, 255, 255, 84); grid.addChild(layer); return graphics; });
+        const ruler = new Node('TimelineRuler'); ruler.layer = Layers.Enum.UI_2D; ruler.addComponent(UITransform).setContentSize(w * 2, 34); ruler.setPosition(0, h / 2 - 17);
+        const rulerG = ruler.addComponent(Graphics); rulerG.rect(-w, -17, w * 2, 34); rulerG.fillColor = new Color(0, 0, 0, 255); rulerG.fill(); rulerG.lineWidth = 1; rulerG.strokeColor = new Color(105, 115, 135, 220); rulerG.moveTo(-w, -17); rulerG.lineTo(w, -17); rulerG.stroke();
+        for (let beat = firstBeat; beat <= lastBeat; beat++) {
+            const x = -w / 2 + contentInset + beat * this.mixerBeatWidth - this.mixerScrollX, accent = this.mixerBeatAccent(beat);
+            verticalGroups[accent].moveTo(x, -h / 2); verticalGroups[accent].lineTo(x, h / 2 - 34);
+            const fontSize = accent === 2 ? 17 : (accent === 1 ? 11 : 6), lineHeight = accent === 2 ? 22 : (accent === 1 ? 16 : 10);
+            const label = this.makeLabel(`Beat${beat}`, String(beat + 1), fontSize, lineHeight, new Color(210, 215, 225, 220), 40, 24); label.setPosition(x - 1, 0); ruler.addChild(label);
+        }
+        for (const graphics of verticalGroups) graphics.stroke(); timeline.addChild(grid);
+        this.mixerTracks.forEach((track, trackIndex) => {
+            const y = h / 2 - 34 - trackIndex * this.mixerRowHeight - this.mixerRowHeight / 2 + this.mixerScrollY;
+            if (y < -h / 2 - this.mixerRowHeight * 2 || y > h / 2 + this.mixerRowHeight * 2) return;
+            const head = new Node(`TrackHead${trackIndex}`); head.layer = Layers.Enum.UI_2D; head.addComponent(UITransform).setContentSize(MIXER_TRACK_HEAD_WIDTH, this.mixerRowHeight - 4); head.setPosition(-w / 2 + MIXER_TRACK_HEAD_WIDTH / 2 + 2, y); head.addComponent(Graphics); this.paintMixerTrackHead(head, track);
+            for (const block of track.blocks) { const clip = this.recordedClips.find(item => item.id === block.clipId); if (!clip) continue; const endBeat = block.startBeat + this.clipBeats(clip, block); if (endBeat >= preloadStartBeat && block.startBeat <= preloadEndBeat) this.drawMixerBlock(timeline, block, trackIndex, w, h, y); }
+            const number = this.makeLabel('TrackNumber', `${trackIndex + 1}${track.solo ? ' S' : ''}`, 11, 16, new Color(255, 255, 255, 255), 32, 20); head.addChild(number); this.attachTrackMuteGesture(head, track, trackIndex); timeline.addChild(head);
+        });
+        timeline.addChild(ruler);
+        this.createMixerPlayhead(timeline, w, h, ruler);
+        ruler.on(Node.EventType.TOUCH_END, (event: EventTouch) => { if (!this.mixerGestureMoved) { const p = event.getUILocation(); const local = ruler.getComponent(UITransform)!.convertToNodeSpaceAR(new Vec3(p.x, p.y, 0)); if (this.mixerPlaying) this.stopMixerTimelinePlayback(true); this.setMixerPlayheadFromLocalX(local.x, w, true); } event.propagationStopped = true; }, this);
+        this.updateMixerPlayheadVisual();
+        const audioPanelTopBorder = this.audioPanel?.getChildByName('AudioPanelTopBorder');
+        if (audioPanelTopBorder && this.audioPanel) {
+            audioPanelTopBorder.setSiblingIndex(this.audioPanel.children.length - 1);
+        }
+        const magnet = this.audioPanel?.getChildByName('AudioMagnet'); if (magnet) { (magnet as any).__panelButtonStyle.color = this.mixerMagnet ? new Color(245, 245, 245, 255) : new Color(8, 10, 15, 255); const label = magnet.getChildByName('Text')?.getComponent(Label); if (label) label.color = this.mixerMagnet ? new Color(0, 0, 0, 255) : new Color(255, 255, 255, 255); this.redrawPanelButton(magnet); }
+        this.redrawMixerTransportButtons();
+    }
+
+    private drawMixerBlock(parent: Node, block: MixerBlock, trackIndex: number, viewW: number, viewH: number, y: number) {
+        const clip = this.recordedClips.find(item => item.id === block.clipId); if (!clip) return;
+        const length = this.clipBeats(clip, block); const width = Math.max(18, length * this.mixerBeatWidth); const color = this.mixerColor(block.color); const selected = block.id === this.mixerSelectedBlockId;
+        const blockHeight = this.mixerRowHeight - 2; const node = new Node(`MixerBlock${block.id}`); node.layer = Layers.Enum.UI_2D; node.addComponent(UITransform).setContentSize(width, blockHeight); const target = new Vec3(-viewW / 2 + this.mixerTimelineContentInset() + block.startBeat * this.mixerBeatWidth - this.mixerScrollX + width / 2, y, 0); node.setPosition(target);
+        const bg = node.addComponent(Graphics); const hh = blockHeight / 2, radius = Math.min(MIXER_BLOCK_CORNER_RADIUS, width / 2, hh); bg.roundRect(-width / 2, -hh, width, hh * 2, radius); bg.fillColor = new Color(2, 3, 5, 255); bg.fill(); bg.lineWidth = 2; bg.strokeColor = color; bg.stroke();
+        const automation = block.volumeAutomation?.length ? block.volumeAutomation : [1, 1]; const kappa = .5522848;
+        bg.fillColor = new Color(color.r, color.g, color.b, 84); bg.moveTo(-width / 2 + radius, -hh); bg.bezierCurveTo(-width / 2 + radius * (1 - kappa), -hh, -width / 2, -hh + radius * (1 - kappa), -width / 2, -hh + radius);
+        automation.forEach((value, i) => { const y = -hh + Math.max(0, Math.min(1, value * clip.volume)) * hh * 2; const edgeY = i === 0 || i === automation.length - 1 ? Math.max(-hh + radius, y) : y; bg.lineTo(-width / 2 + width * i / Math.max(1, automation.length - 1), edgeY); });
+        bg.lineTo(width / 2, -hh + radius); bg.bezierCurveTo(width / 2, -hh + radius * (1 - kappa), width / 2 - radius * (1 - kappa), -hh, width / 2 - radius, -hh); bg.close(); bg.fill();
+        bg.strokeColor = new Color(255, 255, 255, 235); bg.lineWidth = 1.2; const waveTop = selected ? hh - 24 : hh; for (let x = 0; x < width; x += 3) { const phase = x / Math.max(1, width) * Math.PI * 18; const amp = (Math.sin(phase) * .55 + Math.sin(phase * .37) * .25) * (waveTop - 8); const px = -width / 2 + x; if (x === 0) bg.moveTo(px, 0); else bg.lineTo(px, amp); } bg.stroke();
+        if (selected) { this.drawMixerBlockSelectionBorder(node, width, hh, color); this.drawMixerBlockToolbar(node, block, clip, width, hh, color); }
+        else { const label = this.makeLabel('BlockName', clip.name, 12, 18, new Color(255, 255, 255, 230), Math.max(20, width - 8), 18); label.setPosition(0, hh - 11); node.addChild(label); }
+        this.attachMixerBlockGesture(node, block, trackIndex);
+        parent.addChild(node); const from = this.mixerAnimateFrom.get(block.id); if (from) { node.setPosition(from); tween(node).to(1, { position: target }, { easing: 'quadInOut' }).start(); this.mixerAnimateFrom.delete(block.id); }
+    }
+
+    private drawMixerBlockSelectionBorder(node: Node, width: number, hh: number, color: Color) {
+        node.getChildByName('BlockSelectionBorder')?.destroy();
+        const border = new Node('BlockSelectionBorder'); border.layer = Layers.Enum.UI_2D; border.addComponent(UITransform).setContentSize(width + 8, hh * 2 + 8);
+        const g = border.addComponent(Graphics); g.lineWidth = 1.5; g.strokeColor = color; g.roundRect(-width / 2 - 3, -hh - 3, width + 6, hh * 2 + 6, MIXER_BLOCK_CORNER_RADIUS + 3); g.stroke(); node.addChild(border);
+    }
+
+    private animateMixerBlockSelectionBorder(fromNode: Node | null, toNode: Node, blockId: string, color: Color) {
+        const timeline = this.mixerTimeline, targetTransform = toNode.getComponent(UITransform);
+        if (!timeline || !targetTransform) return;
+        const targetWidth = targetTransform.contentSize.width + 6, targetHeight = targetTransform.contentSize.height + 6;
+        let sourcePosition = toNode.position.clone(), sourceWidth = targetWidth, sourceHeight = targetHeight;
+        const active = this.mixerSelectionBorderTransition;
+        if (active) {
+            const activeTransform = active.getComponent(UITransform);
+            sourcePosition = active.position.clone();
+            if (activeTransform) {
+                sourceWidth = activeTransform.contentSize.width * Math.abs(active.scale.x);
+                sourceHeight = activeTransform.contentSize.height * Math.abs(active.scale.y);
+            }
+            Tween.stopAllByTarget(active); active.destroy();
+        } else if (fromNode) {
+            const sourceTransform = fromNode.getComponent(UITransform);
+            sourcePosition = fromNode.position.clone();
+            if (sourceTransform) {
+                sourceWidth = sourceTransform.contentSize.width + 6;
+                sourceHeight = sourceTransform.contentSize.height + 6;
+            }
+        }
+        const transition = new Node('BlockSelectionBorderTransition'); transition.layer = Layers.Enum.UI_2D;
+        transition.addComponent(UITransform).setContentSize(sourceWidth, sourceHeight); transition.setPosition(sourcePosition);
+        const g = transition.addComponent(Graphics); g.lineWidth = 1.5; g.strokeColor = color;
+        g.roundRect(-sourceWidth / 2, -sourceHeight / 2, sourceWidth, sourceHeight, Math.min(MIXER_BLOCK_CORNER_RADIUS + 3, sourceWidth / 2, sourceHeight / 2)); g.stroke();
+        timeline.addChild(transition);
+        const ruler = timeline.getChildByName('TimelineRuler'), rulerIndex = ruler ? timeline.children.indexOf(ruler) : -1;
+        if (rulerIndex >= 0) transition.setSiblingIndex(rulerIndex);
+        this.mixerSelectionBorderTransition = transition;
+        tween(transition).to(.3, {
+            position: toNode.position.clone(),
+            scale: new Vec3(targetWidth / Math.max(1, sourceWidth), targetHeight / Math.max(1, sourceHeight), 1),
+        }, { easing: 'quadInOut' }).call(() => {
+            if (this.mixerSelectionBorderTransition !== transition) return;
+            this.mixerSelectionBorderTransition = null; transition.destroy();
+            if (this.mixerSelectedBlockId !== blockId) return;
+            if (this.mixerDraggingBlockId) this.drawMixerBlockSelectionBorder(toNode, targetTransform.contentSize.width, targetTransform.contentSize.height / 2, color);
+            else this.redrawMixerTimeline();
+        }).start();
+    }
+
+    private drawMixerBlockToolbar(node: Node, block: MixerBlock, clip: AudioClipMeta, width: number, hh: number, color: Color) {
+        const bar = new Node('BlockToolbar'); bar.layer = Layers.Enum.UI_2D; bar.addComponent(UITransform).setContentSize(width - 4, 24); const barG = bar.addComponent(Graphics); barG.roundRect(-(width - 4) / 2, -12, width - 4, 24, Math.min(MIXER_BLOCK_CORNER_RADIUS, 12)); barG.fillColor = new Color(2, 3, 5, 255); barG.fill(); barG.lineWidth = 1; barG.strokeColor = color; barG.moveTo(-(width - 4) / 2, -12); barG.lineTo((width - 4) / 2, -12); barG.stroke(); bar.setPosition(0, hh + 4); node.addChild(bar); tween(bar).to(.06, { position: new Vec3(0, hh - 12, 0) }, { easing: 'quadOut' }).start();
+        const label = this.makeLabel('BlockName', clip.name, 12, 18, new Color(255, 255, 255, 255), Math.max(30, width - 132), 18); label.setPosition(-Math.max(0, width / 2 - 65), 0); bar.addChild(label);
+        if (width < 150) return;
+        const actions: Array<[string, () => void, Color]> = [
+            ['⧉', () => this.cloneMixerBlock(block.id), new Color(10, 10, 12, 255)],
+            ['←', () => this.alignMixerBlockLeft(block.id), new Color(10, 10, 12, 255)],
+            ['X', () => this.deleteMixerBlock(block.id), new Color(10, 10, 12, 255)],
+            ['●', () => this.openMixerColorPalette(block.id), color],
+        ];
+        actions.forEach((action, index) => { const x = width / 2 - 16 - (3 - index) * 31; const button = this.makePanelButton(bar, action[0], x, 0, 26, 22, action[1], action[2]); const text = button.getChildByName('Text')?.getComponent(Label); if (text) { text.fontSize = 12; if (action[0] === 'X') text.color = new Color(255, 65, 70, 255); } });
+    }
+
+    private paintMixerTrackHead(node: Node, track: MixerTrack) {
+        const g = node.getComponent(Graphics); if (!g) return;
+        const width = MIXER_TRACK_HEAD_WIDTH, height = this.mixerRowHeight - 4, radius = Math.min(MIXER_BLOCK_CORNER_RADIUS, width / 2, height / 2); g.clear();
+        g.roundRect(-width / 2, -height / 2, width, height, radius); g.fillColor = new Color(0, 0, 0, 255); g.fill();
+        if (track.muted) { /* opaque base is the muted state */ }
+        else {
+            const rings = 7, step = Math.min(width, height) * .45 / rings;
+            for (let ring = 0; ring < rings; ring++) {
+                const inset = ring * step, innerW = width - inset * 2, innerH = height - inset * 2, shade = Math.round(105 * (1 - ring / rings));
+                g.fillColor = new Color(shade, shade, shade, 153);
+                g.roundRect(-width / 2 + inset, -height / 2 + inset, innerW, innerH, Math.max(0, radius - inset)); g.fill();
+            }
+            const centerInset = rings * step; g.fillColor = new Color(0, 0, 0, 153); g.roundRect(-width / 2 + centerInset, -height / 2 + centerInset, Math.max(0, width - centerInset * 2), Math.max(0, height - centerInset * 2), Math.max(0, radius - centerInset)); g.fill();
+        }
+        g.lineWidth = track.solo ? 3 : 1; g.strokeColor = track.solo ? new Color(255, 220, 70, 255) : new Color(210, 215, 225, 180); g.roundRect(-width / 2, -height / 2, width, height, radius); g.stroke();
+    }
+
+    private attachTrackMuteGesture(node: Node, track: MixerTrack, trackIndex: number) {
+        let startY = 0, lastIndex = trackIndex, sliding = false, targetMuted = false;
+        const applyIndex = (index: number) => { const item = this.mixerTracks[index]; if (!item || item.muted === targetMuted) return; item.muted = targetMuted; const head = this.mixerTimeline?.getChildByName(`TrackHead${index}`); if (head) this.paintMixerTrackHead(head, item); };
+        const indexAt = (e: EventTouch) => { if (!this.mixerViewport) return trackIndex; const p = e.getUILocation(); const local = this.mixerViewport.getComponent(UITransform)!.convertToNodeSpaceAR(new Vec3(p.x, p.y, 0)); const height = this.mixerViewport.getComponent(UITransform)!.contentSize.height; return Math.max(0, Math.min(this.mixerTracks.length - 1, Math.floor((height / 2 - 34 + this.mixerScrollY - local.y) / this.mixerRowHeight))); };
+        node.on(Node.EventType.TOUCH_START, e => { this.stopMixerInertia(false); startY = e.getUILocation().y; lastIndex = trackIndex; sliding = false; targetMuted = !track.muted; e.propagationStopped = true; }, this);
+        node.on(Node.EventType.TOUCH_MOVE, e => { const current = indexAt(e); if (!sliding && Math.abs(e.getUILocation().y - startY) > 7) { sliding = true; applyIndex(trackIndex); } if (sliding) { const from = Math.min(lastIndex, current), to = Math.max(lastIndex, current); for (let index = from; index <= to; index++) applyIndex(index); lastIndex = current; } e.propagationStopped = true; }, this);
+        const finish = (e: EventTouch) => {
+            if (sliding) { this.saveMixerTracks(); this.refreshMixerTimelineAudio(); this.queueMixerRedraw(); }
+            else {
+                const pending = this.mixerTrackTapTimers.get(track.id);
+                if (pending) { clearTimeout(pending); this.mixerTrackTapTimers.delete(track.id); track.muted = !track.muted; track.solo = !track.solo; }
+                else { track.muted = !track.muted; const timer = setTimeout(() => { this.mixerTrackTapTimers.delete(track.id); }, 320); this.mixerTrackTapTimers.set(track.id, timer); }
+                this.saveMixerTracks(); this.refreshMixerTimelineAudio(); this.paintMixerTrackHead(node, track); this.queueMixerRedraw();
+            }
+            e.propagationStopped = true;
+        };
+        node.on(Node.EventType.TOUCH_END, finish, this); node.on(Node.EventType.TOUCH_CANCEL, finish, this);
+    }
+
+    private attachMixerBlockGesture(node: Node, block: MixerBlock, trackIndex: number) {
+        let start = new Vec3(); let dragOrigin = new Vec3(); let moved = false; let holding = false; let selectedAtStart = false; let holdTimer: ReturnType<typeof setTimeout> | null = null;
+        const isToolbarControl = (target: Node | null) => { let current = target; while (current && current !== node) { if (current.getComponent(Button) || current.getComponent(Label)?.node?.name === 'Text') return true; current = current.parent; } return false; };
+        node.on(Node.EventType.TOUCH_START, e => { if (isToolbarControl(e.target as Node)) return; this.stopMixerInertia(false); selectedAtStart = this.mixerSelectedBlockId === block.id; if (!selectedAtStart) { const previousNode = this.mixerSelectedBlockId ? this.mixerTimeline?.getChildByName(`MixerBlock${this.mixerSelectedBlockId}`) ?? null : null; previousNode?.getChildByName('BlockSelectionBorder')?.destroy(); previousNode?.getChildByName('BlockToolbar')?.destroy(); this.mixerSelectedBlockId = block.id; node.getChildByName('BlockName')?.destroy(); const clip = this.recordedClips.find(item => item.id === block.clipId); const transform = node.getComponent(UITransform); if (clip && transform) { const color = this.mixerColor(block.color); if (previousNode || this.mixerSelectionBorderTransition) this.animateMixerBlockSelectionBorder(previousNode, node, block.id, color); else this.drawMixerBlockSelectionBorder(node, transform.contentSize.width, transform.contentSize.height / 2, color); if (!node.getChildByName('BlockToolbar')) this.drawMixerBlockToolbar(node, block, clip, transform.contentSize.width, transform.contentSize.height / 2, color); } } this.mixerDraggingBlockId = block.id; const p = e.getUILocation(); start.set(p.x, p.y, 0); dragOrigin.set(node.position); moved = false; holding = false; holdTimer = setTimeout(() => { holding = true; node.active = true; node.setSiblingIndex(node.parent!.children.length - 2); tween(node).to(.18, { scale: new Vec3(1.05, 1.05, 1) }, { easing: 'quadOut' }).start(); }, 1000); e.propagationStopped = true; }, this);
+        node.on(Node.EventType.TOUCH_MOVE, e => { if (isToolbarControl(e.target as Node)) return; const p = e.getUILocation(); if (Math.abs(p.x - start.x) + Math.abs(p.y - start.y) > 10) moved = true; if (holding) node.setPosition(dragOrigin.x + p.x - start.x, dragOrigin.y + p.y - start.y, 0); e.propagationStopped = true; }, this);
+        const finish = (e: EventTouch) => { if (isToolbarControl(e.target as Node)) return; if (holdTimer) clearTimeout(holdTimer); this.mixerDraggingBlockId = ''; if (holding) { const target = this.mixerBlockLocation(node, block); if (target) this.moveMixerBlock(block.id, target.track, target.beat, node.position.clone()); else this.queueMixerRedraw(); } else if (!moved) this.handleMixerBlockTap(block, selectedAtStart); else this.queueMixerRedraw(); e.propagationStopped = true; };
+        node.on(Node.EventType.TOUCH_END, finish, this); node.on(Node.EventType.TOUCH_CANCEL, finish, this);
+    }
+
+    private mixerBlockLocation(node: Node, block: MixerBlock): { track: number; beat: number } | null {
+        if (!this.mixerViewport) return null;
+        const clip = this.recordedClips.find(item => item.id === block.clipId); if (!clip) return null;
+        const size = this.mixerViewport.getComponent(UITransform)!.contentSize;
+        const width = Math.max(18, this.clipBeats(clip, block) * this.mixerBeatWidth);
+        const leftX = node.position.x - width / 2;
+        const rawBeat = Math.max(0, (leftX + size.width / 2 - this.mixerTimelineContentInset() + this.mixerScrollX) / this.mixerBeatWidth);
+        const firstCenterY = size.height / 2 - 34 - this.mixerRowHeight / 2 + this.mixerScrollY;
+        const track = Math.max(0, Math.min(12, Math.round((firstCenterY - node.position.y) / this.mixerRowHeight)));
+        return { track, beat: this.mixerMagnet ? Math.round(rawBeat) : rawBeat };
+    }
+
+    private handleMixerBlockTap(block: MixerBlock, wasSelected = this.mixerSelectedBlockId === block.id) {
+        const now = Date.now();
+        if (this.mixerLastBlockTap.id === block.id && now - this.mixerLastBlockTap.at < 330) { this.mixerSelectedBlockId = block.id; this.previewMixerBlock(block); this.queueMixerRedraw(); this.mixerLastBlockTap = { id: '', at: 0 }; return; }
+        this.mixerLastBlockTap = { id: block.id, at: now };
+        if (!wasSelected) { this.mixerSelectedBlockId = block.id; if (!this.mixerSelectionBorderTransition) this.queueMixerRedraw(); this.scheduleOnce(() => { if (this.mixerLastBlockTap.id === block.id) this.mixerLastBlockTap = { id: '', at: 0 }; }, .3); }
+        else this.scheduleOnce(() => { if (this.mixerLastBlockTap.id === block.id) { this.mixerLastBlockTap = { id: '', at: 0 }; this.openMixerBlockEditor(block.id); } }, .3);
+    }
+
+    private deselectMixerBlockImmediately() {
+        this.mixerLastBlockTap = { id: '', at: 0 };
+        if (this.mixerSelectionBorderTransition) { Tween.stopAllByTarget(this.mixerSelectionBorderTransition); this.mixerSelectionBorderTransition.destroy(); this.mixerSelectionBorderTransition = null; }
+        if (!this.mixerSelectedBlockId) return;
+        this.mixerSelectedBlockId = ''; this.mixerColorPalette?.destroy(); this.mixerColorPalette = null;
+        this.redrawMixerTimeline();
+    }
+
+    private previewMixerBlock(block: MixerBlock) {
+        const clip = this.recordedClips.find(item => item.id === block.clipId);
+        if (!clip) return;
+        const automation = block.volumeAutomation?.length ? block.volumeAutomation : [1];
+        const average = automation.reduce((sum, value) => sum + Math.max(0, Math.min(1, value)), 0) / automation.length;
+        NativeBridge.playTimeline([{ ...clip, trimStart: block.trimStart ?? clip.trimStart, trimEnd: block.trimEnd ?? clip.trimEnd, volume: clip.volume * average, startBeat: 0, speed: Math.max(.25, Math.min(4, block.speed ?? 1)), volumeAutomation: block.volumeAutomation, pitchAutomation: block.pitchAutomation, panAutomation: block.panAutomation }], this.metronomeBpm);
+    }
+
+    private moveMixerBlock(blockId: string, requestedTrack: number, beat: number, from?: Vec3) {
+        const found = this.findMixerBlock(blockId); if (!found) return; const clip = this.recordedClips.find(item => item.id === found.block.clipId); if (!clip) return; this.pushMixerUndo(); found.track.blocks = found.track.blocks.filter(item => item.id !== blockId); found.block.startBeat = Math.max(0, this.mixerMagnet ? Math.round(beat) : beat); const trackIndex = this.findFreeMixerTrack(requestedTrack, found.block.startBeat, this.clipBeats(clip, found.block), blockId); this.ensureMixerTrack(trackIndex)?.blocks.push(found.block); if (from) this.mixerAnimateFrom.set(blockId, from); this.saveMixerTracks(); this.queueMixerRedraw();
+    }
+
+    private cloneMixerBlock(blockId: string) { const found = this.findMixerBlock(blockId); if (!found) return; const clip = this.recordedClips.find(item => item.id === found.block.clipId); if (!clip || !this.mixerViewport) return; this.pushMixerUndo(); const clone: MixerBlock = JSON.parse(JSON.stringify(found.block)); clone.id = `block_${Date.now()}`; clone.startBeat = found.block.startBeat + this.clipBeats(clip, found.block); const targetTrack = this.findFreeMixerTrack(found.trackIndex, clone.startBeat, this.clipBeats(clip, clone)); this.ensureMixerTrack(targetTrack)?.blocks.push(clone); const size = this.mixerViewport.getComponent(UITransform)!.contentSize; const originalWidth = this.clipBeats(clip, found.block) * this.mixerBeatWidth; this.mixerAnimateFrom.set(clone.id, new Vec3(-size.width / 2 + this.mixerTimelineContentInset() + found.block.startBeat * this.mixerBeatWidth - this.mixerScrollX + originalWidth / 2, size.height / 2 - 34 - found.trackIndex * this.mixerRowHeight - this.mixerRowHeight / 2 + this.mixerScrollY, 0)); this.mixerSelectedBlockId = clone.id; this.saveMixerTracks(); this.queueMixerRedraw(); }
+    private alignMixerBlockLeft(blockId: string) { const found = this.findMixerBlock(blockId); if (!found) return; const from = this.mixerTimeline?.getChildByName(`MixerBlock${blockId}`)?.position.clone(); let best = 0; for (const track of this.mixerTracks) for (const other of track.blocks) { if (other.id === blockId) continue; const clip = this.recordedClips.find(item => item.id === other.clipId); if (!clip) continue; const end = other.startBeat + this.clipBeats(clip, other); if (end < found.block.startBeat && end > best) best = end; } this.moveMixerBlock(blockId, found.trackIndex, best, from); }
+    private deleteMixerBlock(blockId: string) { const found = this.findMixerBlock(blockId); if (!found) return; this.pushMixerUndo(); found.track.blocks = found.track.blocks.filter(item => item.id !== blockId); this.mixerSelectedBlockId = ''; this.saveMixerTracks(); this.redrawMixerTimeline(); }
+    private openMixerSourceColorPalette(clip: AudioClipMeta) {
+        if (!this.audioPanel) return;
+        this.mixerColorPalette?.destroy();
+        const names = ['黑', '白', '红', '橙', '粉', '黄', '蓝', '绿', '青', '棕'];
+        const colors = ['black', 'white', 'red', 'orange', 'pink', 'yellow', 'blue', 'green', 'cyan', 'brown'];
+        const palette = new Node('MixerSourceColorPalette'); palette.layer = Layers.Enum.UI_2D; const width = 500, height = 92;
+        palette.addComponent(UITransform).setContentSize(width, height); const bg = palette.addComponent(Graphics); bg.roundRect(-width / 2, -height / 2, width, height, 8); bg.fillColor = new Color(7, 10, 17, 248); bg.fill(); bg.lineWidth = 1.5; bg.strokeColor = new Color(150, 165, 190, 240); bg.stroke();
+        colors.forEach((name, index) => {
+            const button = new Node(`SourceColor-${name}`); button.layer = Layers.Enum.UI_2D; button.addComponent(UITransform).setContentSize(34, 34); button.setPosition(-width / 2 + 34 + index * 40, 6);
+            const buttonG = button.addComponent(Graphics); buttonG.circle(0, 0, 15); buttonG.fillColor = this.mixerColor(name); buttonG.fill(); buttonG.lineWidth = 2; buttonG.strokeColor = name === (clip.color ?? 'white') ? new Color(255, 255, 255, 255) : new Color(110, 125, 150, 255); buttonG.stroke();
+            const buttonLabel = this.makeLabel('ColorName', names[index], 13, 18, name === 'black' ? new Color(235, 240, 248, 255) : new Color(18, 22, 30, 255), 34, 18); buttonLabel.setPosition(0, -28); button.addChild(buttonLabel);
+            button.addComponent(Button).transition = Button.Transition.SCALE; button.on(Button.EventType.CLICK, () => { clip.color = name; for (const track of this.mixerTracks) for (const block of track.blocks) if (block.clipId === clip.id) block.color = name; this.saveAudioClips(); this.saveMixerTracks(); palette.destroy(); this.mixerColorPalette = null; this.rebuildAudioRows(); this.redrawMixerTimeline(); }, this); palette.addChild(button);
+        });
+        const close = this.makePanelButton(palette, '×', width / 2 - 24, height / 2 - 22, 34, 30, () => { palette.destroy(); this.mixerColorPalette = null; }, new Color(80, 38, 48, 255)); close.name = 'PaletteClose';
+        this.audioPanel.addChild(palette); this.mixerColorPalette = palette;
+    }
+
+    private openMixerColorPalette(blockId: string) {
+        const found = this.findMixerBlock(blockId);
+        if (!found || !this.audioPanel) return;
+        this.mixerColorPalette?.destroy();
+        const names = ['黑', '白', '红', '橙', '粉', '黄', '蓝', '绿', '青', '棕'];
+        const colors = ['black', 'white', 'red', 'orange', 'pink', 'yellow', 'blue', 'green', 'cyan', 'brown'];
+        const palette = new Node('MixerColorPalette'); palette.layer = Layers.Enum.UI_2D;
+        const width = 500, height = 92;
+        palette.addComponent(UITransform).setContentSize(width, height);
+        const bg = palette.addComponent(Graphics); bg.roundRect(-width / 2, -height / 2, width, height, 8); bg.fillColor = new Color(7, 10, 17, 248); bg.fill(); bg.lineWidth = 1.5; bg.strokeColor = new Color(150, 165, 190, 240); bg.stroke();
+        palette.setPosition(0, 0);
+        colors.forEach((name, index) => {
+            const button = new Node(`Color-${name}`); button.layer = Layers.Enum.UI_2D; button.addComponent(UITransform).setContentSize(34, 34); button.setPosition(-width / 2 + 34 + index * 40, 6);
+            const buttonG = button.addComponent(Graphics); buttonG.circle(0, 0, 15); buttonG.fillColor = this.mixerColor(name); buttonG.fill(); buttonG.lineWidth = 2; buttonG.strokeColor = name === found.block.color ? new Color(255, 255, 255, 255) : new Color(110, 125, 150, 255); buttonG.stroke();
+            const buttonLabel = this.makeLabel('ColorName', names[index], 13, 18, name === 'black' ? new Color(235, 240, 248, 255) : new Color(18, 22, 30, 255), 34, 18); buttonLabel.setPosition(0, -28); button.addChild(buttonLabel);
+            const click = button.addComponent(Button); click.transition = Button.Transition.SCALE; button.on(Button.EventType.CLICK, () => { found.block.color = name; this.saveMixerTracks(); this.mixerColorPalette?.destroy(); this.mixerColorPalette = null; this.redrawMixerTimeline(); }, this); palette.addChild(button);
+        });
+        const close = this.makePanelButton(palette, '×', width / 2 - 24, height / 2 - 22, 34, 30, () => { palette.destroy(); this.mixerColorPalette = null; }, new Color(80, 38, 48, 255)); close.name = 'PaletteClose';
+        this.audioPanel.addChild(palette); this.mixerColorPalette = palette;
+    }
+
+    private createMixerPlayhead(parent: Node, width: number, height: number, ruler: Node) {
+        const node = new Node('MixerPlayhead'); node.layer = Layers.Enum.UI_2D;
+        node.addComponent(UITransform).setContentSize(30, height); const g = node.addComponent(Graphics);
+        g.lineWidth = 2; g.strokeColor = new Color(255, 255, 255, 255); g.moveTo(0, -height / 2); g.lineTo(0, height / 2); g.stroke();
+        const setFromTouch = (event: EventTouch) => { const p = event.getUILocation(); const local = this.mixerViewport?.getComponent(UITransform)?.convertToNodeSpaceAR(new Vec3(p.x, p.y, 0)); if (local) this.setMixerPlayheadFromLocalX(local.x, width); event.propagationStopped = true; };
+        node.on(Node.EventType.TOUCH_START, (event: EventTouch) => { if (this.mixerPlaying) this.stopMixerTimelinePlayback(true); this.mixerDraggingPlayhead = true; setFromTouch(event); }, this);
+        node.on(Node.EventType.TOUCH_MOVE, setFromTouch, this);
+        const finish = (event: EventTouch) => { setFromTouch(event); this.mixerDraggingPlayhead = false; };
+        node.on(Node.EventType.TOUCH_END, finish, this); node.on(Node.EventType.TOUCH_CANCEL, finish, this);
+        parent.addChild(node);
+        const stamp = new Node('MixerPlayheadStamp'); stamp.layer = Layers.Enum.UI_2D; stamp.addComponent(UITransform).setContentSize(30, 34); const stampG = stamp.addComponent(Graphics);
+        stampG.fillColor = new Color(255, 255, 255, 255); stampG.moveTo(-7, 17); stampG.lineTo(7, 17); stampG.lineTo(0, 6); stampG.close(); stampG.fill(); ruler.addChild(stamp);
+    }
+
+    private setMixerPlayheadFromLocalX(localX: number, width: number, animate = false) {
+        const playhead = this.mixerTimeline?.getChildByName('MixerPlayhead'), stamp = this.mixerTimeline?.getChildByName('TimelineRuler')?.getChildByName('MixerPlayheadStamp'); const from = playhead?.position.clone();
+        const contentInset = this.mixerTimelineContentInset();
+        this.mixerPlayheadBeat = Math.max(0, (localX + width / 2 - contentInset + this.mixerScrollX) / this.mixerBeatWidth);
+        if (this.mixerFollowPlayhead) this.mixerFollowPlayheadX = localX;
+        const targetX = this.mixerPlayheadTimelineX(width);
+        if (playhead && animate && from) { Tween.stopAllByTarget(playhead); playhead.setPosition(from); tween(playhead).to(.3, { position: new Vec3(targetX, 0, 0) }, { easing: 'quadOut' }).start(); if (stamp) { Tween.stopAllByTarget(stamp); tween(stamp).to(.3, { position: new Vec3(targetX, 0, 0) }, { easing: 'quadOut' }).start(); } }
+        else this.updateMixerPlayheadVisual();
+    }
+
+    private mixerPlayheadViewportX(width: number) {
+        return -width / 2 + this.mixerTimelineContentInset() + this.mixerPlayheadBeat * this.mixerBeatWidth - this.mixerScrollX;
+    }
+
+    private mixerPlayheadTimelineX(width: number) {
+        const timeline = this.mixerTimeline, viewportX = this.mixerPlayheadViewportX(width);
+        if (!timeline) return viewportX;
+        return (viewportX - timeline.position.x) / Math.max(.001, timeline.scale.x);
+    }
+
+    private updateMixerPlayheadVisual() {
+        const viewport = this.mixerViewport, playhead = this.mixerTimeline?.getChildByName('MixerPlayhead'), stamp = this.mixerTimeline?.getChildByName('TimelineRuler')?.getChildByName('MixerPlayheadStamp');
+        if (!viewport || !playhead) return;
+        Tween.stopAllByTarget(playhead); if (stamp) Tween.stopAllByTarget(stamp);
+        const width = viewport.getComponent(UITransform)!.contentSize.width;
+        const x = this.mixerPlayheadTimelineX(width), inverseScale = 1 / Math.max(.001, this.mixerTimeline?.scale.x ?? 1);
+        playhead.setPosition(x, 0, 0); playhead.setScale(inverseScale, 1, 1); if (stamp) { stamp.setPosition(x, 0, 0); stamp.setScale(inverseScale, 1, 1); }
+    }
+
+    private previewMixerGestureTransform(viewportWidth: number) {
+        if (!this.mixerTimeline) return;
+        const scaleX = this.mixerBeatWidth / Math.max(1, this.mixerRenderedBeatWidth);
+        const contentInset = this.mixerTimelineContentInset();
+        const oldOrigin = -viewportWidth / 2 + contentInset - this.mixerRenderedScrollX;
+        const newOrigin = -viewportWidth / 2 + contentInset - this.mixerScrollX;
+        const offsetX = newOrigin - oldOrigin * scaleX;
+        const offsetY = this.mixerScrollY - this.mixerRenderedScrollY;
+        this.mixerTimeline.setScale(scaleX, 1, 1);
+        this.mixerTimeline.setPosition(offsetX, offsetY, 0);
+        for (const child of this.mixerTimeline.children) {
+            if (child.name.startsWith('TrackHead')) { child.setScale(1 / scaleX, 1, 1); child.setPosition((-viewportWidth / 2 + MIXER_TRACK_HEAD_WIDTH / 2 + 2 - offsetX) / scaleX, child.position.y, 0); }
+        }
+        const ruler = this.mixerTimeline.getChildByName('TimelineRuler');
+        const viewportHeight = this.mixerViewport?.getComponent(UITransform)?.contentSize.height ?? 0;
+        if (ruler) ruler.setPosition(0, viewportHeight / 2 - 17 - offsetY, 0);
+        if (this.mixerPlaying && this.mixerFollowPlayhead && this.mixerViewportInteractionActive()) this.captureMixerFollowPlayheadPosition();
+        this.updateMixerPlayheadVisual();
+    }
+
+    private mixerViewportInteractionActive() {
+        return this.mixerGestureTouches.size > 0 || this.mixerInertiaFrame !== null;
+    }
+
+    private stopMixerInertia(redraw = false, deferRedraw = false) {
+        const needsRedraw = this.mixerInertiaFrame !== null || !!this.mixerTimeline && (Math.abs(this.mixerTimeline.position.x) > .01 || Math.abs(this.mixerTimeline.position.y) > .01 || Math.abs(this.mixerTimeline.scale.x - 1) > .001);
+        const generation = ++this.mixerInertiaGeneration;
+        if (this.mixerInertiaFrame !== null) cancelAnimationFrame(this.mixerInertiaFrame);
+        this.mixerInertiaFrame = null; this.mixerPanVelocity.set(0, 0, 0);
+        if (redraw && needsRedraw && this.mixerTimeline) {
+            if (deferRedraw) this.deferMixerGestureRedraw(generation);
+            else this.redrawMixerTimeline();
+        }
+    }
+
+    private stopMixerTimelineReturnAnimation() {
+        this.mixerReturnGeneration++;
+        if (this.mixerReturnFrame !== null) cancelAnimationFrame(this.mixerReturnFrame);
+        this.mixerReturnFrame = null;
+    }
+
+    private returnMixerTimelineToStart() {
+        const viewport = this.mixerViewport;
+        if (!viewport || !this.mixerTimeline || !this.audioPanelOpen) return;
+        this.stopMixerInertia(false);
+        this.stopMixerTimelineReturnAnimation();
+        const from = this.mixerScrollX;
+        const width = viewport.getComponent(UITransform)!.contentSize.width;
+        if (from <= .01) { this.mixerScrollX = 0; this.previewMixerGestureTransform(width); return; }
+        if (this.mixerFollowPlayhead) { this.mixerFollowPlayhead = false; this.redrawMixerTransportButtons(); }
+        const generation = ++this.mixerReturnGeneration;
+        const started = performance.now();
+        const durationMs = Math.min(900, 380 + from / Math.max(1, width) * 90);
+        const advance = (now: number) => {
+            if (generation !== this.mixerReturnGeneration || !this.audioPanelOpen) return;
+            const progress = Math.max(0, Math.min(1, (now - started) / durationMs));
+            const eased = 1 - Math.pow(1 - progress, 3);
+            this.mixerScrollX = progress >= 1 ? 0 : from * (1 - eased);
+            this.previewMixerGestureTransform(width);
+            if (Math.abs(this.mixerScrollX - this.mixerRenderedScrollX) > width * .4) this.redrawMixerTimeline();
+            if (progress < 1) this.mixerReturnFrame = requestAnimationFrame(advance);
+            else this.mixerReturnFrame = null;
+        };
+        this.mixerReturnFrame = requestAnimationFrame(advance);
+    }
+
+    private startMixerInertia(viewport: Node) {
+        const releaseDelay = Math.max(0, Date.now() - this.mixerGestureLastAt);
+        const releaseDecay = Math.pow(.8, releaseDelay / 16);
+        this.mixerPanVelocity.x = Math.max(-1.3, Math.min(1.3, this.mixerPanVelocity.x * releaseDecay));
+        this.mixerPanVelocity.y = Math.max(-1.1, Math.min(1.1, this.mixerPanVelocity.y * releaseDecay));
+        const size = viewport.getComponent(UITransform)!.contentSize;
+        const outsidePreloadWindow = () => Math.abs(this.mixerScrollX - this.mixerRenderedScrollX) > size.width * .4
+            || Math.abs(this.mixerScrollY - this.mixerRenderedScrollY) > this.mixerRowHeight * 1.5;
+        const speed = Math.abs(this.mixerPanVelocity.x) + Math.abs(this.mixerPanVelocity.y);
+        if (speed < .08) { this.stopMixerInertia(outsidePreloadWindow(), true); return; }
+        const generation = ++this.mixerInertiaGeneration;
+        let lastAt = 0;
+        const tick = (now: number) => {
+            if (this.mixerInertiaFrame === null || generation !== this.mixerInertiaGeneration) return;
+            this.mixerInertiaFrame = null;
+            const dt = lastAt > 0 ? Math.max(1, Math.min(34, now - lastAt)) : 16; lastAt = now;
+            const maxY = Math.max(0, this.mixerTracks.length * this.mixerRowHeight - size.height + 38);
+            const nextX = Math.max(0, this.mixerScrollX + this.mixerPanVelocity.x * dt), nextY = Math.max(0, Math.min(maxY, this.mixerScrollY + this.mixerPanVelocity.y * dt));
+            if (nextX === 0 && this.mixerPanVelocity.x < 0) this.mixerPanVelocity.x = 0;
+            if ((nextY === 0 && this.mixerPanVelocity.y < 0) || (nextY === maxY && this.mixerPanVelocity.y > 0)) this.mixerPanVelocity.y = 0;
+            this.mixerScrollX = nextX; this.mixerScrollY = nextY; this.previewMixerGestureTransform(size.width);
+            if (outsidePreloadWindow()) {
+                this.mixerTimeline?.setPosition(0, 0, 0); this.mixerTimeline?.setScale(Vec3.ONE); this.redrawMixerTimeline(); this.mixerGestureStartScrollX = this.mixerScrollX; this.mixerGestureStartScrollY = this.mixerScrollY; this.mixerGestureVisualBasePosition.set(0, 0, 0); this.mixerGestureVisualBaseScaleX = 1;
+            }
+            const friction = Math.pow(.8, dt / 16); this.mixerPanVelocity.x *= friction; this.mixerPanVelocity.y *= friction;
+            if (Math.abs(this.mixerPanVelocity.x) + Math.abs(this.mixerPanVelocity.y) < .025) { this.stopMixerInertia(false); return; }
+            this.mixerInertiaFrame = requestAnimationFrame(tick);
+        };
+        this.mixerInertiaFrame = requestAnimationFrame(tick);
+    }
+
+    private attachMixerViewportGestures(viewport: Node) {
+        viewport.on(Node.EventType.TOUCH_START, e => {
+            this.stopMixerTimelineReturnAnimation();
+            this.stopMixerInertia(false);
+            let target = e.target as Node | null;
+            while (target && target !== viewport) {
+                if (target.name.startsWith('MixerBlock') || target.name.startsWith('TrackHead')) return;
+                target = target.parent;
+            }
+            const activeTouches = (e as any).getAllTouches?.() as any[] | undefined; if (!activeTouches || activeTouches.length <= 1) this.mixerGestureTouches.clear();
+            const p = e.getUILocation(); this.mixerGestureTouches.set(e.getID(), new Vec3(p.x, p.y, 0));
+            if (this.mixerGestureTouches.size === 1) {
+                this.mixerGestureVisualBasePosition.set(this.mixerTimeline?.position ?? Vec3.ZERO); this.mixerGestureVisualBaseScaleX = this.mixerTimeline?.scale.x ?? 1;
+                this.mixerGestureStartPoint.set(p.x, p.y, 0); this.mixerGestureLastPoint.set(p.x, p.y, 0); this.mixerGestureLastAt = Date.now(); this.mixerPanVelocity.set(0, 0, 0); this.mixerGestureStartScrollX = this.mixerScrollX; this.mixerGestureStartScrollY = this.mixerScrollY; this.mixerGestureStartBeatWidth = this.mixerBeatWidth; this.mixerGestureMoved = false;
+            } else if (this.mixerGestureTouches.size === 2) {
+                const points = Array.from(this.mixerGestureTouches.values()); const midpoint = new Vec3((points[0].x + points[1].x) / 2, (points[0].y + points[1].y) / 2, 0); const local = viewport.getComponent(UITransform)!.convertToNodeSpaceAR(midpoint); const width = viewport.getComponent(UITransform)!.contentSize.width;
+                this.mixerGestureVisualBasePosition.set(this.mixerTimeline?.position ?? Vec3.ZERO); this.mixerGestureVisualBaseScaleX = this.mixerTimeline?.scale.x ?? 1; this.mixerPanVelocity.set(0, 0, 0); this.mixerGestureStartScrollX = this.mixerScrollX; this.mixerGestureStartScrollY = this.mixerScrollY; this.mixerGestureStartBeatWidth = this.mixerBeatWidth; this.mixerLastPinchDistance = Math.max(8, Math.abs(points[1].x - points[0].x)); this.mixerPinchAnchorBeat = Math.max(0, (local.x + width / 2 - this.mixerTimelineContentInset() + this.mixerScrollX) / this.mixerBeatWidth); this.mixerGestureMoved = true;
+            }
+            e.propagationStopped = true;
+        }, this);
+        viewport.on(Node.EventType.TOUCH_MOVE, e => {
+            if (!this.mixerGestureTouches.has(e.getID())) return;
+            const p = e.getUILocation(); this.mixerGestureTouches.set(e.getID(), new Vec3(p.x, p.y, 0)); const points = Array.from(this.mixerGestureTouches.values());
+            if (points.length >= 2) {
+                const distance = Math.max(8, Math.abs(points[1].x - points[0].x)); const midpoint = new Vec3((points[0].x + points[1].x) / 2, (points[0].y + points[1].y) / 2, 0); const local = viewport.getComponent(UITransform)!.convertToNodeSpaceAR(midpoint); const width = viewport.getComponent(UITransform)!.contentSize.width;
+                this.mixerBeatWidth = Math.max(20, Math.min(260, this.mixerGestureStartBeatWidth * distance / Math.max(8, this.mixerLastPinchDistance)));
+                this.mixerScrollX = Math.max(0, this.mixerPinchAnchorBeat * this.mixerBeatWidth - (local.x + width / 2 - this.mixerTimelineContentInset())); this.mixerPanVelocity.set(0, 0, 0);
+            } else {
+                const dx = p.x - this.mixerGestureStartPoint.x, dy = p.y - this.mixerGestureStartPoint.y;
+                if (this.mixerPlaying && this.mixerFollowPlayhead && Math.abs(dx) > 3) {
+                    this.mixerFollowPlayhead = false;
+                    this.redrawMixerTransportButtons();
+                }
+                if (!this.mixerPlaying || !this.mixerFollowPlayhead) this.mixerScrollX = Math.max(0, this.mixerGestureStartScrollX - dx);
+                const maxY = Math.max(0, this.mixerTracks.length * this.mixerRowHeight - viewport.getComponent(UITransform)!.contentSize.height + 38); this.mixerScrollY = Math.max(0, Math.min(maxY, this.mixerGestureStartScrollY + dy));
+                if (Math.abs(dx) + Math.abs(dy) > 3) this.mixerGestureMoved = true;
+                const now = Date.now(), dt = Math.max(1, now - this.mixerGestureLastAt), vx = this.mixerPlaying && this.mixerFollowPlayhead ? 0 : -(p.x - this.mixerGestureLastPoint.x) / dt, vy = (p.y - this.mixerGestureLastPoint.y) / dt; this.mixerPanVelocity.x = this.mixerPanVelocity.x * .55 + vx * .45; this.mixerPanVelocity.y = this.mixerPanVelocity.y * .55 + vy * .45; this.mixerGestureLastPoint.set(p.x, p.y, 0); this.mixerGestureLastAt = now;
+            }
+            this.previewMixerGestureTransform(viewport.getComponent(UITransform)!.contentSize.width); e.propagationStopped = true;
+        }, this);
+        const end = (e: EventTouch) => {
+            if (!this.mixerGestureTouches.has(e.getID())) return;
+            const gestureChanged = this.mixerGestureMoved, wasPinch = this.mixerGestureTouches.size > 1 || this.mixerLastPinchDistance > 0;
+            const wasTap = !gestureChanged && this.mixerGestureTouches.size === 1; this.mixerGestureTouches.delete(e.getID());
+            if (this.mixerGestureTouches.size === 0) { if (gestureChanged && !wasPinch) this.startMixerInertia(viewport); else if (gestureChanged) this.stopMixerInertia(true, true); }
+            else if (this.mixerGestureTouches.size === 1) { this.mixerGestureVisualBasePosition.set(this.mixerTimeline?.position ?? Vec3.ZERO); this.mixerGestureVisualBaseScaleX = this.mixerTimeline?.scale.x ?? 1; const remaining = Array.from(this.mixerGestureTouches.values())[0]; this.mixerGestureStartPoint.set(remaining); this.mixerGestureLastPoint.set(remaining); this.mixerGestureLastAt = Date.now(); this.mixerPanVelocity.set(0, 0, 0); this.mixerGestureStartScrollX = this.mixerScrollX; this.mixerGestureStartScrollY = this.mixerScrollY; this.mixerGestureStartBeatWidth = this.mixerBeatWidth; }
+            this.mixerLastPinchDistance = 0; if (wasTap && e.target === viewport) this.deselectMixerBlockImmediately(); e.propagationStopped = true;
+        };
+        viewport.on(Node.EventType.TOUCH_END, end, this); viewport.on(Node.EventType.TOUCH_CANCEL, end, this);
+    }
+
+    private redrawMixerTransportButton(name: string, active: boolean) {
+        const button = this.audioPanel?.getChildByName(name); if (!button) return;
+        const style = (button as any).__panelButtonStyle as { fillColor?: Color } | undefined;
+        if (style) style.fillColor = active ? new Color(245, 248, 255, 255) : new Color(8, 10, 15, 255);
+        const label = button.getChildByName('Text')?.getComponent(Label); if (label) label.color = active ? new Color(0, 0, 0, 255) : new Color(245, 248, 255, 255);
+        this.redrawPanelButton(button);
+    }
+
+    private redrawMixerTransportButtons() {
+        this.redrawMixerTransportButton('AudioTimelineFollow', this.mixerFollowPlayhead);
+        this.redrawMixerTransportButton('AudioTimelinePlay', this.mixerPlaying);
+    }
+
+    private captureMixerFollowPlayheadPosition() {
+        const viewport = this.mixerViewport; if (!viewport) return;
+        const width = viewport.getComponent(UITransform)!.contentSize.width, current = this.mixerPlayheadViewportX(width);
+        const minX = -width / 2 + this.mixerTimelineContentInset(), maxX = width / 2 - 24;
+        this.mixerFollowPlayheadX = current < -width / 2 || current > width / 2 ? 0 : Math.max(minX, Math.min(maxX, current));
+    }
+
+    private updateMixerFollowPosition() {
+        if (!this.mixerFollowPlayhead || !this.mixerViewport) { this.updateMixerPlayheadVisual(); return; }
+        const width = this.mixerViewport.getComponent(UITransform)!.contentSize.width;
+        if (this.mixerViewportInteractionActive()) {
+            this.captureMixerFollowPlayheadPosition();
+            this.updateMixerPlayheadVisual();
+            return;
+        }
+        this.mixerScrollX = Math.max(0, -width / 2 + this.mixerTimelineContentInset() + this.mixerPlayheadBeat * this.mixerBeatWidth - this.mixerFollowPlayheadX);
+        this.previewMixerGestureTransform(width);
+        if (Math.abs(this.mixerScrollX - this.mixerRenderedScrollX) > width * .42) this.queueMixerRedraw();
+    }
+
+    private toggleMixerPlayheadFollow() {
+        this.mixerFollowPlayhead = !this.mixerFollowPlayhead;
+        if (this.mixerFollowPlayhead) { this.captureMixerFollowPlayheadPosition(); this.updateMixerFollowPosition(); }
+        this.redrawMixerTransportButtons();
+    }
+
+    private toggleMixerTimelinePlayback() {
+        if (this.mixerPlaying) { NativeBridge.stopAudioFiles(); this.mixerPlaying = false; if (this.mixerPlayTimer !== null) cancelAnimationFrame(this.mixerPlayTimer); this.mixerPlayTimer = null; this.mixerPlayheadBeat = this.mixerPlaybackAnchorBeat; this.updateMixerFollowPosition(); this.redrawMixerTransportButtons(); return; }
+        const allBlocks = this.timelineBlocks(true); if (!allBlocks.length) return;
+        this.mixerPlaybackAnchorBeat = this.mixerPlayheadBeat;
+        if (this.mixerFollowPlayhead) this.captureMixerFollowPlayheadPosition();
+        const blocks = this.mixerTimelineBlocksFrom(this.mixerPlaybackAnchorBeat, allBlocks);
+        if (!blocks.length) return;
+        this.mixerPlaybackEndBeat = this.mixerTimelineEndBeat(allBlocks);
+        NativeBridge.playTimeline(blocks, this.metronomeBpm); this.mixerPlaying = true; this.redrawMixerTransportButtons(); const started = performance.now();
+        const advance = (now: number) => {
+            if (!this.mixerPlaying) return;
+            this.mixerPlayheadBeat = this.mixerPlaybackAnchorBeat + (now - started) / 60000 * this.metronomeBpm;
+            if (this.mixerPlayheadBeat >= this.mixerPlaybackEndBeat) { this.mixerPlayheadBeat = this.mixerPlaybackEndBeat; this.stopMixerTimelinePlayback(true); return; }
+            this.updateMixerFollowPosition();
+            this.mixerPlayTimer = requestAnimationFrame(advance);
+        };
+        this.mixerPlayTimer = requestAnimationFrame(advance);
+    }
+
+    private mixerTimelineBlocksFrom(anchorBeat: number, allBlocks = this.timelineBlocks(true)) {
+        const blocks: typeof allBlocks = [];
+        for (const block of allBlocks) {
+            const seconds = Math.max(.05, (block.trimEnd > block.trimStart ? block.trimEnd : block.duration) - block.trimStart);
+            const endBeat = block.startBeat + seconds * this.metronomeBpm / 60 / block.speed;
+            if (endBeat <= anchorBeat) continue;
+            if (block.startBeat >= anchorBeat) { blocks.push({ ...block, startBeat: block.startBeat - anchorBeat }); continue; }
+            const elapsedSourceSeconds = (anchorBeat - block.startBeat) * 60 / this.metronomeBpm * block.speed;
+            blocks.push({ ...block, startBeat: 0, trimStart: Math.min(block.trimEnd || block.duration, block.trimStart + elapsedSourceSeconds) });
+        }
+        return blocks;
+    }
+
+    private mixerTimelineEndBeat(blocks = this.timelineBlocks(true)) {
+        return blocks.reduce((end, block) => {
+            const seconds = Math.max(.05, (block.trimEnd > block.trimStart ? block.trimEnd : block.duration) - block.trimStart);
+            return Math.max(end, block.startBeat + seconds * this.metronomeBpm / 60 / block.speed);
+        }, 0);
+    }
+
+    private refreshMixerTimelineAudio() {
+        if (!this.mixerPlaying) return;
+        const solo = this.mixerTracks.some(track => track.solo);
+        const audibility: Record<string, boolean> = {};
+        for (const track of this.mixerTracks) audibility[track.id] = !track.muted && (!solo || track.solo);
+        NativeBridge.setTimelineTrackAudibility(audibility);
+    }
+
+    private stopMixerTimelinePlayback(keepPosition = true) { NativeBridge.stopAudioFiles(); this.mixerPlaying = false; if (this.mixerPlayTimer !== null) cancelAnimationFrame(this.mixerPlayTimer); this.mixerPlayTimer = null; if (!keepPosition) this.mixerPlayheadBeat = 0; this.updateMixerFollowPosition(); this.redrawMixerTransportButtons(); }
+
+    private openMixerBlockEditor(blockId: string) {
+        const initialFound = this.findMixerBlock(blockId); if (!initialFound || !this.audioPanel) return; const initialClip = this.recordedClips.find(item => item.id === initialFound.block.clipId); if (!initialClip) return;
+        this.mixerEditor?.destroy(); this.mixerEditorUndo = []; this.mixerEditorCropping = false; this.mixerEditorCropStart = -1; this.mixerEditorCropEnd = -1; this.mixerEditorInitial = this.captureMixerEditorSnapshot();
+        const currentBlock = () => this.findMixerBlock(blockId)?.block ?? null;
+        const currentClip = () => { const block = currentBlock(); return block ? this.recordedClips.find(item => item.id === block.clipId) ?? null : null; };
+        const panel = new Node('MixerBlockEditor'); panel.layer = Layers.Enum.UI_2D; const view = this.userViewport(false); panel.addComponent(UITransform).setContentSize(view.w * .78, view.h * .82); panel.setPosition(view.w * .03, 0); const pg = panel.addComponent(Graphics); const pw = view.w * .78, ph = view.h * .82; pg.rect(-pw / 2, -ph / 2, pw, ph); pg.fillColor = new Color(5, 7, 12, 252); pg.fill(); pg.lineWidth = 2; pg.strokeColor = this.mixerColor(initialFound.block.color); pg.stroke(); this.audioPanel.addChild(panel); this.mixerEditor = panel;
+        const title = this.makeLabel('EditorTitle', initialClip.name, 20, 30, new Color(245, 245, 248, 255), pw * .5, 34); title.setPosition(0, ph / 2 - 28); panel.addChild(title);
+        let redraw = () => { /* assigned after graph creation */ };
+        let updateSpeedLabel = () => { /* assigned after button creation */ };
+        const speed = this.makePanelButton(panel, `${(initialFound.block.speed ?? 1).toFixed(2)}×`, -pw / 2 + 70, ph / 2 - 28, 90, 34, () => { const block = currentBlock(); if (!block) return; NativeBridge.promptText(t('音频块速度', 'Block speed'), String(block.speed ?? 1), value => { const n = Number(value); const live = currentBlock(); if (!live || !Number.isFinite(n)) return; this.pushMixerEditorUndo(); live.speed = Math.max(.25, Math.min(4, n)); this.resolveMixerBlockOverlap(blockId); this.saveMixerTracks(); updateSpeedLabel(); redraw(); }); }, new Color(28, 34, 48, 255));
+        updateSpeedLabel = () => { const label = speed.getChildByName('Text')?.getComponent(Label); const block = currentBlock(); if (label && block) label.string = `${(block.speed ?? 1).toFixed(2)}×`; };
+        this.makePanelButton(panel, '×', pw / 2 - 28, ph / 2 - 28, 38, 34, () => { if (this.mixerEditorInitial) this.restoreMixerEditorSnapshot(this.mixerEditorInitial); this.mixerEditor?.destroy(); this.mixerEditor = null; this.queueMixerRedraw(); }, new Color(90, 38, 45, 255));
+        const graph = new Node('AutomationGraph'); graph.layer = Layers.Enum.UI_2D; const graphW = pw - 60, graphH = ph - 150; const transform = graph.addComponent(UITransform); transform.setContentSize(graphW, graphH); graph.setPosition(0, 8); const gfx = graph.addComponent(Graphics); panel.addChild(graph);
+        redraw = () => { const block = currentBlock(), clip = currentClip(); if (block && clip) this.drawAutomationGraph(gfx, graphW, graphH, block, clip, this.mixerEditorCropStart, this.mixerEditorCropEnd); };
+        const touches = new Map<number, Vec3>(); let drawing = false; let pinchDistance = 0; let pinchSpeed = 1;
+        const graphPoint = (event: EventTouch) => { const p = event.getUILocation(); const local = transform.convertToNodeSpaceAR(new Vec3(p.x, p.y, 0)); return { x: Math.max(0, Math.min(1, (local.x + graphW / 2) / graphW)), y: Math.max(0, Math.min(1, (local.y + graphH / 2) / graphH)) }; };
+        graph.on(Node.EventType.TOUCH_START, (event: EventTouch) => {
+            const p = event.getUILocation(); touches.set(event.getID(), new Vec3(p.x, p.y, 0)); const block = currentBlock(); if (!block) return;
+            if (touches.size === 1) { this.pushMixerEditorUndo(); drawing = true; const point = graphPoint(event); if (this.mixerEditorCropping) this.mixerEditorCropStart = this.mixerEditorCropEnd = point.x; else { this.upsertAutomationPoint(block, point.x, this.mixerEditorMode === 'pan' ? point.y * 2 - 1 : point.y); this.syncAutomationSamples(block); } }
+            else if (touches.size === 2 && !this.mixerEditorCropping) { const beforeDraw = this.mixerEditorUndo.pop(); if (beforeDraw) this.restoreMixerEditorSnapshot(beforeDraw); this.pushMixerEditorUndo(); const points = Array.from(touches.values()); pinchDistance = Math.max(8, Math.abs(points[1].x - points[0].x)); pinchSpeed = currentBlock()?.speed ?? 1; drawing = false; }
+            redraw(); event.propagationStopped = true;
+        }, this);
+        graph.on(Node.EventType.TOUCH_MOVE, (event: EventTouch) => {
+            const p = event.getUILocation(); touches.set(event.getID(), new Vec3(p.x, p.y, 0)); const block = currentBlock(); if (!block) return;
+            if (touches.size >= 2 && !this.mixerEditorCropping) { const points = Array.from(touches.values()); const distance = Math.max(8, Math.abs(points[1].x - points[0].x)); block.speed = Math.max(.25, Math.min(4, pinchSpeed * pinchDistance / distance)); updateSpeedLabel(); }
+            else if (drawing) { const point = graphPoint(event); if (this.mixerEditorCropping) this.mixerEditorCropEnd = point.x; else { this.upsertAutomationPoint(block, point.x, this.mixerEditorMode === 'pan' ? point.y * 2 - 1 : point.y); this.syncAutomationSamples(block); } }
+            redraw(); event.propagationStopped = true;
+        }, this);
+        const finishGraphTouch = (event: EventTouch) => {
+            const hadMultiple = touches.size >= 2; touches.delete(event.getID());
+            if (hadMultiple) { this.resolveMixerBlockOverlap(blockId); updateSpeedLabel(); }
+            else if (drawing && this.mixerEditorCropping) { const point = graphPoint(event); this.mixerEditorCropEnd = point.x; const a = Math.min(this.mixerEditorCropStart, this.mixerEditorCropEnd), b = Math.max(this.mixerEditorCropStart, this.mixerEditorCropEnd); if (b - a > .004) this.applyMixerCrop(blockId, a, b); this.mixerEditorCropping = false; this.mixerEditorCropStart = -1; this.mixerEditorCropEnd = -1; }
+            drawing = false; this.saveAudioClips(); this.saveMixerTracks(); redraw(); event.propagationStopped = true;
+        };
+        graph.on(Node.EventType.TOUCH_END, finishGraphTouch, this); graph.on(Node.EventType.TOUCH_CANCEL, finishGraphTouch, this);
+        const modeY = -ph / 2 + 32; [['音量', 'volume'], ['音高', 'pitch'], ['声相', 'pan']].forEach((item, i) => this.makePanelButton(panel, t(item[0], item[1]), -250 + i * 85, modeY, 75, 34, () => { this.mixerEditorMode = item[1] as any; const block = currentBlock(); if (block) this.automationPoints(block); redraw(); }, new Color(32, 42, 62, 255)));
+        this.makePanelButton(panel, t('撤回', 'Undo'), 30, modeY, 70, 34, () => { const state = this.mixerEditorUndo.pop(); if (state) this.restoreMixerEditorSnapshot(state); this.mixerEditorCropping = false; this.mixerEditorCropStart = -1; this.mixerEditorCropEnd = -1; updateSpeedLabel(); redraw(); }, new Color(45, 58, 78, 255));
+        this.makePanelButton(panel, t('重置', 'Reset'), 110, modeY, 70, 34, () => { if (!this.mixerEditorInitial) return; this.pushMixerEditorUndo(); this.restoreMixerEditorSnapshot(this.mixerEditorInitial); this.mixerEditorCropping = false; this.mixerEditorCropStart = -1; this.mixerEditorCropEnd = -1; updateSpeedLabel(); redraw(); }, new Color(45, 58, 78, 255));
+        this.makePanelButton(panel, t('裁剪', 'Crop'), 190, modeY, 70, 34, () => { this.mixerEditorCropping = true; this.mixerEditorCropStart = -1; this.mixerEditorCropEnd = -1; redraw(); }, new Color(85, 48, 50, 255));
+        this.makePanelButton(panel, t('试听', 'Preview'), 270, modeY, 70, 34, () => { const block = currentBlock(); if (block) this.previewMixerBlock(block); }, new Color(38, 72, 110, 255));
+        this.makePanelButton(panel, t('保存并关闭', 'Save & Close'), pw / 2 - 100, modeY, 140, 34, () => { this.saveAudioClips(); this.saveMixerTracks(); this.mixerEditor?.destroy(); this.mixerEditor = null; this.queueMixerRedraw(); }, new Color(38, 100, 70, 255)); redraw();
+    }
+
+    private captureMixerEditorSnapshot(): MixerEditorSnapshot { return { tracks: JSON.parse(JSON.stringify(this.mixerTracks)), clips: JSON.parse(JSON.stringify(this.recordedClips)) }; }
+    private pushMixerEditorUndo() { this.mixerEditorUndo.push(this.captureMixerEditorSnapshot()); if (this.mixerEditorUndo.length > 30) this.mixerEditorUndo.shift(); }
+    private restoreMixerEditorSnapshot(snapshot: MixerEditorSnapshot) { this.mixerTracks = JSON.parse(JSON.stringify(snapshot.tracks)); this.recordedClips = JSON.parse(JSON.stringify(snapshot.clips)); this.saveAudioClips(); this.saveMixerTracks(); }
+
+    private automationPoints(block: MixerBlock): AutomationPoint[] {
+        const fallback = this.mixerEditorMode === 'pan' ? 0 : 1;
+        if (this.mixerEditorMode === 'pitch') return block.pitchAutomationPoints ?? (block.pitchAutomationPoints = [{ x: 0, y: block.pitchAutomation?.[0] ?? fallback }, { x: 1, y: block.pitchAutomation?.[block.pitchAutomation.length - 1] ?? fallback }]);
+        if (this.mixerEditorMode === 'pan') return block.panAutomationPoints ?? (block.panAutomationPoints = [{ x: 0, y: block.panAutomation?.[0] ?? fallback }, { x: 1, y: block.panAutomation?.[block.panAutomation.length - 1] ?? fallback }]);
+        return block.volumeAutomationPoints ?? (block.volumeAutomationPoints = [{ x: 0, y: block.volumeAutomation?.[0] ?? fallback }, { x: 1, y: block.volumeAutomation?.[block.volumeAutomation.length - 1] ?? fallback }]);
+    }
+
+    private upsertAutomationPoint(block: MixerBlock, x: number, y: number) { const points = this.automationPoints(block); const near = points.find(point => Math.abs(point.x - x) < .018); if (near) { near.x = x; near.y = y; } else points.push({ x, y }); points.sort((a, b) => a.x - b.x); if (points.length > 36) points.splice(1, points.length - 36); }
+    private syncAutomationSamples(block: MixerBlock) { const data = this.fitAutomationPoints(this.automationPoints(block), 64, this.mixerEditorMode === 'pan' ? -1 : 0, 1); if (this.mixerEditorMode === 'pitch') block.pitchAutomation = data; else if (this.mixerEditorMode === 'pan') block.panAutomation = data; else block.volumeAutomation = data; }
+
+    private fitAutomationPoints(points: AutomationPoint[], samples: number, min: number, max: number): number[] {
+        const degree = Math.min(3, Math.max(0, points.length - 1)), size = degree + 1; const matrix = Array.from({ length: size }, () => Array(size + 1).fill(0));
+        for (let row = 0; row < size; row++) for (let col = 0; col < size; col++) matrix[row][col] = points.reduce((sum, point) => sum + Math.pow(point.x, row + col), 0) + (row === col ? 1e-7 : 0);
+        for (let row = 0; row < size; row++) matrix[row][size] = points.reduce((sum, point) => sum + point.y * Math.pow(point.x, row), 0);
+        for (let pivot = 0; pivot < size; pivot++) { let best = pivot; for (let row = pivot + 1; row < size; row++) if (Math.abs(matrix[row][pivot]) > Math.abs(matrix[best][pivot])) best = row; [matrix[pivot], matrix[best]] = [matrix[best], matrix[pivot]]; const divisor = Math.abs(matrix[pivot][pivot]) < 1e-9 ? 1 : matrix[pivot][pivot]; for (let col = pivot; col <= size; col++) matrix[pivot][col] /= divisor; for (let row = 0; row < size; row++) if (row !== pivot) { const factor = matrix[row][pivot]; for (let col = pivot; col <= size; col++) matrix[row][col] -= factor * matrix[pivot][col]; } }
+        const coefficients = matrix.map(row => row[size]); return Array.from({ length: samples }, (_, index) => { const x = index / Math.max(1, samples - 1); const y = coefficients.reduce((sum, value, power) => sum + value * Math.pow(x, power), 0); return Math.max(min, Math.min(max, y)); });
+    }
+
+    private drawAutomationGraph(g: Graphics, w: number, h: number, block: MixerBlock, clip: AudioClipMeta, cropStart = -1, cropEnd = -1) {
+        g.clear();
+        g.fillColor = new Color(14, 18, 26, 255);
+        g.rect(-w / 2, -h / 2, w, h);
+        g.fill();
+
+        const durationBeats = Math.max(.001, this.clipBeats(clip, block));
+        g.strokeColor = new Color(255, 255, 255, 84);
+        const blockStartBeat = Math.max(0, block.startBeat), blockEndBeat = blockStartBeat + durationBeats;
+        const firstGridBeat = Math.ceil(blockStartBeat - 1e-6), lastGridBeat = Math.floor(blockEndBeat + 1e-6);
+        for (let beat = firstGridBeat; beat <= lastGridBeat; beat++) {
+            const x = -w / 2 + (beat - blockStartBeat) / durationBeats * w;
+            g.lineWidth = this.mixerBeatAccent(beat) === 2 ? 2 : (this.mixerBeatAccent(beat) === 1 ? 1.5 : 1);
+            g.moveTo(x, -h / 2);
+            g.lineTo(x, h / 2);
+            g.stroke();
+        }
+        g.lineWidth = 1;
+        const horizontalDivisions = this.mixerEditorMode === 'pan' ? 10 : 5;
+        for (let i = 0; i <= horizontalDivisions; i++) {
+            const y = -h / 2 + i / horizontalDivisions * h;
+            g.moveTo(-w / 2, y);
+            g.lineTo(w / 2, y);
+        }
+        g.stroke();
+
+        // Volume/pitch originate at bottom-left; pan uses the left midpoint.
+        g.lineWidth = 1.5;
+        g.strokeColor = new Color(255, 255, 255, 190);
+        g.moveTo(-w / 2, -h / 2);
+        g.lineTo(-w / 2, h / 2);
+        const originY = this.mixerEditorMode === 'pan' ? 0 : -h / 2;
+        g.moveTo(-w / 2, originY);
+        g.lineTo(w / 2, originY);
+        g.rect(-w / 2, -h / 2, w, h);
+        g.stroke();
+
+        this.syncAutomationSamples(block);
+        const data = this.mixerEditorMode === 'pitch' ? block.pitchAutomation! : this.mixerEditorMode === 'pan' ? block.panAutomation! : block.volumeAutomation!;
+        g.lineWidth = 3;
+        g.strokeColor = this.mixerColor(block.color);
+        data.forEach((value, i) => {
+            const x = -w / 2 + i / Math.max(1, data.length - 1) * w;
+            const normalized = this.mixerEditorMode === 'pan' ? (value + 1) / 2 : value;
+            const y = -h / 2 + Math.max(0, Math.min(1, normalized)) * h;
+            if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
+        });
+        g.stroke();
+        g.fillColor = new Color(245, 245, 248, 255);
+        for (const point of this.automationPoints(block)) {
+            const normalized = this.mixerEditorMode === 'pan' ? (point.y + 1) / 2 : point.y;
+            g.circle(-w / 2 + point.x * w, -h / 2 + Math.max(0, Math.min(1, normalized)) * h, 4);
+            g.fill();
+        }
+        if (cropStart >= 0 && cropEnd >= 0) {
+            const a = Math.min(cropStart, cropEnd), b = Math.max(cropStart, cropEnd);
+            g.fillColor = new Color(255, 45, 55, 84);
+            g.rect(-w / 2 + a * w, -h / 2, Math.max(2, (b - a) * w), h);
+            g.fill();
+        }
+    }
+
+    private applyMixerCrop(blockId: string, startRatio: number, endRatio: number) {
+        const found = this.findMixerBlock(blockId); if (!found) return; const clip = this.recordedClips.find(item => item.id === found.block.clipId); if (!clip) return; const baseStart = found.block.trimStart ?? clip.trimStart; const baseEnd = (found.block.trimEnd ?? clip.trimEnd) > baseStart ? (found.block.trimEnd ?? clip.trimEnd) : clip.duration; const cutStart = baseStart + (baseEnd - baseStart) * startRatio, cutEnd = baseStart + (baseEnd - baseStart) * endRatio;
+        if (endRatio - startRatio < .004 || cutEnd - cutStart >= baseEnd - baseStart - .02) return;
+        if (startRatio <= .01) found.block.trimStart = cutEnd;
+        else if (endRatio >= .99) found.block.trimEnd = cutStart;
+        else { const right: MixerBlock = JSON.parse(JSON.stringify(found.block)); right.id = `block_${Date.now()}_crop`; right.trimStart = cutEnd; right.trimEnd = baseEnd; found.block.trimEnd = cutStart; right.startBeat = found.block.startBeat + (cutStart - baseStart) * this.metronomeBpm / 60 / Math.max(.25, found.block.speed ?? 1); const targetTrack = this.findFreeMixerTrack(found.trackIndex, right.startBeat, this.clipBeats(clip, right)); this.ensureMixerTrack(targetTrack)?.blocks.push(right); }
+        this.resolveMixerBlockOverlap(blockId);
+    }
+    private resolveMixerBlockOverlap(blockId: string) { const found = this.findMixerBlock(blockId); if (!found) return; const clip = this.recordedClips.find(item => item.id === found.block.clipId); if (!clip) return; const target = this.findFreeMixerTrack(found.trackIndex, found.block.startBeat, this.clipBeats(clip, found.block), blockId); if (target !== found.trackIndex) { found.track.blocks = found.track.blocks.filter(item => item.id !== blockId); this.ensureMixerTrack(target)?.blocks.push(found.block); } }
+
+    private renameAudioClip(clip: AudioClipMeta) { NativeBridge.promptText(t('重命名音频', 'Rename Audio'), clip.name, (value) => { if (value.trim()) clip.name = value.trim(); this.saveAudioClips(); this.rebuildAudioRows(); this.queueMixerRedraw(); }); }
+    private editClipTrim(clip: AudioClipMeta, start: boolean) { const duration = Math.max(.1, clip.duration); const initial = start ? clip.trimStart : (clip.trimEnd || duration); NativeBridge.promptText(start ? '首端裁剪（秒）' : '末端裁剪（秒）', initial.toFixed(2), (value) => { const n = Number(value); if (!Number.isFinite(n)) return; if (start) clip.trimStart = Math.max(0, Math.min(n, (clip.trimEnd || duration) - .05)); else clip.trimEnd = Math.max(clip.trimStart + .05, Math.min(n, duration)); this.saveAudioClips(); this.rebuildAudioRows(); this.queueMixerRedraw(); }); }
 
     private makeTrimRangeSlider(parent: Node, clip: AudioClipMeta, x: number, y: number, width: number, refreshLabels: () => void) {
-        const node = new Node('TrimRange'); node.layer = Layers.Enum.UI_2D; const transform = node.addComponent(UITransform); transform.setContentSize(width, 36); node.setPosition(x, y); const g = node.addComponent(Graphics); let activeHandle: 'start' | 'end' = 'start';
+        const node = new Node('TrimRange'); node.layer = Layers.Enum.UI_2D; (node as any).__mixerSourceControl = true; const transform = node.addComponent(UITransform); transform.setContentSize(width, 36); node.setPosition(x, y); const g = node.addComponent(Graphics); let activeHandle: 'start' | 'end' = 'start';
         const duration = Math.max(.1, clip.duration || 0);
         const normalized = () => ({ start: Math.max(0, Math.min(1, clip.trimStart / duration)), end: Math.max(0, Math.min(1, (clip.trimEnd > clip.trimStart ? clip.trimEnd : duration) / duration)) });
         const draw = () => {
@@ -2754,10 +4004,10 @@ export class GameManager extends Component {
         };
         node.on(Node.EventType.TOUCH_START, (e: EventTouch) => { const p = e.getUILocation(); const local = transform.convertToNodeSpaceAR(new Vec3(p.x, p.y, 0)); const value = (local.x + width / 2) / width; const current = normalized(); activeHandle = Math.abs(value - current.start) <= Math.abs(value - current.end) ? 'start' : 'end'; moveHandle(e); }, this);
         node.on(Node.EventType.TOUCH_MOVE, moveHandle, this);
-        const finish = (e: EventTouch) => { this.saveAudioClips(); e.propagationStopped = true; };
+        const finish = (e: EventTouch) => { this.saveAudioClips(); this.flushMixerLiveRedraw(); e.propagationStopped = true; };
         node.on(Node.EventType.TOUCH_END, finish, this); node.on(Node.EventType.TOUCH_CANCEL, finish, this); parent.addChild(node); draw();
     }
-    private cloneAudioClip(clip: AudioClipMeta) { if (this.recordedClips.length >= 13) { this.setInfo('最多支持 13 个音频片段', new Color(255, 190, 120, 255)); return; } this.recordedClips.unshift({ ...clip, id: `clip_${Date.now()}`, name: `${clip.name} 副本` }); this.saveAudioClips(); this.rebuildAudioRows(); }
+    private cloneAudioClip(clip: AudioClipMeta) { if (this.recordedClips.length >= 13) { this.setInfo('最多支持 13 个音频片段', new Color(255, 190, 120, 255)); return; } this.recordedClips.unshift({ ...clip, id: `clip_${Date.now()}`, name: `${clip.name}${isEnglish() ? ' Copy' : ' 副本'}` }); this.saveAudioClips(); this.rebuildAudioRows(); }
     private makeCloneButton(parent: Node, x: number, y: number, cb: () => void) { const b = this.makePanelButton(parent, '', x, y, 42, 34, cb, new Color(42, 72, 115, 255)); const icon = new Node('CloneIcon'); icon.layer = Layers.Enum.UI_2D; icon.addComponent(UITransform).setContentSize(24, 24); b.addChild(icon); const g = icon.addComponent(Graphics); g.lineWidth = 1.5; g.strokeColor = new Color(255, 255, 255, 255); g.rect(-8, -8, 12, 12); g.stroke(); g.rect(-3, -3, 12, 12); g.stroke(); return b; }
 
     private exportAudioClip(clip: AudioClipMeta) {
@@ -2767,7 +4017,7 @@ export class GameManager extends Component {
                 const path = NativeBridge.exportAudio(clip.path, clip.name, format);
                 const failed = !path || path.startsWith('ERROR:');
                 if (failed) this.setInfo(path.replace(/^ERROR:/, '') || '音频导出失败', new Color(255, 150, 150, 255));
-                else this.showCenterMessage('导出成功，音频已保存至游戏文件根目录');
+                else NativeBridge.showAudioExportResult(path);
             });
             return;
         }
@@ -2779,10 +4029,15 @@ export class GameManager extends Component {
     }
 
     private redrawPanelButton(node: Node) {
-        const style = (node as any).__panelButtonStyle as { w: number; h: number; color: Color } | undefined;
+        const style = (node as any).__panelButtonStyle as { w: number; h: number; color: Color; fillColor?: Color; strokeColor?: Color } | undefined;
         const g = node.getComponent(Graphics); if (!style || !g) return;
-        g.clear(); g.roundRect(-style.w / 2, -style.h / 2, style.w, style.h, Math.min(8, style.h / 3)); g.fillColor = style.color; g.fill();
-        g.lineWidth = 1.2; g.strokeColor = new Color(125, 150, 188, 230); g.stroke();
+        g.clear(); g.roundRect(-style.w / 2, -style.h / 2, style.w, style.h, Math.min(8, style.h / 3)); g.fillColor = style.fillColor ?? style.color; g.fill();
+        g.lineWidth = style.strokeColor ? 2 : 1.2; g.strokeColor = style.strokeColor ?? new Color(125, 150, 188, 230); g.stroke();
+    }
+
+    private setPanelButtonBlackFill(node: Node) {
+        const style = (node as any).__panelButtonStyle as { color: Color; fillColor?: Color; strokeColor?: Color } | undefined; if (!style) return;
+        style.fillColor = new Color(0, 0, 0, 255); style.strokeColor = new Color(style.color.r, style.color.g, style.color.b, 255); this.redrawPanelButton(node);
     }
 
     private redrawPanelButtons(root: Node) {
@@ -2812,7 +4067,7 @@ export class GameManager extends Component {
         const imp = this.makePanelButton(panel, isEnglish() ? 'Import' : '导入', 0, 0, 300, 52, () => this.importStyleJson(), new Color(38, 72, 106, 255)); imp.name = 'StyleImport';
         const clearList = this.makePanelButton(panel, isEnglish() ? 'Clear style list' : '清空样式栏', 0, 0, 300, 52, () => this.confirmClearStyles(), new Color(92, 54, 64, 255)); clearList.name = 'StyleClearList';
         const clearPackages = this.makePanelButton(panel, isEnglish() ? 'Clear packages' : '清空数据包', 0, 0, 300, 52, () => this.confirmClearPackages(), new Color(92, 54, 64, 255)); clearPackages.name = 'StyleClearPackages';
-        for (const leftButton of [save, flow, imp, clearList, clearPackages]) leftButton.addComponent(UIOpacity).opacity = 128;
+        for (const leftButton of [save, flow, imp, clearList, clearPackages]) this.setPanelButtonBlackFill(leftButton);
         const close = this.makePanelButton(panel, isEnglish() ? 'Close' : '关闭', 0, 0, 110, 42, () => this.closeStylePanel(), new Color(45, 58, 88, 255)); close.name = 'StyleClose';
         const swallow = (e: EventTouch) => { e.propagationStopped = true; };
         panel.on(Node.EventType.TOUCH_START, swallow, this); panel.on(Node.EventType.TOUCH_MOVE, swallow, this); panel.on(Node.EventType.TOUCH_END, swallow, this);
@@ -2862,7 +4117,7 @@ export class GameManager extends Component {
         });
     }
 
-    private renameStyle(style: StyleSnapshot) { NativeBridge.promptText('重命名样式', style.name, (value) => { if (value.trim()) style.name = value.trim(); this.saveStyles(); this.rebuildStyleRows(); }); }
+    private renameStyle(style: StyleSnapshot) { NativeBridge.promptText(t('重命名样式', 'Rename Style'), style.name, (value) => { if (value.trim()) style.name = value.trim(); this.saveStyles(); this.rebuildStyleRows(); }); }
 
     private deleteStyle(style: StyleSnapshot) {
         NativeBridge.confirm('删除样式', `确定删除“${style.name}”吗？`, (confirmed) => {
@@ -2928,10 +4183,11 @@ export class GameManager extends Component {
             }),
             grid: JSON.parse(JSON.stringify(this.gridState)), fxSlots: JSON.parse(JSON.stringify(this.fxSlots)), outputFxSlots: JSON.parse(JSON.stringify(this.outputFxSlots)),
             drumBlackId: this.drumBlackId, drumWhiteId: this.drumWhiteId,
+            metronome: { enabled: this.metronomeEnabled, beatsPerBar: this.metronomeBeatsPerBar, beatUnit: this.metronomeBeatUnit, bpm: this.metronomeBpm },
         };
     }
 
-    private saveCurrentStyle() { this.styles.push(this.captureStyle('style', '新样式')); this.saveStyles(); this.setInfo('已保存新样式', new Color(220, 225, 235, 255)); }
+    private saveCurrentStyle() { this.styles.push(this.captureStyle('style', t('新样式', 'New Style'))); this.saveStyles(); this.setInfo(t('已保存新样式', 'New style saved'), new Color(220, 225, 235, 255)); }
 
     private openStyleFlowEditor() {
         const styleChoices = this.styles.filter((s) => s.kind === 'style');
@@ -2980,9 +4236,9 @@ export class GameManager extends Component {
     private closeStyleFlowEditor() { if (this.flowEditorPanel) this.flowEditorPanel.active = false; if (this.stylePanel) { this.stylePanel.active = true; this.layoutStylePanel(); this.rebuildStyleRows(); } }
 
     private saveStyleFlow() {
-        const flow = this.captureStyle('flow', '新样式流'); flow.flowNodes = this.flowEditorNodes.map((n) => ({ ...n })); this.styles.push(flow); this.saveStyles(); this.closeStyleFlowEditor(); this.setInfo('已保存新样式流', new Color(220, 225, 235, 255));
+        const flow = this.captureStyle('flow', t('新样式流', 'New Style Flow')); flow.flowNodes = this.flowEditorNodes.map((n) => ({ ...n })); this.styles.push(flow); this.saveStyles(); this.closeStyleFlowEditor(); this.setInfo(t('已保存新样式流', 'New style flow saved'), new Color(220, 225, 235, 255));
     }
-    private loadStyles(): StyleSnapshot[] { try { const raw = sys.localStorage.getItem('cm_styles'); const v = raw ? JSON.parse(raw) : []; return Array.isArray(v) ? v : []; } catch (e) { return []; } }
+    private loadStyles(): StyleSnapshot[] { try { const raw = sys.localStorage.getItem('cm_styles'); const value = raw ? JSON.parse(raw) : []; return Array.isArray(value) ? value.map((style) => ({ ...style, name: localizeMutableDefaultName(String(style.name ?? (style.kind === 'flow' ? t('新样式流', 'New Style Flow') : t('新样式', 'New Style')))) })) : []; } catch (e) { return []; } }
     private saveStyles() { try { sys.localStorage.setItem('cm_styles', JSON.stringify(this.styles)); } catch (e) { /* ignore */ } }
 
     private applyStyle(style: StyleSnapshot) {
@@ -3016,6 +4272,15 @@ export class GameManager extends Component {
             this.instIds[ch] = w.instId; saveStr('cm_inst_' + ch, w.instId); this.sendWaveToNative(ch, w.baseWave, w.amplitude, w.cycles); this.pushChannelDrumToNative(ch);
         });
         this.gridState = JSON.parse(JSON.stringify(style.grid)); saveGridState(this.gridState); this.fxSlots = JSON.parse(JSON.stringify(style.fxSlots)); saveFxSlots(this.fxSlots); this.outputFxSlots = JSON.parse(JSON.stringify(style.outputFxSlots)); saveOutputFxSlots(this.outputFxSlots); this.drumBlackId = style.drumBlackId; this.drumWhiteId = style.drumWhiteId; this.pushFxToNative(); this.pushOutputFxToNative(); this.pushDrumToNative(); this.redrawPlayGrid(); this.scheduleOnce(() => { this.styleTransition = false; this.edgeMode = previousEdgeMode; this.redrawPlayGrid(); }, 1.3); this.setInfo('样式已载入', new Color(220, 225, 235, 255));
+        if (style.metronome) {
+            this.metronomeEnabled = !!style.metronome.enabled;
+            this.metronomeBeatsPerBar = Math.max(1, Math.min(32, Math.round(style.metronome.beatsPerBar || 4)));
+            this.metronomeBeatUnit = [1, 2, 4, 8, 16, 32].indexOf(style.metronome.beatUnit) >= 0 ? style.metronome.beatUnit : 4;
+            this.metronomeBpm = Math.max(20, Math.min(320, Math.round(style.metronome.bpm || 120)));
+            saveStr('cm_metronome_beats', String(this.metronomeBeatsPerBar)); saveStr('cm_metronome_unit', String(this.metronomeBeatUnit)); saveStr('cm_metronome_bpm', String(this.metronomeBpm));
+            NativeBridge.setMetronome(this.metronomeEnabled, this.metronomeBeatsPerBar, this.metronomeBeatUnit, this.metronomeBpm);
+            this.redrawMetronomeButton();
+        }
     }
 
     private startStyleFlow() {
@@ -3158,6 +4423,28 @@ export class GameManager extends Component {
         this.imageDisplay.on(Node.EventType.TOUCH_MOVE, this.onImageTouchMove, this);
         this.imageDisplay.on(Node.EventType.TOUCH_END, this.onImageTouchEnd, this);
         this.imageDisplay.on(Node.EventType.TOUCH_CANCEL, this.onImageTouchEnd, this);
+        input.on(Input.EventType.TOUCH_END, this.onGlobalTouchEnd, this);
+        input.on(Input.EventType.TOUCH_CANCEL, this.onGlobalTouchEnd, this);
+    }
+
+    /** Input-level fallback for touch sequences whose target node was hidden/rotated before TOUCH_END arrived. */
+    private onGlobalTouchEnd(event: EventTouch) {
+        const id = event.getID();
+        if (!this.activeTouches.has(id)) return;
+        this.activeTouches.delete(id);
+        this.touchAudioUpdateMs.delete(id);
+        this.touchVisualUpdateMs.delete(id);
+        this.hideTouchRipple(id);
+        if (NativeBridge.isAndroidNative) NativeBridge.noteOff(id); else this.webSynth?.noteOff(id);
+    }
+
+    private releaseAllActiveNotes() {
+        if (NativeBridge.isAndroidNative) NativeBridge.releaseAllNotes();
+        else for (const id of this.activeTouches.keys()) this.webSynth?.noteOff(id);
+        this.activeTouches.clear();
+        this.touchAudioUpdateMs.clear();
+        this.touchVisualUpdateMs.clear();
+        this.clearTouchRipples();
     }
 
     private gridEdgeAt(uv: { u: number; v: number }): 'left' | 'right' | 'top' | 'bottom' | null {
@@ -3199,6 +4486,8 @@ export class GameManager extends Component {
     /** 将一组原点网格图案按周期平铺到整个屏幕，周期边界本身也是网格线。 */
     private repeatedGridLines(lines: number[], period: number): number[] {
         const safePeriod = Math.max(.008, Math.min(8, period));
+        const cached = this.repeatedGridCache.get(lines);
+        if (cached?.period === safePeriod) return cached.result;
         const pattern = lines.filter((p) => p > 0 && p < safePeriod);
         const result: number[] = [];
         for (let cycle = 0; cycle * safePeriod < 1 && result.length < 512; cycle++) {
@@ -3210,6 +4499,7 @@ export class GameManager extends Component {
                 result.push(value);
             }
         }
+        this.repeatedGridCache.set(lines, { period: safePeriod, result });
         return result;
     }
 
@@ -3278,6 +4568,7 @@ export class GameManager extends Component {
         }
         const id = event.getID();
         this.activeTouches.set(id, null as any);
+        this.touchAudioUpdateMs.set(id, Date.now());
         this.playSustain(event);
     }
 
@@ -3317,6 +4608,8 @@ export class GameManager extends Component {
         }
         if (!this.activeTouches.has(id)) return;
         if (!this.store.ready) return;
+        const now = Date.now();
+        if (now - (this.touchAudioUpdateMs.get(id) ?? 0) < TOUCH_AUDIO_INTERVAL_MS) return;
         // 距离节流：相对该手指上一次发声点移动 ≥ SLIDE_MIN_DIST 才更新
         const local = this.localFromEvent(event);
         if (!local) return;
@@ -3326,6 +4619,7 @@ export class GameManager extends Component {
             const dy = local.y - prev.y;
             if (dx * dx + dy * dy < SLIDE_MIN_DIST * SLIDE_MIN_DIST) return;
         }
+        this.touchAudioUpdateMs.set(id, now);
         this.activeTouches.set(id, new Vec3(local.x, local.y, 0));
         this.playSustain(event);
     }
@@ -3355,6 +4649,8 @@ export class GameManager extends Component {
         }
         if (!this.activeTouches.has(id)) return;
         this.activeTouches.delete(id);
+        this.touchAudioUpdateMs.delete(id);
+        this.touchVisualUpdateMs.delete(id);
         this.hideTouchRipple(id);
         if (NativeBridge.isAndroidNative) {
             NativeBridge.noteOff(id);
@@ -3418,15 +4714,24 @@ export class GameManager extends Component {
             this.webSynth.noteOn(touchId, params.r, params.g, params.b, params.a, params.freq, params.volume);
         }
 
-        this.showTouchRipple(touchId, local.x, local.y, color);
-        const note = midiToName(midi);
-        const summary = colorToneSummary(color.r, color.g, color.b, color.a);
-        this.setInfo(
-            isEnglish()
-                ? `${summary}  ${note} ${params.freq.toFixed(1)}Hz  Volume ${params.volume.toFixed(2)}`
-                : `${summary}  ${note} ${params.freq.toFixed(1)}Hz  音量 ${params.volume.toFixed(2)}`,
-            new Color(220, 225, 235, 255),
-        );
+        const now = Date.now();
+        const lastVisual = this.touchVisualUpdateMs.get(touchId);
+        const firstVisual = lastVisual === undefined;
+        if (firstVisual || now - lastVisual >= TOUCH_VISUAL_INTERVAL_MS) {
+            this.showTouchRipple(touchId, local.x, local.y, color);
+            this.touchVisualUpdateMs.set(touchId, now);
+        }
+        if (firstVisual || now - this.lastTouchInfoMs >= TOUCH_INFO_INTERVAL_MS) {
+            const note = midiToName(midi);
+            const summary = colorToneSummary(color.r, color.g, color.b, color.a);
+            this.setInfo(
+                isEnglish()
+                    ? `${summary}  ${note} ${params.freq.toFixed(1)}Hz  Volume ${params.volume.toFixed(2)}`
+                    : `${summary}  ${note} ${params.freq.toFixed(1)}Hz  音量 ${params.volume.toFixed(2)}`,
+                new Color(220, 225, 235, 255),
+            );
+            this.lastTouchInfoMs = now;
+        }
     }
 
     private showTouchRipple(touchId: number, localX: number, localY: number,
@@ -3646,7 +4951,7 @@ export class GameManager extends Component {
             tween(this.infoNode).stop();
             if (withTween) this.tweenTo(this.infoNode, infoPos[0], infoPos[1]);
             else this.infoNode.setPosition(infoPos[0], infoPos[1]);
-            this.settingsMenu.setPosition(view.w / 2 - 125, btnPos[4][1] - 118);
+            this.settingsMenu.setPosition(view.w / 2 - 125, btnPos[4][1] - 148.5);
         };
 
         try {

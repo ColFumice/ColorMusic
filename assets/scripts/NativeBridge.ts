@@ -49,11 +49,15 @@ export const JS_TEXT_INPUT_CALLBACK = '__colormusic_onTextInput';
 export const JS_STYLE_IMPORT_CALLBACK = '__colormusic_onStyleImported';
 export const JS_CONFIRM_CALLBACK = '__colormusic_onConfirm';
 export const JS_AUDIO_FORMAT_CALLBACK = '__colormusic_onAudioFormat';
+export const JS_METRONOME_CALLBACK = '__colormusic_onMetronomeSettings';
+export const JS_MIX_EXPORT_CALLBACK = '__colormusic_onMixExport';
 
 export class NativeBridge {
     private static textCallbacks = new Map<string, (value: string) => void>();
     private static confirmCallbacks = new Map<string, (confirmed: boolean) => void>();
     private static audioFormatCallbacks = new Map<string, (format: 'wav' | 'mp3' | '') => void>();
+    private static metronomeCallbacks = new Map<string, (beats: number, unit: number, bpm: number) => void>();
+    private static mixExportCallbacks = new Map<string, (path: string) => void>();
     private static styleImportCallback: ((json: string) => void) | null = null;
     /** 当前是否运行在原生环境（本项目只构建 Android，isNative 即安卓）。 */
     static get isAndroidNative(): boolean {
@@ -95,6 +99,16 @@ export class NativeBridge {
             NativeBridge.audioFormatCallbacks.delete(requestId);
             if (cb) cb(format === 'wav' || format === 'mp3' ? format : '');
         };
+        g[JS_METRONOME_CALLBACK] = (requestId: string, beats: number, unit: number, bpm: number) => {
+            const cb = NativeBridge.metronomeCallbacks.get(requestId);
+            NativeBridge.metronomeCallbacks.delete(requestId);
+            if (cb) cb(Number(beats), Number(unit), Number(bpm));
+        };
+        g[JS_MIX_EXPORT_CALLBACK] = (requestId: string, path: string) => {
+            const cb = NativeBridge.mixExportCallbacks.get(requestId);
+            NativeBridge.mixExportCallbacks.delete(requestId);
+            if (cb) cb(String(path ?? ''));
+        };
     }
 
     static promptText(title: string, initial: string, cb: (value: string) => void): void {
@@ -106,6 +120,19 @@ export class NativeBridge {
         const requestId = `text_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
         NativeBridge.textCallbacks.set(requestId, cb);
         NativeBridge.call('promptText', '(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V', requestId, title, initial);
+    }
+
+    static promptMetronome(beats: number, unit: number, bpm: number, cb: (beats: number, unit: number, bpm: number) => void): void {
+        if (!NativeBridge.isAndroidNative) {
+            const value = typeof globalThis.prompt === 'function'
+                ? globalThis.prompt('Metronome (signature, BPM)', `${beats}/${unit}, ${bpm}`) : `${beats}/${unit}, ${bpm}`;
+            const match = value && /^\s*(\d+)\s*\/\s*(\d+)\s*[, ]+\s*(\d+)\s*$/.exec(value);
+            if (match) cb(Number(match[1]), Number(match[2]), Number(match[3]));
+            return;
+        }
+        const requestId = `metronome_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+        NativeBridge.metronomeCallbacks.set(requestId, cb);
+        NativeBridge.call('promptMetronome', '(Ljava/lang/String;III)V', requestId, Math.round(beats), Math.round(unit), Math.round(bpm));
     }
 
     static confirm(title: string, message: string, cb: (confirmed: boolean) => void): void {
@@ -158,6 +185,34 @@ export class NativeBridge {
             const out = ref?.callStaticMethod(NATIVE_CLASS, 'exportAudio', '(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;', path, name, format);
             return typeof out === 'string' ? out : String(out ?? '');
         } catch (e) { console.error('[ColorMusic] exportAudio 失败:', e); return ''; }
+    }
+
+    static mixAndExportAudio(clips: Array<{ path: string; enabled: boolean; volume: number; trimStart: number; trimEnd: number; duration: number; startBeat?: number; bpm?: number; speed?: number; volumeAutomation?: number[]; pitchAutomation?: number[]; panAutomation?: number[] }>, name: string, format: 'wav' | 'mp3'): string {
+        if (!NativeBridge.isAndroidNative) return '';
+        try {
+            const out = NativeBridge.reflection?.callStaticMethod(NATIVE_CLASS, 'mixAndExportAudio',
+                '(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;', JSON.stringify(clips), name, format);
+            return typeof out === 'string' ? out : String(out ?? '');
+        } catch (e) { console.error('[ColorMusic] mixAndExportAudio 失败:', e); return ''; }
+    }
+
+    static mixAndExportAudioAsync(clips: Array<{ path: string; enabled: boolean; volume: number; trimStart: number; trimEnd: number; duration: number; startBeat?: number; bpm?: number; speed?: number; volumeAutomation?: number[]; pitchAutomation?: number[]; panAutomation?: number[] }>, name: string, format: 'wav' | 'mp3', cb: (path: string) => void): void {
+        if (!NativeBridge.isAndroidNative) { cb(''); return; }
+        const requestId = `mix_export_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+        NativeBridge.mixExportCallbacks.set(requestId, cb);
+        NativeBridge.call('mixAndExportAudioAsync', '(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V', requestId, JSON.stringify(clips), name, format);
+    }
+
+    static showAudioExportResult(path: string): void {
+        NativeBridge.call('showAudioExportResult', '(Ljava/lang/String;)V', path);
+    }
+
+    static playTimeline(blocks: Array<{ path: string; volume: number; trimStart: number; trimEnd: number; startBeat: number; speed?: number; trackId?: string; trackAudible?: boolean; volumeAutomation?: number[]; pitchAutomation?: number[]; panAutomation?: number[] }>, bpm: number): void {
+        NativeBridge.call('playTimeline', '(Ljava/lang/String;I)V', JSON.stringify(blocks), Math.max(20, Math.min(320, Math.round(bpm))));
+    }
+
+    static setTimelineTrackAudibility(states: Record<string, boolean>): void {
+        NativeBridge.call('setTimelineTrackAudibility', '(Ljava/lang/String;)V', JSON.stringify(states));
     }
 
     static consumeDebugPanel(): string {
@@ -224,6 +279,16 @@ export class NativeBridge {
     /** 释放指定 touchId 的持续音。 */
     static noteOff(touchId: number): void {
         NativeBridge.call('noteOff', '(I)V', touchId);
+    }
+
+    static releaseAllNotes(): void {
+        NativeBridge.call('releaseAllNotes', '()V');
+    }
+
+    static setMetronome(enabled: boolean, beatsPerBar: number, beatUnit: number, bpm = 120): void {
+        NativeBridge.call('setMetronome', '(ZIII)V', !!enabled,
+            Math.max(1, Math.min(32, Math.round(beatsPerBar))), Math.round(beatUnit),
+            Math.max(20, Math.min(320, Math.round(bpm))));
     }
 
     /** 播放一个 C5 测试音（验证 JS→原生 链路）。 */

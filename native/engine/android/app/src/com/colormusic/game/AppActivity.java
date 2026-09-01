@@ -27,11 +27,24 @@ package com.colormusic.game;
 import android.os.Bundle;
 import android.content.Intent;
 import android.content.res.Configuration;
+import android.view.MotionEvent;
 
 import com.cocos.service.SDKWrapper;
 import com.cocos.lib.CocosActivity;
 
 public class AppActivity extends CocosActivity {
+
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent event) {
+        int action = event.getActionMasked();
+        if (action == MotionEvent.ACTION_POINTER_UP) {
+            NativeBridge.noteOff(event.getPointerId(event.getActionIndex()));
+        } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+            // Native fallback for touch-end events dropped while Cocos changes UI focus or orientation.
+            NativeBridge.releaseAllNotes();
+        }
+        return super.dispatchTouchEvent(event);
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {

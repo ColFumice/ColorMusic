@@ -16,18 +16,28 @@ import android.provider.DocumentsContract;
 import android.util.Base64;
 import android.util.Log;
 import android.widget.EditText;
+import android.text.InputType;
+import android.view.Gravity;
+import android.widget.LinearLayout;
+import android.widget.TextView;
 
 import com.cocos.lib.CocosHelper;
 import com.cocos.lib.CocosJavascriptJavaBridge;
 
 import java.io.File;
+import java.io.BufferedOutputStream;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import mobi.cangol.mobile.utils.LameUtils;
 
@@ -59,9 +69,27 @@ public class NativeBridge {
     private static Activity sActivity;
     private static final AudioSynth sSynth = new AudioSynth();
     private static final List<MediaPlayer> sClipPlayers = new ArrayList<>();
+    private static final Map<MediaPlayer, TimelinePlayerState> sTimelinePlayers = new HashMap<>();
+    private static final Map<String, Boolean> sTimelineTrackAudible = new HashMap<>();
     private static final Handler sPlaybackHandler = new Handler(Looper.getMainLooper());
     private static Runnable sLoopRestart;
+    private static final List<Runnable> sScheduledPlayback = new ArrayList<>();
+    private static final ExecutorService sMixExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread thread = new Thread(r, "ColorMusicMixExport");
+        thread.setPriority(Thread.NORM_PRIORITY);
+        return thread;
+    });
     private static int sPlaybackGeneration = 0;
+
+    private static final class TimelinePlayerState {
+        final String trackId;
+        final float volume;
+
+        TimelinePlayerState(String trackId, float volume) {
+            this.trackId = trackId;
+            this.volume = volume;
+        }
+    }
 
     private NativeBridge() { }
 
@@ -120,6 +148,69 @@ public class NativeBridge {
         evalToJs("globalThis.__colormusic_onTextInput && globalThis.__colormusic_onTextInput("
                 + org.json.JSONObject.quote(requestId == null ? "" : requestId) + ","
                 + org.json.JSONObject.quote(value == null ? "" : value) + ");");
+    }
+
+    /** 单窗口编辑节拍器拍号与 BPM。 */
+    public static void promptMetronome(String requestId, int beats, int unit, int bpm) {
+        if (sActivity == null) return;
+        sActivity.runOnUiThread(() -> {
+            final LinearLayout root = new LinearLayout(sActivity);
+            root.setOrientation(LinearLayout.VERTICAL);
+            root.setPadding(36, 8, 36, 0);
+
+            final LinearLayout signature = new LinearLayout(sActivity);
+            signature.setGravity(Gravity.CENTER_VERTICAL);
+            final EditText numerator = numberInput(String.valueOf(beats), 2);
+            final EditText denominator = numberInput(String.valueOf(unit), 2);
+            final TextView slash = new TextView(sActivity);
+            slash.setText("/");
+            slash.setTextSize(22);
+            slash.setGravity(Gravity.CENTER);
+            signature.addView(numerator, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+            signature.addView(slash, new LinearLayout.LayoutParams(42, LinearLayout.LayoutParams.WRAP_CONTENT));
+            signature.addView(denominator, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+            root.addView(signature, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+            final LinearLayout bpmRow = new LinearLayout(sActivity);
+            bpmRow.setGravity(Gravity.CENTER_VERTICAL);
+            final TextView bpmLabel = new TextView(sActivity);
+            bpmLabel.setText("BPM");
+            bpmLabel.setTextSize(17);
+            bpmLabel.setPadding(0, 18, 22, 0);
+            final EditText bpmInput = numberInput(String.valueOf(bpm), 3);
+            bpmRow.addView(bpmLabel, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+            bpmRow.addView(bpmInput, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+            root.addView(bpmRow, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+            new AlertDialog.Builder(sActivity)
+                    .setTitle("节拍器")
+                    .setView(root)
+                    .setPositiveButton("确定", (dialog, which) -> sendMetronomeResult(requestId,
+                            parseInt(numerator, beats), parseInt(denominator, unit), parseInt(bpmInput, bpm)))
+                    .setNegativeButton("取消", (dialog, which) -> sendMetronomeResult(requestId, beats, unit, bpm))
+                    .setOnCancelListener(dialog -> sendMetronomeResult(requestId, beats, unit, bpm))
+                    .show();
+        });
+    }
+
+    private static EditText numberInput(String value, int digits) {
+        EditText input = new EditText(sActivity);
+        input.setSingleLine(true);
+        input.setInputType(InputType.TYPE_CLASS_NUMBER);
+        input.setText(value);
+        input.setSelectAllOnFocus(true);
+        input.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(digits)});
+        return input;
+    }
+
+    private static int parseInt(EditText input, int fallback) {
+        try { return Integer.parseInt(input.getText().toString().trim()); } catch (Exception ignored) { return fallback; }
+    }
+
+    private static void sendMetronomeResult(String requestId, int beats, int unit, int bpm) {
+        evalToJs("globalThis.__colormusic_onMetronomeSettings && globalThis.__colormusic_onMetronomeSettings("
+                + org.json.JSONObject.quote(requestId == null ? "" : requestId) + ","
+                + beats + "," + unit + "," + bpm + ");");
     }
 
     /** 显示原生确认框，并将结果回传给对应的 JS 请求。 */
@@ -377,6 +468,174 @@ public class NativeBridge {
         }
     }
 
+    /** Mix enabled mixer rows with their trim/volume settings, then export the rendered bus. */
+    public static String mixAndExportAudio(String clipsJson, String displayName, String requestedFormat) {
+        if (sActivity == null) return "ERROR:应用尚未就绪";
+        File mixed = new File(sActivity.getCacheDir(), "colormusic_mix_" + System.nanoTime() + ".wav");
+        List<MixInput> inputs = new ArrayList<>();
+        try {
+            org.json.JSONArray clips = new org.json.JSONArray(clipsJson == null ? "[]" : clipsJson);
+            int sampleRate = 0;
+            long longestFrames = 0;
+            for (int i = 0; i < clips.length(); i++) {
+                org.json.JSONObject clip = clips.optJSONObject(i);
+                if (clip == null || !clip.optBoolean("enabled", true)) continue;
+                MixInput input = new MixInput(clip);
+                if (sampleRate == 0) sampleRate = input.sampleRate;
+                if (input.sampleRate != sampleRate) throw new IOException("轨道采样率不一致");
+                inputs.add(input);
+                longestFrames = Math.max(longestFrames, input.startFrames + input.totalFrames);
+            }
+            if (inputs.isEmpty() || longestFrames <= 0) return "ERROR:没有已启用的有效轨道";
+            renderMixWav(mixed, inputs, sampleRate, longestFrames);
+            return exportAudio(mixed.getAbsolutePath(), displayName, requestedFormat);
+        } catch (Exception error) {
+            Log.e(TAG, "Mix export failed", error);
+            return "ERROR:混音导出失败";
+        } finally {
+            for (MixInput input : inputs) input.close();
+            mixed.delete();
+        }
+    }
+
+    /** 后台分块混音，避免大文件导出阻塞 Cocos/UI 线程。 */
+    public static void mixAndExportAudioAsync(String requestId, String clipsJson, String displayName, String requestedFormat) {
+        sMixExecutor.execute(() -> {
+            String result = mixAndExportAudio(clipsJson, displayName, requestedFormat);
+            evalToJs("globalThis.__colormusic_onMixExport && globalThis.__colormusic_onMixExport("
+                    + org.json.JSONObject.quote(requestId == null ? "" : requestId) + ","
+                    + org.json.JSONObject.quote(result == null ? "" : result) + ");");
+        });
+    }
+
+    private static final class MixInput {
+        final RandomAccessFile file;
+        final int channels;
+        final int sampleRate;
+        final int frameBytes;
+        final float volume;
+        final long startFrames;
+        final long totalFrames;
+        long framesRemaining;
+        byte[] block = new byte[0];
+
+        MixInput(org.json.JSONObject clip) throws IOException {
+            String path = clip.optString("path", "");
+            file = new RandomAccessFile(path, "r");
+            try {
+                byte[] header = new byte[44];
+                file.readFully(header);
+                if (header[0] != 'R' || header[8] != 'W' || little16(header, 20) != 1 || little16(header, 34) != 16) {
+                    throw new IOException("仅支持 16 位 PCM WAV 轨道");
+                }
+                channels = little16(header, 22);
+                sampleRate = little32(header, 24);
+                if (channels < 1 || channels > 2 || sampleRate < 8000) throw new IOException("无效 WAV 参数");
+                frameBytes = channels * 2;
+                long sourceTotalFrames = Math.min(Math.max(0, little32(header, 40)), Math.max(0, file.length() - 44)) / frameBytes;
+                long start = Math.max(0, Math.round(clip.optDouble("trimStart", 0) * sampleRate));
+                long requestedEnd = Math.round(clip.optDouble("trimEnd", 0) * sampleRate);
+                long end = requestedEnd > start ? Math.min(sourceTotalFrames, requestedEnd) : sourceTotalFrames;
+                start = Math.min(start, end);
+                framesRemaining = Math.max(0, end - start);
+                this.totalFrames = framesRemaining;
+                volume = Math.max(0f, Math.min(1f, (float) clip.optDouble("volume", 1)));
+                int bpm = Math.max(20, Math.min(320, clip.optInt("bpm", 120)));
+                startFrames = Math.max(0, Math.round(clip.optDouble("startBeat", 0) * 60.0 / bpm * sampleRate));
+                file.seek(44 + start * frameBytes);
+            } catch (IOException | RuntimeException error) {
+                try { file.close(); } catch (Exception ignored) { }
+                throw error;
+            }
+        }
+
+        int mixInto(float[] left, float[] right, int requestedFrames) throws IOException {
+            return mixInto(left, right, requestedFrames, 0);
+        }
+
+        int mixInto(float[] left, float[] right, int requestedFrames, int outputOffset) throws IOException {
+            int frames = (int) Math.min(framesRemaining, requestedFrames);
+            int bytes = frames * frameBytes;
+            if (block.length < bytes) block = new byte[bytes];
+            int offset = 0;
+            while (offset < bytes) {
+                int read = file.read(block, offset, bytes - offset);
+                if (read < 0) break;
+                offset += read;
+            }
+            int actualFrames = offset / frameBytes;
+            for (int frame = 0; frame < actualFrames; frame++) {
+                int at = frame * frameBytes;
+                float l = (short) little16(block, at) / 32768f;
+                float r = channels == 1 ? l : (short) little16(block, at + 2) / 32768f;
+                left[frame + outputOffset] += l * volume;
+                right[frame + outputOffset] += r * volume;
+            }
+            framesRemaining -= actualFrames;
+            return actualFrames;
+        }
+
+        void close() { try { file.close(); } catch (Exception ignored) { } }
+    }
+
+    private static void renderMixWav(File target, List<MixInput> inputs, int sampleRate, long totalFrames) throws IOException {
+        try (BufferedOutputStream out = new BufferedOutputStream(new FileOutputStream(target), 65536)) {
+            writeMixHeader(out, sampleRate, totalFrames * 4);
+            final int framesPerBlock = 1024;
+            float[] left = new float[framesPerBlock];
+            float[] right = new float[framesPerBlock];
+            byte[] pcm = new byte[framesPerBlock * 4];
+            float busGain = 1f / (float) Math.sqrt(Math.max(1, inputs.size()));
+            float limiterGain = 1f;
+            for (long rendered = 0; rendered < totalFrames; rendered += framesPerBlock) {
+                int frames = (int) Math.min(framesPerBlock, totalFrames - rendered);
+                java.util.Arrays.fill(left, 0, frames, 0f);
+                java.util.Arrays.fill(right, 0, frames, 0f);
+                for (MixInput input : inputs) {
+                    if (rendered + frames <= input.startFrames || input.framesRemaining <= 0) continue;
+                    int offset = (int) Math.max(0, input.startFrames - rendered);
+                    input.mixInto(left, right, frames - offset, offset);
+                }
+                float peak = 0f;
+                for (int i = 0; i < frames; i++) peak = Math.max(peak, Math.max(Math.abs(left[i]), Math.abs(right[i])) * busGain);
+                float targetGain = peak > .95f ? .95f / peak : 1f;
+                limiterGain = targetGain < limiterGain ? targetGain : limiterGain + (targetGain - limiterGain) * .12f;
+                for (int i = 0; i < frames; i++) {
+                    short l = (short) (Math.max(-.95f, Math.min(.95f, left[i] * busGain * limiterGain)) * 32767f);
+                    short r = (short) (Math.max(-.95f, Math.min(.95f, right[i] * busGain * limiterGain)) * 32767f);
+                    int at = i * 4;
+                    pcm[at] = (byte) (l & 255); pcm[at + 1] = (byte) ((l >> 8) & 255);
+                    pcm[at + 2] = (byte) (r & 255); pcm[at + 3] = (byte) ((r >> 8) & 255);
+                }
+                out.write(pcm, 0, frames * 4);
+            }
+        }
+    }
+
+    private static void writeMixHeader(java.io.OutputStream out, int sampleRate, long dataBytes) throws IOException {
+        byte[] h = new byte[44];
+        h[0] = 'R'; h[1] = 'I'; h[2] = 'F'; h[3] = 'F'; putLittle32(h, 4, 36 + dataBytes);
+        h[8] = 'W'; h[9] = 'A'; h[10] = 'V'; h[11] = 'E'; h[12] = 'f'; h[13] = 'm'; h[14] = 't'; h[15] = ' ';
+        putLittle32(h, 16, 16); putLittle16(h, 20, 1); putLittle16(h, 22, 2);
+        putLittle32(h, 24, sampleRate); putLittle32(h, 28, sampleRate * 4L); putLittle16(h, 32, 4); putLittle16(h, 34, 16);
+        h[36] = 'd'; h[37] = 'a'; h[38] = 't'; h[39] = 'a'; putLittle32(h, 40, dataBytes);
+        out.write(h);
+    }
+
+    private static void putLittle16(byte[] b, int at, int value) { b[at] = (byte) value; b[at + 1] = (byte) (value >> 8); }
+    private static void putLittle32(byte[] b, int at, long value) { b[at] = (byte) value; b[at + 1] = (byte) (value >> 8); b[at + 2] = (byte) (value >> 16); b[at + 3] = (byte) (value >> 24); }
+
+    /** Export completion dialog with a direct path to the app's export directory. */
+    public static void showAudioExportResult(String path) {
+        if (sActivity == null || path == null || path.isEmpty()) return;
+        sActivity.runOnUiThread(() -> new AlertDialog.Builder(sActivity)
+                .setTitle("导出成功")
+                .setMessage("音频已保存至：\n" + path)
+                .setPositiveButton("查看目录", (dialog, which) -> openExportDirectory())
+                .setNegativeButton("完成", null)
+                .show());
+    }
+
     private static int little16(byte[] b, int p) { return (b[p] & 255) | ((b[p + 1] & 255) << 8); }
     private static int little32(byte[] b, int p) { return little16(b, p) | (little16(b, p + 2) << 16); }
     private static String sanitizeFileName(String name) { String value = name.replaceAll("[\\\\/:*?\"<>|]", "_").trim(); return value.isEmpty() ? "ColorMusic" : value; }
@@ -397,6 +656,14 @@ public class NativeBridge {
     /** 释放指定 touchId 的持续音。 */
     public static void noteOff(int touchId) {
         sSynth.noteOff(touchId);
+    }
+
+    public static void releaseAllNotes() {
+        sSynth.releaseAllNotes();
+    }
+
+    public static void setMetronome(boolean enabled, int beatsPerBar, int beatUnit, int bpm) {
+        sSynth.setMetronome(enabled, beatsPerBar, beatUnit, bpm);
     }
 
     /** 播放 C5 测试音（验证 JS→原生→AudioTrack 链路）。 */
@@ -479,16 +746,153 @@ public class NativeBridge {
         }
     }
 
+    /** Play timeline blocks at beat offsets without blocking the Cocos thread. */
+    public static synchronized void playTimeline(String blocksJson, int requestedBpm) {
+        stopAudioFiles();
+        final int generation = ++sPlaybackGeneration;
+        final int bpm = Math.max(20, Math.min(320, requestedBpm));
+        try {
+            org.json.JSONArray blocks = new org.json.JSONArray(blocksJson == null ? "[]" : blocksJson);
+            for (int i = 0; i < blocks.length(); i++) {
+                final org.json.JSONObject block = blocks.optJSONObject(i);
+                if (block == null || block.optString("path", "").isEmpty()) continue;
+                String trackId = block.optString("trackId", "");
+                if (!trackId.isEmpty() && !sTimelineTrackAudible.containsKey(trackId)) {
+                    sTimelineTrackAudible.put(trackId, block.optBoolean("trackAudible", true));
+                }
+                long delayMs = Math.max(0, Math.round(block.optDouble("startBeat", 0) * 60000.0 / bpm));
+                Runnable scheduled = () -> {
+                    synchronized (NativeBridge.class) {
+                        if (generation != sPlaybackGeneration) return;
+                        startTimelinePlayer(block, generation);
+                    }
+                };
+                sScheduledPlayback.add(scheduled);
+                sPlaybackHandler.postDelayed(scheduled, delayMs);
+            }
+        } catch (Exception error) {
+            Log.e(TAG, "playTimeline failed", error);
+            stopAudioFiles();
+        }
+    }
+
+    private static void startTimelinePlayer(org.json.JSONObject block, int generation) {
+        MediaPlayer player = new MediaPlayer();
+        try {
+            player.setDataSource(block.optString("path", ""));
+            player.setLooping(false);
+            player.setOnErrorListener((failed, what, extra) -> {
+                synchronized (NativeBridge.class) {
+                    sClipPlayers.remove(failed);
+                    sTimelinePlayers.remove(failed);
+                    try { failed.reset(); } catch (Exception ignored) { }
+                    try { failed.release(); } catch (Exception ignored) { }
+                }
+                Log.e(TAG, "timeline MediaPlayer error: " + what + "/" + extra);
+                return true;
+            });
+            player.setOnCompletionListener(p -> {
+                synchronized (NativeBridge.class) {
+                    try { p.release(); } catch (Exception ignored) { }
+                    sClipPlayers.remove(p);
+                    sTimelinePlayers.remove(p);
+                }
+            });
+            player.setOnPreparedListener(prepared -> {
+                synchronized (NativeBridge.class) {
+                    if (generation != sPlaybackGeneration) {
+                        sClipPlayers.remove(prepared);
+                        sTimelinePlayers.remove(prepared);
+                        try { prepared.release(); } catch (Exception ignored) { }
+                        return;
+                    }
+                    float volume = Math.max(0f, Math.min(1f, (float) block.optDouble("volume", 1)));
+                    String trackId = block.optString("trackId", "");
+                    boolean audible = trackId.isEmpty() ? block.optBoolean("trackAudible", true) : Boolean.TRUE.equals(sTimelineTrackAudible.get(trackId));
+                    prepared.setVolume(audible ? volume : 0f, audible ? volume : 0f);
+                    sTimelinePlayers.put(prepared, new TimelinePlayerState(trackId, volume));
+                    float speed = Math.max(.25f, Math.min(4f, (float) block.optDouble("speed", 1)));
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M && Math.abs(speed - 1f) > .001f) {
+                        try { prepared.setPlaybackParams(prepared.getPlaybackParams().setSpeed(speed)); } catch (Exception ignored) { }
+                    }
+                    long startMs = Math.max(0, Math.round(block.optDouble("trimStart", 0) * 1000));
+                    long requestedEnd = Math.round(block.optDouble("trimEnd", 0) * 1000);
+                    long endMs = requestedEnd > startMs ? Math.min(requestedEnd, prepared.getDuration()) : prepared.getDuration();
+                    long playMs = Math.max(1, Math.round((endMs - startMs) / speed));
+                    Runnable begin = () -> beginPreparedTimelinePlayer(prepared, generation, endMs, playMs);
+                    if (startMs > 0) {
+                        prepared.setOnSeekCompleteListener(seeked -> begin.run());
+                        prepared.seekTo((int) Math.min(startMs, Integer.MAX_VALUE));
+                    } else begin.run();
+                }
+            });
+            sClipPlayers.add(player);
+            player.prepareAsync();
+        } catch (Exception error) {
+            sClipPlayers.remove(player);
+            sTimelinePlayers.remove(player);
+            try { player.release(); } catch (Exception ignored) { }
+            Log.e(TAG, "timeline block failed", error);
+        }
+    }
+
+    private static void beginPreparedTimelinePlayer(MediaPlayer player, int generation, long endMs, long playMs) {
+        synchronized (NativeBridge.class) {
+            if (generation != sPlaybackGeneration || !sClipPlayers.contains(player)) return;
+            try { player.start(); } catch (Exception error) {
+                sClipPlayers.remove(player);
+                sTimelinePlayers.remove(player);
+                try { player.release(); } catch (Exception ignored) { }
+                Log.e(TAG, "timeline start failed", error);
+                return;
+            }
+            if (endMs < player.getDuration()) {
+                Runnable stop = () -> {
+                    synchronized (NativeBridge.class) {
+                        if (generation != sPlaybackGeneration || !sClipPlayers.remove(player)) return;
+                        sTimelinePlayers.remove(player);
+                        try { player.pause(); } catch (Exception ignored) { }
+                        try { player.release(); } catch (Exception ignored) { }
+                    }
+                };
+                sScheduledPlayback.add(stop);
+                sPlaybackHandler.postDelayed(stop, playMs);
+            }
+        }
+    }
+
+    public static synchronized void setTimelineTrackAudibility(String statesJson) {
+        try {
+            org.json.JSONObject states = new org.json.JSONObject(statesJson == null ? "{}" : statesJson);
+            java.util.Iterator<String> keys = states.keys();
+            while (keys.hasNext()) {
+                String trackId = keys.next();
+                sTimelineTrackAudible.put(trackId, states.optBoolean(trackId, true));
+            }
+            for (Map.Entry<MediaPlayer, TimelinePlayerState> entry : sTimelinePlayers.entrySet()) {
+                TimelinePlayerState state = entry.getValue();
+                boolean audible = state.trackId.isEmpty() || Boolean.TRUE.equals(sTimelineTrackAudible.get(state.trackId));
+                try { entry.getKey().setVolume(audible ? state.volume : 0f, audible ? state.volume : 0f); } catch (Exception ignored) { }
+            }
+        } catch (Exception error) {
+            Log.e(TAG, "setTimelineTrackAudibility failed", error);
+        }
+    }
+
     /** 停止所有录音片段播放。 */
     public static synchronized void stopAudioFiles() {
         sPlaybackGeneration++;
         if (sLoopRestart != null) sPlaybackHandler.removeCallbacks(sLoopRestart);
+        for (Runnable scheduled : sScheduledPlayback) sPlaybackHandler.removeCallbacks(scheduled);
+        sScheduledPlayback.clear();
         sLoopRestart = null;
         for (MediaPlayer player : sClipPlayers) {
             try { player.stop(); } catch (Exception ignored) { }
             try { player.release(); } catch (Exception ignored) { }
         }
         sClipPlayers.clear();
+        sTimelinePlayers.clear();
+        sTimelineTrackAudible.clear();
     }
 
     /** 设置通道单周期波表及其周期倍率（0=R、1=G、2=B）。 */

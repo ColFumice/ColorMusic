@@ -27,6 +27,14 @@ const samples = [
   ['lofi_kick', 'Lo-fi', '底鼓', 'Kick', source('free-drum-samples', 'drum-samples', '03-soulful-vintage', 'kicks', 'vintage-kick-02.wav'), 'Free Drum Samples', 'CC0-1.0'],
   ['lofi_snare', 'Lo-fi', '军鼓', 'Snare', source('free-drum-samples', 'drum-samples', '03-soulful-vintage', 'snares', 'vintage-snare-02.wav'), 'Free Drum Samples', 'CC0-1.0'],
   ['lofi_hat', 'Lo-fi', '踩镲', 'Hi-hat', source('free-drum-samples', 'drum-samples', '03-soulful-vintage', 'hi-hats', 'hi-hat-closed-01.wav'), 'Free Drum Samples', 'CC0-1.0'],
+  ['percussion_shaker', '特殊打击乐', '沙槌', 'Shaker', source('0x808', 'samples', 'percussion', 'shaker.wav'), '0x808', 'CC0 / royalty-free'],
+  ['percussion_maracas', '特殊打击乐', '沙锤', 'Maracas', source('free-drum-samples', 'drum-samples', '03-soulful-vintage', 'percs', 'perc-maraca.wav'), 'Free Drum Samples', 'CC0-1.0'],
+  ['percussion_tambourine', '特殊打击乐', '铃鼓', 'Tambourine', source('0x808', 'samples', 'percussion', 'tambourine.wav'), '0x808', 'CC0 / royalty-free'],
+  ['percussion_clave', '特殊打击乐', '击木', 'Clave', source('0x808', 'samples', 'percussion', 'clave.wav'), '0x808', 'CC0 / royalty-free'],
+  ['percussion_rimshot', '特殊打击乐', '边击', 'Rimshot', source('0x808', 'samples', 'percussion', 'rimshot.wav'), '0x808', 'CC0 / royalty-free'],
+  ['percussion_tom', '特殊打击乐', '通鼓', 'Tom', source('0x808', 'samples', '808-synth', '808-tom-mid.wav'), '0x808', 'CC0 / royalty-free'],
+  ['percussion_cowbell', '特殊打击乐', '牛铃', 'Cowbell', source('0x808', 'samples', 'cr-78-real', 'cowbell.wav'), '0x808', 'CC0 / royalty-free'],
+  ['percussion_bongo', '特殊打击乐', '邦戈鼓', 'Bongo', source('0x808', 'samples', 'cr-78-real', 'bongo-h.wav'), '0x808', 'CC0 / royalty-free'],
 ];
 
 function readPcm(buffer) {
