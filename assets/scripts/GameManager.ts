@@ -90,6 +90,7 @@ const MIXER_TRACK_HEAD_WIDTH = 36;
 /** 轨道音频块约 1mm 的设计坐标圆角。 */
 const MIXER_BLOCK_CORNER_RADIUS = 8;
 const MIXER_CONTENT_INSET = MIXER_TRACK_HEAD_WIDTH + 20;
+const MIXER_COLLAPSED_RESTORE_VISUAL_SCALE = .62;
 const LEGACY_DRUM_IDS: Record<string, string> = {
     kick: 'tr808_kick', snare: 'tr808_snare', clap: 'boombap_clap',
     hihat: 'tr808_hat', tom: 'percussion_tom', maracas: 'percussion_maracas',
@@ -123,6 +124,7 @@ interface MixerBlock {
     speed?: number;
     trimStart?: number;
     trimEnd?: number;
+    trimRanges?: Array<{ start: number; end: number }>;
     volumeAutomation?: number[];
     pitchAutomation?: number[];
     panAutomation?: number[];
@@ -207,13 +209,27 @@ export class GameManager extends Component {
     private mixerViewport: Node | null = null;
     private mixerTimeline: Node | null = null;
     private mixerSourcePane: Node | null = null;
+    private mixerSourcePaneBackground: Node | null = null;
+    private mixerCollapsedSourceDots: Node[] = [];
+    private mixerConnectionLayer: Node | null = null;
+    private mixerConnectionSourceId = '';
+    private mixerConnectionBlockId = '';
     private mixerSourcePanelCollapsed = false;
     private mixerCollapsedContentInsetExtra = 0;
     private mixerSourcePaneAnimating = false;
     private mixerSelectedBlockId = '';
     private mixerSelectionBorderTransition: Node | null = null;
+    private mixerMultiSelectMode = false;
+    private mixerMultiSelectedBlockIds = new Set<string>();
+    private mixerMultiSelectOverlay: Node | null = null;
+    private mixerMultiLeftVeil: Node | null = null;
+    private mixerMultiModeGeneration = 0;
+    private mixerMultiBoxTouchId = -1;
+    private mixerMultiBoxStart: Vec3 | null = null;
+    private mixerMultiBoxCurrent: Vec3 | null = null;
     private mixerPlaying = false;
     private mixerPlayheadBeat = 0;
+    private mixerPlayheadTouchOffsetX = 0;
     private mixerPlaybackAnchorBeat = 0;
     private mixerPlaybackEndBeat = 0;
     private mixerFollowPlayhead = false;
@@ -251,6 +267,17 @@ export class GameManager extends Component {
     private mixerReturnGeneration = 0;
     private mixerDeferredRedrawGeneration = 0;
     private mixerLiveRedrawTimer: ReturnType<typeof setTimeout> | null = null;
+    /** 时间线采用只追加的分段缓存：初始 200 拍，之后每次追加 100 拍。 */
+    private mixerTimelineLoadedThroughBeat = 0;
+    private mixerTimelineCacheSignature = '';
+    private mixerTimelineCacheBeatWidth = 0;
+    private mixerTimelineCacheInset = -1;
+    private mixerTimelineCacheViewportWidth = 0;
+    private mixerTimelineCacheReady = false;
+    private mixerTimelineVisualDirty = false;
+    private mixerTimelinePendingTransitionPosition: Vec3 | null = null;
+    private mixerTimelineViewportHeight = 0;
+    private mixerRetainedTimelineNodes: Node[] = [];
     private mixerDraggingBlockId = '';
     private mixerDraggingPlayhead = false;
     private mixerEditor: Node | null = null;
@@ -397,6 +424,7 @@ export class GameManager extends Component {
     private diagCounter = 0;
     private currentSnapped = 0;    // 当前吸附的绝对方向（0/90/180/270）
     private currentTarget = 0;     // 图片当前角度（-90/0/90/180）
+    private startupLandscapePending = true;
 
     onLoad() {
         console.warn('[CM] onLoad start, isNative=', sys.isNative);
@@ -2833,12 +2861,15 @@ export class GameManager extends Component {
     private saveAudioClips() { try { sys.localStorage.setItem('cm_audio_clips', JSON.stringify(this.recordedClips.slice(0, 13))); } catch (e) { /* ignore */ } }
 
     private loadMixerTracks(): MixerTrack[] {
+        let tracks: MixerTrack[] = [];
         try {
             const raw = sys.localStorage.getItem('cm_mixer_tracks_v15');
             const value = raw ? JSON.parse(raw) : [];
-            if (Array.isArray(value)) return value.slice(0, 13);
+            if (Array.isArray(value)) tracks = value.slice(0, 13).map((track, index) => ({ id: track.id || `track_${Date.now()}_${index}`, muted: !!track.muted, solo: !!track.solo, blocks: Array.isArray(track.blocks) ? track.blocks : [] }));
         } catch (e) { /* ignore */ }
-        return [];
+        const stamp = Date.now();
+        while (tracks.length < 13) tracks.push({ id: `track_${stamp}_${tracks.length}`, muted: false, solo: false, blocks: [] });
+        return tracks;
     }
 
     private saveMixerTracks() {
@@ -2854,6 +2885,7 @@ export class GameManager extends Component {
         const state = this.mixerUndoStack.pop();
         if (!state) return;
         this.mixerTracks = state;
+        this.ensureMixerTrack(12);
         this.saveMixerTracks();
         this.redrawMixerTimeline();
     }
@@ -2868,8 +2900,12 @@ export class GameManager extends Component {
                 const clip = this.recordedClips.find(item => item.id === block.clipId);
                 if (clip?.path && clip.enabled !== false) {
                     const volumeAutomation = block.volumeAutomation?.length ? block.volumeAutomation : [1];
-                    const automationGain = volumeAutomation.reduce((sum, value) => sum + Math.max(0, Math.min(1, value)), 0) / volumeAutomation.length;
-                    result.push({ ...clip, trimStart: block.trimStart ?? clip.trimStart, trimEnd: block.trimEnd ?? clip.trimEnd, volume: clip.volume * automationGain, enabled: true, startBeat: block.startBeat, bpm: this.metronomeBpm, speed: Math.max(.25, Math.min(4, block.speed ?? 1)), trackId: track.id, trackAudible, volumeAutomation, pitchAutomation: block.pitchAutomation, panAutomation: block.panAutomation });
+                    const speed = Math.max(.25, Math.min(4, block.speed ?? 1));
+                    let elapsedSeconds = 0;
+                    for (const range of this.mixerBlockTrimRanges(clip, block)) {
+                        result.push({ ...clip, trimStart: range.start, trimEnd: range.end, volume: clip.volume, enabled: true, startBeat: block.startBeat + elapsedSeconds * this.metronomeBpm / 60 / speed, bpm: this.metronomeBpm, speed, trackId: track.id, trackAudible, volumeAutomation, pitchAutomation: block.pitchAutomation, panAutomation: block.panAutomation });
+                        elapsedSeconds += range.end - range.start;
+                    }
                 }
             }
         }
@@ -2890,7 +2926,8 @@ export class GameManager extends Component {
         const panel = new Node('AudioMixerPanel'); panel.layer = Layers.Enum.UI_2D;
         panel.addComponent(UITransform).setContentSize(1400, 860); const initialBg = panel.addComponent(Graphics);
         initialBg.rect(-700, -430, 1400, 860); initialBg.fillColor = new Color(8, 12, 24, 255); initialBg.fill();
-        const sourcePane = new Node('AudioSourcePane'); sourcePane.layer = Layers.Enum.UI_2D; sourcePane.addComponent(UITransform).setContentSize(1400, 860); sourcePane.addComponent(UIOpacity).opacity = 255; sourcePane.addComponent(Graphics); panel.addChild(sourcePane); this.mixerSourcePane = sourcePane;
+        const sourcePane = new Node('AudioSourcePane'); sourcePane.layer = Layers.Enum.UI_2D; sourcePane.addComponent(UITransform).setContentSize(1400, 860); sourcePane.addComponent(UIOpacity).opacity = 255; panel.addChild(sourcePane); this.mixerSourcePane = sourcePane;
+        const sourceBackground = new Node('AudioSourcePaneBackground'); sourceBackground.layer = Layers.Enum.UI_2D; sourceBackground.addComponent(UITransform).setContentSize(1400, 860); sourceBackground.addComponent(Graphics); sourcePane.addChild(sourceBackground); this.mixerSourcePaneBackground = sourceBackground;
         const title = this.makeLabel('AudioMixerTitle', isEnglish() ? 'Audio Edit Tracks' : '音频编辑轨道', 22, 38, new Color(240, 244, 252, 255), 180, 50); sourcePane.addChild(title);
         const close = this.makePanelButton(sourcePane, isEnglish() ? 'Close' : '关闭', 0, 0, 77, 30, () => this.closeAudioPanel(), new Color(45, 58, 88, 255)); close.name = 'AudioClose';
         const clear = this.makePanelButton(sourcePane, t('清空轨道', 'Clear Tracks'), 0, 0, 170, 42, () => this.clearAudioTracks(), new Color(105, 45, 55, 255)); clear.name = 'AudioClearTracks';
@@ -2905,11 +2942,14 @@ export class GameManager extends Component {
         const home = this.makePanelButton(panel, '◀', 0, 0, 42, 42, () => this.returnMixerTimelineToStart(), new Color(8, 10, 15, 255)); home.name = 'AudioTimelineHome';
         const magnet = this.makePanelButton(panel, '∪', 0, 0, 42, 42, () => { this.mixerMagnet = !this.mixerMagnet; this.queueMixerRedraw(); }, new Color(8, 10, 15, 255)); magnet.name = 'AudioMagnet';
         const collapse = new Node('AudioSourceCollapse'); collapse.layer = Layers.Enum.UI_2D; collapse.addComponent(UITransform).setContentSize(64, 64); const collapseDisc = this.makeLabel('AudioSourceCollapseDisc', '●', 64, 68, new Color(0, 0, 0, 255), 68, 68); collapse.addChild(collapseDisc); const collapseLabel = this.makeLabel('Arrow', '←', 25, 36, new Color(255, 255, 255, 255), 34, 34); collapse.addChild(collapseLabel); collapse.addComponent(Button).transition = Button.Transition.SCALE; collapse.on(Button.EventType.CLICK, () => this.toggleMixerSourcePane(), this);
+        const collapsedUndo = new Node('AudioCollapsedUndo'); collapsedUndo.layer = Layers.Enum.UI_2D; collapsedUndo.addComponent(UITransform).setContentSize(64, 64); const undoDisc = this.makeLabel('AudioCollapsedUndoDisc', '●', 64, 68, new Color(0, 0, 0, 255), 68, 68); collapsedUndo.addChild(undoDisc); const undoIcon = this.makeLabel('UndoIcon', '↶', 27, 38, new Color(255, 255, 255, 255), 38, 38); collapsedUndo.addChild(undoIcon); collapsedUndo.addComponent(Button).transition = Button.Transition.SCALE; collapsedUndo.on(Button.EventType.CLICK, () => this.undoMixer(), this); collapsedUndo.active = false;
+        const multiSelect = new Node('AudioMultiSelect'); multiSelect.layer = Layers.Enum.UI_2D; multiSelect.addComponent(UITransform).setContentSize(44, 44); multiSelect.addComponent(Graphics); multiSelect.addComponent(Button).transition = Button.Transition.NONE; multiSelect.on(Button.EventType.CLICK, () => this.toggleMixerMultiSelectMode(), this); multiSelect.active = false;
         const viewport = new Node('AudioTimelineViewport'); viewport.layer = Layers.Enum.UI_2D; viewport.addComponent(UITransform).setContentSize(1000, 700); (viewport.addComponent(Mask) as any).type = 0; panel.addChild(viewport); this.mixerViewport = viewport;
         const timeline = new Node('AudioTimeline'); timeline.layer = Layers.Enum.UI_2D; timeline.addComponent(UITransform).setContentSize(6000, 1200); viewport.addChild(timeline); this.mixerTimeline = timeline;
         this.attachMixerViewportGestures(viewport);
         viewport.setSiblingIndex(0);
-        const frame = new Node('AudioPanelTopBorder'); frame.layer = Layers.Enum.UI_2D; frame.addComponent(UITransform).setContentSize(1400, 860); frame.addComponent(Graphics); frame.addChild(collapse); panel.addChild(frame);
+        const connections = new Node('MixerConnections'); connections.layer = Layers.Enum.UI_2D; connections.addComponent(UITransform).setContentSize(1400, 860); connections.addComponent(Graphics); panel.addChild(connections); connections.setSiblingIndex(sourcePane.getSiblingIndex() + 1); this.mixerConnectionLayer = connections;
+        const frame = new Node('AudioPanelTopBorder'); frame.layer = Layers.Enum.UI_2D; frame.addComponent(UITransform).setContentSize(1400, 860); frame.addComponent(Graphics); frame.addChild(collapse); frame.addChild(collapsedUndo); frame.addChild(multiSelect); panel.addChild(frame);
         const swallow = (e: EventTouch) => { if (e.target === panel) e.propagationStopped = true; };
         panel.on(Node.EventType.TOUCH_START, swallow, this); panel.on(Node.EventType.TOUCH_MOVE, swallow, this); panel.on(Node.EventType.TOUCH_END, swallow, this);
         this.uiRoot.addChild(panel); panel.active = false;
@@ -2927,9 +2967,10 @@ export class GameManager extends Component {
         const leftWidth = view.w / 5;
         const sourcePane = this.mixerSourcePane;
         sourcePane?.getComponent(UITransform)?.setContentSize(view.w, view.h);
-        const sourcePaneG = sourcePane?.getComponent(Graphics);
-        if (sourcePaneG) { sourcePaneG.clear(); sourcePaneG.rect(-view.w / 2, -view.h / 2, leftWidth, view.h); sourcePaneG.fillColor = new Color(8, 12, 24, 255); sourcePaneG.fill(); }
-        sourcePane?.setPosition(this.mixerSourcePanelCollapsed ? -leftWidth : 0, 0);
+        const sourceBackground = this.mixerSourcePaneBackground;
+        sourceBackground?.getComponent(UITransform)?.setContentSize(view.w, view.h);
+        this.paintMixerSourceBackground(this.mixerSourcePanelCollapsed ? this.mixerCollapsedSourceWidth() : leftWidth);
+        if (!this.mixerSourcePaneAnimating) { sourcePane?.setPosition(0, 0); sourceBackground?.setPosition(0, 0); }
         if (!this.mixerSourcePaneAnimating) { const sourceOpacity = sourcePane?.getComponent(UIOpacity); if (sourceOpacity) sourceOpacity.opacity = 255; }
         sourcePane?.getChildByName('AudioMixerTitle')?.setPosition(-view.w / 2 + leftWidth / 2 - 44, view.h / 2 - 34);
         sourcePane?.getChildByName('AudioClose')?.setPosition(-view.w / 2 + leftWidth - 48, view.h / 2 - 34);
@@ -2938,9 +2979,11 @@ export class GameManager extends Component {
         panel.getChildByName('AudioTimelineStop')?.setPosition(view.w / 2 - 58, view.h / 2 - 35);
         panel.getChildByName('AudioTimelineHome')?.setPosition(view.w / 2 - 78, -view.h / 2 + 30);
         panel.getChildByName('AudioMagnet')?.setPosition(view.w / 2 - 28, -view.h / 2 + 30);
-        const viewportWidth = this.mixerSourcePanelCollapsed ? view.w : view.w - leftWidth - 8;
+        const collapsedWidth = this.mixerCollapsedSourceWidth();
+        const viewportWidth = this.mixerSourcePanelCollapsed ? view.w - collapsedWidth : view.w - leftWidth - 8;
         this.mixerViewport?.getComponent(UITransform)?.setContentSize(viewportWidth, view.h);
-        this.mixerViewport?.setPosition(this.mixerSourcePanelCollapsed ? 0 : -view.w / 2 + leftWidth + (view.w - leftWidth) / 2, 0);
+        this.mixerViewport?.setPosition(this.mixerSourcePanelCollapsed ? collapsedWidth / 2 : -view.w / 2 + leftWidth + (view.w - leftWidth) / 2, 0);
+        this.mixerConnectionLayer?.getComponent(UITransform)?.setContentSize(view.w, view.h);
         const footerY = -view.h / 2 + 145;
         const leftX = -view.w / 2 + leftWidth / 2;
         sourcePane?.getChildByName('AudioClearTracks')?.setPosition(leftX, footerY + 72);
@@ -2949,60 +2992,450 @@ export class GameManager extends Component {
         sourcePane?.getChildByName('AudioViewFolder')?.setPosition(leftX, footerY - 72);
         sourcePane?.getChildByName('AudioUndo')?.setPosition(leftX, footerY - 120);
         const collapseInset = MIXER_CONTENT_INSET + 12;
-        const collapsePosition = new Vec3(this.mixerSourcePanelCollapsed ? -view.w / 2 + collapseInset : -view.w / 2 + leftWidth + collapseInset, -view.h / 2 + 42, 0);
+        const collapsePosition = this.mixerSourcePanelCollapsed
+            ? new Vec3(-view.w / 2 + collapsedWidth / 2, -view.h / 2 + collapsedWidth / 2 + 2, 0)
+            : new Vec3(-view.w / 2 + leftWidth + collapseInset, -view.h / 2 + 42, 0);
         const collapse = frame?.getChildByName('AudioSourceCollapse');
-        collapse?.setPosition(collapsePosition);
+        if (!this.mixerSourcePaneAnimating && collapse) {
+            collapse.setPosition(collapsePosition);
+            const visualScale = this.mixerSourcePanelCollapsed ? MIXER_COLLAPSED_RESTORE_VISUAL_SCALE : 1;
+            for (const child of collapse.children) child.setScale(visualScale, visualScale, 1);
+        }
+        const collapsedUndo = frame?.getChildByName('AudioCollapsedUndo');
+        if (collapsedUndo) {
+            collapsedUndo.setPosition(-view.w / 2 + collapsedWidth / 2, -view.h / 2 + collapsedWidth / 2 + 66, 0);
+            for (const child of collapsedUndo.children) child.setScale(MIXER_COLLAPSED_RESTORE_VISUAL_SCALE, MIXER_COLLAPSED_RESTORE_VISUAL_SCALE, 1);
+            collapsedUndo.active = this.mixerSourcePanelCollapsed && !this.mixerSourcePaneAnimating && !this.mixerMultiSelectMode;
+        }
         if (frame) frame.setSiblingIndex(panel.children.length - 1);
         const arrow = collapse?.getChildByName('Arrow')?.getComponent(Label); if (arrow) arrow.string = this.mixerSourcePanelCollapsed ? '→' : '←';
+        const multiSelect = frame?.getChildByName('AudioMultiSelect');
+        multiSelect?.setPosition(-view.w / 2 + collapsedWidth / 2, view.h / 2 - collapsedWidth / 2 - 2, 0);
+        if (multiSelect) multiSelect.active = this.mixerSourcePanelCollapsed && !this.mixerSourcePaneAnimating;
+        this.paintMixerMultiSelectButton(); this.setMixerMultiSelectChrome(this.mixerMultiSelectMode);
         this.redrawPanelButtons(panel);
         this.queueMixerRedraw();
+        this.updateMixerConnections();
+    }
+
+    private mixerCollapsedSourceWidth() { return MIXER_TRACK_HEAD_WIDTH + 8; }
+
+    private paintMixerSourceBackground(width: number) {
+        const background = this.mixerSourcePaneBackground, graphics = background?.getComponent(Graphics);
+        if (!background || !graphics) return;
+        const view = this.userViewport(false);
+        graphics.clear(); graphics.rect(-view.w / 2, -view.h / 2, Math.max(0, width), view.h);
+        graphics.fillColor = new Color(8, 12, 24, 255); graphics.fill();
+    }
+
+    private paintMixerMultiSelectButton() {
+        const button = this.audioPanel?.getChildByName('AudioPanelTopBorder')?.getChildByName('AudioMultiSelect');
+        const graphics = button?.getComponent(Graphics); if (!graphics) return;
+        graphics.clear(); graphics.circle(0, 0, 10);
+        if (this.mixerMultiSelectMode) { graphics.fillColor = new Color(255, 255, 255, 255); graphics.fill(); }
+        else { graphics.lineWidth = 2; graphics.strokeColor = new Color(255, 255, 255, 255); graphics.stroke(); }
+    }
+
+    private setMixerMultiSelectChrome(enabled: boolean) {
+        const panel = this.audioPanel, frame = panel?.getChildByName('AudioPanelTopBorder');
+        if (!panel || !frame) return;
+        for (const name of ['AudioTimelineFollow', 'AudioTimelinePlay', 'AudioTimelineStop', 'AudioTimelineHome', 'AudioMagnet']) {
+            const control = panel.getChildByName(name); if (control) { control.active = !enabled; if (!enabled) this.redrawPanelButton(control); }
+        }
+        const collapse = frame.getChildByName('AudioSourceCollapse');
+        if (collapse) collapse.active = !enabled;
+        const collapsedUndo = frame.getChildByName('AudioCollapsedUndo');
+        if (collapsedUndo) collapsedUndo.active = !enabled && this.mixerSourcePanelCollapsed && !this.mixerSourcePaneAnimating;
+        const multiSelect = frame.getChildByName('AudioMultiSelect');
+        if (multiSelect) {
+            multiSelect.active = this.mixerSourcePanelCollapsed && !this.mixerSourcePaneAnimating;
+            if (multiSelect.active) multiSelect.setSiblingIndex(frame.children.length - 1);
+        }
+        const playhead = this.mixerTimeline?.getChildByName('MixerPlayhead');
+        if (playhead) {
+            playhead.active = !enabled;
+            if (!enabled) { this.paintMixerPlayheadLine(playhead, this.mixerViewport?.getComponent(UITransform)?.contentSize.height ?? 1); this.updateMixerPlayheadVisual(); }
+        }
+        if (this.mixerConnectionLayer) this.mixerConnectionLayer.active = !enabled;
+        for (const dot of this.mixerCollapsedSourceDots) {
+            const button = dot.getComponent(Button); if (button) button.interactable = !enabled;
+        }
+        let veil = this.mixerMultiLeftVeil;
+        if (!veil?.isValid || veil.parent !== frame) {
+            veil?.destroy(); veil = new Node('MixerMultiLeftVeil'); veil.layer = Layers.Enum.UI_2D;
+            veil.addComponent(UITransform); veil.addComponent(Graphics);
+            const swallow = (event: EventTouch) => { event.propagationStopped = true; };
+            veil.on(Node.EventType.TOUCH_START, swallow, this); veil.on(Node.EventType.TOUCH_MOVE, swallow, this); veil.on(Node.EventType.TOUCH_END, swallow, this); veil.on(Node.EventType.TOUCH_CANCEL, swallow, this);
+            frame.addChild(veil); this.mixerMultiLeftVeil = veil;
+        }
+        const view = this.userViewport(false), width = this.mixerCollapsedSourceWidth();
+        veil.getComponent(UITransform)!.setContentSize(width, view.h);
+        veil.setPosition(-view.w / 2 + width / 2, 0, 0); veil.active = enabled;
+        const graphics = veil.getComponent(Graphics)!; graphics.clear(); graphics.rect(-width / 2, -view.h / 2, width, view.h); graphics.fillColor = new Color(0, 0, 0, 84); graphics.fill();
+        if (enabled) {
+            veil.setSiblingIndex(frame.children.length - 1);
+            const button = frame.getChildByName('AudioMultiSelect'); if (button) button.setSiblingIndex(frame.children.length - 1);
+        }
+        this.paintMixerMultiSelectButton(); this.redrawMixerTransportButtons();
+    }
+
+    private toggleMixerMultiSelectMode() {
+        if (!this.mixerSourcePanelCollapsed || this.mixerSourcePaneAnimating) return;
+        this.setMixerMultiSelectMode(!this.mixerMultiSelectMode);
+    }
+
+    private setMixerMultiSelectMode(enabled: boolean, redraw = true) {
+        if (enabled && !this.mixerSourcePanelCollapsed) return;
+        if (enabled === this.mixerMultiSelectMode) return;
+        this.stopMixerInertia(false);
+        this.mixerMultiSelectMode = enabled;
+        this.mixerMultiSelectedBlockIds.clear();
+        this.mixerMultiBoxTouchId = -1; this.mixerMultiBoxStart = null; this.mixerMultiBoxCurrent = null;
+        this.mixerSelectedBlockId = ''; this.mixerConnectionBlockId = ''; this.mixerConnectionSourceId = '';
+        if (this.mixerSelectionBorderTransition) { Tween.stopAllByTarget(this.mixerSelectionBorderTransition); this.mixerSelectionBorderTransition.destroy(); this.mixerSelectionBorderTransition = null; }
+        if (!enabled) { this.mixerMultiSelectOverlay?.destroy(); this.mixerMultiSelectOverlay = null; }
+        this.mixerColorPalette?.destroy(); this.mixerColorPalette = null;
+        this.paintMixerMultiSelectButton(); this.setMixerMultiSelectChrome(enabled);
+        for (const child of this.mixerTimeline?.children ?? []) {
+            if (!child.name.startsWith('MixerBlock')) continue;
+            const found = this.findMixerBlock(child.name.slice('MixerBlock'.length)); if (found) this.setMixerMultiBlockSelectionVisual(child, found.block, false);
+        }
+        if (enabled) this.paintMixerMultiSelectOverlay();
+        this.updateMixerConnections();
+        const generation = ++this.mixerMultiModeGeneration;
+        if (redraw) this.scheduleOnce(() => {
+            if (generation !== this.mixerMultiModeGeneration) return;
+            this.mixerTimelineVisualDirty = true; this.redrawMixerTimeline(); this.setMixerMultiSelectChrome(this.mixerMultiSelectMode);
+        }, .035);
+    }
+
+    private mixerMultiViewportPoint(event: EventTouch) {
+        const transform = this.mixerViewport?.getComponent(UITransform); if (!transform) return null;
+        const p = event.getUILocation(); return transform.convertToNodeSpaceAR(new Vec3(p.x, p.y, 0));
+    }
+
+    private paintMixerMultiSelectOverlay() {
+        const timeline = this.mixerTimeline, viewport = this.mixerViewport;
+        if (!this.mixerMultiSelectMode || !timeline || !viewport) return;
+        let overlay = this.mixerMultiSelectOverlay;
+        if (!overlay?.isValid || overlay.parent !== timeline) {
+            if (overlay?.isValid) overlay.destroy();
+            overlay = new Node('MixerMultiSelectOverlay'); overlay.layer = Layers.Enum.UI_2D;
+            overlay.addComponent(UITransform); overlay.addComponent(Graphics); timeline.addChild(overlay); this.mixerMultiSelectOverlay = overlay;
+        }
+        const size = viewport.getComponent(UITransform)!.contentSize;
+        overlay.getComponent(UITransform)!.setContentSize(size.width, size.height); overlay.setPosition(Vec3.ZERO); overlay.setScale(Vec3.ONE);
+        const graphics = overlay.getComponent(Graphics)!; graphics.clear(); graphics.fillColor = new Color(0, 0, 0, 84);
+        const start = this.mixerMultiBoxStart, current = this.mixerMultiBoxCurrent;
+        if (!start || !current) { graphics.rect(-size.width / 2, -size.height / 2, size.width, size.height); graphics.fill(); }
+        else {
+            const left = Math.max(-size.width / 2, Math.min(start.x, current.x));
+            const right = Math.min(size.width / 2, Math.max(start.x, current.x));
+            const bottom = Math.max(-size.height / 2, Math.min(start.y, current.y));
+            const top = Math.min(size.height / 2, Math.max(start.y, current.y));
+            graphics.rect(-size.width / 2, top, size.width, size.height / 2 - top);
+            graphics.rect(-size.width / 2, -size.height / 2, size.width, bottom + size.height / 2);
+            graphics.rect(-size.width / 2, bottom, left + size.width / 2, Math.max(0, top - bottom));
+            graphics.rect(right, bottom, size.width / 2 - right, Math.max(0, top - bottom)); graphics.fill();
+            graphics.lineWidth = 4; graphics.strokeColor = new Color(255, 255, 255, 255);
+            // About 5 mm on the target tablet after the design-to-device scale.
+            graphics.roundRect(left, bottom, Math.max(1, right - left), Math.max(1, top - bottom), Math.min(46, Math.abs(right - left) / 2, Math.abs(top - bottom) / 2)); graphics.stroke();
+        }
+        overlay.setSiblingIndex(timeline.children.length - 1);
+        for (const id of this.mixerMultiSelectedBlockIds) {
+            const node = timeline.getChildByName(`MixerBlock${id}`); if (node) node.setSiblingIndex(timeline.children.length - 1);
+        }
+    }
+
+    private showMixerMultiTapFeedback(event: EventTouch) {
+        const frame = this.audioPanel?.getChildByName('AudioPanelTopBorder'), transform = frame?.getComponent(UITransform);
+        if (!frame || !transform) return;
+        const p = event.getUILocation(), local = transform.convertToNodeSpaceAR(new Vec3(p.x, p.y, 0));
+        const dot = new Node('MixerMultiTapFeedback'); dot.layer = Layers.Enum.UI_2D; dot.addComponent(UITransform).setContentSize(40, 40); dot.setPosition(local); dot.setScale(.72, .72, 1);
+        const graphics = dot.addComponent(Graphics); graphics.circle(0, 0, 11); graphics.fillColor = new Color(255, 255, 255, 255); graphics.fill();
+        const opacity = dot.addComponent(UIOpacity); frame.addChild(dot); dot.setSiblingIndex(frame.children.length - 1);
+        tween(dot).to(.26, { scale: new Vec3(1.75, 1.75, 1) }, { easing: 'quadOut' }).start();
+        tween(opacity).to(.26, { opacity: 0 }, { easing: 'quadOut' }).call(() => dot.destroy()).start();
+    }
+
+    private setMixerMultiBlockSelectionVisual(node: Node, block: MixerBlock, selected: boolean) {
+        Tween.stopAllByTarget(node); node.setScale(Vec3.ONE);
+        node.getChildByName('BlockSelectionBorder')?.destroy(); node.getChildByName('BlockToolbar')?.destroy(); node.getChildByName('BlockName')?.destroy();
+        const transform = node.getComponent(UITransform), clip = this.recordedClips.find(item => item.id === block.clipId); if (!transform || !clip) return;
+        const width = transform.contentSize.width, hh = transform.contentSize.height / 2, color = this.mixerColor(block.color);
+        if (selected) { this.drawMixerBlockSelectionBorder(node, width, hh, color); this.drawMixerBlockToolbar(node, block, clip, width, hh, color); }
+        else { const label = this.makeLabel('BlockName', clip.name, 12, 18, new Color(255, 255, 255, 230), Math.max(20, width - 8), 18); label.setPosition(0, hh - 11); node.addChild(label); }
+    }
+
+    private toggleMixerMultiBlockSelection(node: Node, block: MixerBlock) {
+        const selected = !this.mixerMultiSelectedBlockIds.has(block.id);
+        if (selected) this.mixerMultiSelectedBlockIds.add(block.id); else this.mixerMultiSelectedBlockIds.delete(block.id);
+        this.setMixerMultiBlockSelectionVisual(node, block, selected); this.paintMixerMultiSelectOverlay();
+    }
+
+    private finishMixerMultiBoxSelection() {
+        const start = this.mixerMultiBoxStart, current = this.mixerMultiBoxCurrent, timeline = this.mixerTimeline, viewport = this.mixerViewport;
+        this.mixerMultiBoxTouchId = -1; this.mixerMultiBoxStart = null; this.mixerMultiBoxCurrent = null;
+        if (!start || !current || !timeline || !viewport) { this.paintMixerMultiSelectOverlay(); return; }
+        const left = Math.min(start.x, current.x), right = Math.max(start.x, current.x), bottom = Math.min(start.y, current.y), top = Math.max(start.y, current.y);
+        if (right - left < 18 && top - bottom < 18) { this.paintMixerMultiSelectOverlay(); return; }
+        const viewportTransform = viewport.getComponent(UITransform)!;
+        const toggled: Array<{ node: Node; block: MixerBlock }> = [];
+        for (const child of timeline.children.slice()) {
+            if (!child.name.startsWith('MixerBlock')) continue;
+            const transform = child.getComponent(UITransform); if (!transform) continue;
+            const halfW = transform.contentSize.width / 2, halfH = transform.contentSize.height / 2;
+            const corners = [new Vec3(-halfW, -halfH), new Vec3(halfW, -halfH), new Vec3(-halfW, halfH), new Vec3(halfW, halfH)]
+                .map(point => viewportTransform.convertToNodeSpaceAR(transform.convertToWorldSpaceAR(point)));
+            const blockLeft = Math.min(...corners.map(point => point.x)), blockRight = Math.max(...corners.map(point => point.x));
+            const blockBottom = Math.min(...corners.map(point => point.y)), blockTop = Math.max(...corners.map(point => point.y));
+            if (left <= blockRight && right >= blockLeft && bottom <= blockTop && top >= blockBottom) {
+                const id = child.name.slice('MixerBlock'.length);
+                const found = this.findMixerBlock(id); if (found) toggled.push({ node: child, block: found.block });
+            }
+        }
+        for (const item of toggled) this.toggleMixerMultiBlockSelection(item.node, item.block);
+        this.paintMixerMultiSelectOverlay();
+    }
+
+    private paintMixerSourceRow(node: Node, opacity = 1) {
+        const style = (node as any).__mixerSourceRowStyle as { width: number; height: number; color: Color } | undefined;
+        const graphics = node.getComponent(Graphics); if (!style || !graphics) return;
+        const alpha = Math.max(0, Math.min(1, opacity));
+        graphics.clear(); graphics.roundRect(-style.width / 2, -style.height / 2, style.width, style.height, 4);
+        graphics.fillColor = new Color(18, 23, 34, Math.round(255 * alpha)); graphics.fill();
+        graphics.lineWidth = 1.5;
+        graphics.strokeColor = new Color(style.color.r, style.color.g, style.color.b, Math.round(style.color.a * alpha)); graphics.stroke();
     }
 
     private closeAudioPanel() { if (this.audioPanel) { this.stopMixerInertia(); this.stopMixerTimelineReturnAnimation(); this.stopMixerTimelinePlayback(); this.mixerColorPalette?.destroy(); this.mixerColorPalette = null; this.audioPanel.active = false; this.audioPanelOpen = false; } }
 
+    private updateMixerConnections() {
+        const layer = this.mixerConnectionLayer, panel = this.audioPanel, viewport = this.mixerViewport, timeline = this.mixerTimeline;
+        const graphics = layer?.getComponent(Graphics); if (!layer || !graphics) return;
+        graphics.clear();
+        if (!panel || !viewport || !timeline || !this.audioPanelOpen) return;
+        let clipId = this.mixerConnectionSourceId;
+        let blocks: MixerBlock[] = [];
+        if (this.mixerConnectionBlockId) {
+            const found = this.findMixerBlock(this.mixerConnectionBlockId); if (!found) return;
+            clipId = found.block.clipId; blocks = [found.block];
+        } else if (clipId) {
+            for (const track of this.mixerTracks) for (const block of track.blocks) if (block.clipId === clipId) blocks.push(block);
+        }
+        if (!clipId || !blocks.length) return;
+        const clip = this.recordedClips.find(item => item.id === clipId); if (!clip) return;
+        const rowSource = this.clipRows.find(row => row.name === `AudioSource${clipId}`);
+        const dotSource = this.mixerCollapsedSourceDots.find(dot => dot.name === `AudioSourceDot${clipId}`);
+        const source = this.mixerSourcePanelCollapsed && !this.mixerSourcePaneAnimating ? dotSource : rowSource;
+        const sourceTransform = source?.getComponent(UITransform);
+        const layerTransform = layer.getComponent(UITransform), viewportTransform = viewport.getComponent(UITransform);
+        if (!source || !sourceTransform || !layerTransform || !viewportTransform) return;
+        const sourceWorld = sourceTransform.convertToWorldSpaceAR(new Vec3(sourceTransform.contentSize.width / 2, 0, 0));
+        const sourcePoint = layerTransform.convertToNodeSpaceAR(sourceWorld);
+        const viewportSize = viewportTransform.contentSize;
+        const color = this.mixerColor(clip.color ?? 'white'); graphics.lineWidth = 2; graphics.strokeColor = new Color(color.r, color.g, color.b, 230);
+        const visibleEnds: Vec3[] = [];
+        for (const block of blocks) {
+            const blockNode = timeline.getChildByName(`MixerBlock${block.id}`), blockTransform = blockNode?.getComponent(UITransform); if (!blockNode || !blockTransform) continue;
+            const endWorld = blockTransform.convertToWorldSpaceAR(new Vec3(-blockTransform.contentSize.width / 2, 0, 0));
+            const viewportPoint = viewportTransform.convertToNodeSpaceAR(endWorld);
+            if (viewportPoint.x < -viewportSize.width / 2 || viewportPoint.x > viewportSize.width / 2
+                || viewportPoint.y < -viewportSize.height / 2 || viewportPoint.y > viewportSize.height / 2) continue;
+            const endPoint = layerTransform.convertToNodeSpaceAR(endWorld); visibleEnds.push(endPoint);
+            const bend = Math.max(28, Math.abs(endPoint.x - sourcePoint.x) * .38);
+            graphics.moveTo(sourcePoint.x, sourcePoint.y);
+            graphics.bezierCurveTo(sourcePoint.x + bend, sourcePoint.y, endPoint.x - bend, endPoint.y, endPoint.x, endPoint.y);
+        }
+        graphics.stroke();
+        if (!visibleEnds.length) return;
+        graphics.fillColor = new Color(color.r, color.g, color.b, 255); graphics.circle(sourcePoint.x, sourcePoint.y, 3.5); graphics.fill();
+        for (const endPoint of visibleEnds) { graphics.circle(endPoint.x, endPoint.y, 3.5); graphics.fill(); }
+    }
+
     private mixerTimelineContentInset() { return MIXER_CONTENT_INSET + (this.mixerSourcePanelCollapsed ? this.mixerCollapsedContentInsetExtra : 0); }
+
+    private selectCollapsedMixerSource(clip: AudioClipMeta) {
+        const previousBlockId = this.mixerSelectedBlockId;
+        this.mixerConnectionSourceId = clip.id; this.mixerConnectionBlockId = ''; this.mixerSelectedBlockId = '';
+        if (previousBlockId) {
+            const previousBlock = this.mixerTimeline?.getChildByName(`MixerBlock${previousBlockId}`);
+            previousBlock?.getChildByName('BlockSelectionBorder')?.destroy(); previousBlock?.getChildByName('BlockToolbar')?.destroy();
+        }
+        if (this.mixerSelectionBorderTransition) {
+            Tween.stopAllByTarget(this.mixerSelectionBorderTransition); this.mixerSelectionBorderTransition.destroy(); this.mixerSelectionBorderTransition = null;
+        }
+        this.refreshCollapsedSourceDotSelection(true); this.updateMixerConnections();
+    }
+
+    private refreshCollapsedSourceDotSelection(animate = false) {
+        for (const dot of this.mixerCollapsedSourceDots) {
+            const clipId = dot.name.slice('AudioSourceDot'.length);
+            const selected = this.mixerConnectionSourceId === clipId && !this.mixerConnectionBlockId;
+            const targetScale = selected ? 1.18 : 1;
+            if (this.mixerSourcePanelCollapsed && !this.mixerSourcePaneAnimating) {
+                dot.active = true;
+            }
+            Tween.stopAllByTarget(dot);
+            if (animate) tween(dot).to(.2, { scale: new Vec3(targetScale, targetScale, 1) }, { easing: 'sineInOut' }).start();
+            else dot.setScale(targetScale, targetScale, 1);
+        }
+    }
+
+    private animateMixerSourceRows(collapsing: boolean, duration: number) {
+        const view = this.userViewport(false), leftWidth = view.w / 5;
+        const rowWidth = Math.max(1, leftWidth - 18), dotWidth = 18;
+        const leftEdge = -view.w / 2 + 9, dotX = leftEdge + dotWidth / 2;
+        const staticNames = ['AudioMixerTitle', 'AudioClose', 'AudioClearTracks', 'AudioExportWav', 'AudioExportMp3', 'AudioViewFolder', 'AudioUndo'];
+        for (const name of staticNames) {
+            const node = this.mixerSourcePane?.getChildByName(name); if (!node) continue;
+            node.active = true;
+            const opacity = node.getComponent(UIOpacity) ?? node.addComponent(UIOpacity); Tween.stopAllByTarget(opacity);
+            tween(opacity).to(duration * .55, { opacity: collapsing ? 0 : 255 }, { easing: 'sineInOut' }).start();
+            const style = (node as any).__panelButtonStyle as { graphicsOpacity?: number } | undefined;
+            if (style) {
+                const graphicsOpacity = { value: collapsing ? 1 : 0 };
+                style.graphicsOpacity = graphicsOpacity.value; this.redrawPanelButton(node);
+                tween(graphicsOpacity).to(duration * .55, { value: collapsing ? 0 : 1 }, {
+                    easing: 'sineInOut',
+                    onUpdate: () => { style.graphicsOpacity = graphicsOpacity.value; this.redrawPanelButton(node); },
+                }).start();
+            }
+        }
+        const backgroundProgress = { value: collapsing ? leftWidth : this.mixerCollapsedSourceWidth() };
+        tween(backgroundProgress).to(duration, { value: collapsing ? this.mixerCollapsedSourceWidth() : leftWidth }, {
+            easing: 'sineInOut', onUpdate: () => this.paintMixerSourceBackground(backgroundProgress.value),
+        }).start();
+        for (const row of this.clipRows) {
+            const expandedPosition = ((row as any).__expandedPosition as Vec3 | undefined) ?? row.position.clone();
+            const opacity = row.getComponent(UIOpacity) ?? row.addComponent(UIOpacity); row.active = true;
+            Tween.stopAllByTarget(row); Tween.stopAllByTarget(opacity);
+            if (!collapsing) { row.setPosition(dotX, expandedPosition.y, 0); row.setScale(dotWidth / rowWidth, 1, 1); opacity.opacity = 0; }
+            const graphicsOpacity = { value: collapsing ? 1 : 0 };
+            this.paintMixerSourceRow(row, graphicsOpacity.value);
+            tween(graphicsOpacity).to(duration * .72, { value: collapsing ? 0 : 1 }, {
+                easing: 'sineInOut', onUpdate: () => this.paintMixerSourceRow(row, graphicsOpacity.value),
+            }).start();
+            tween(row).to(duration, {
+                position: collapsing ? new Vec3(dotX, expandedPosition.y, 0) : expandedPosition,
+                scale: collapsing ? new Vec3(dotWidth / rowWidth, 1, 1) : Vec3.ONE,
+            }, { easing: 'sineInOut' }).start();
+            tween(opacity).to(duration * .6, { opacity: collapsing ? 0 : 255 }, { easing: 'sineInOut' }).start();
+        }
+        for (const dot of this.mixerCollapsedSourceDots) {
+            dot.active = true;
+            const clipId = dot.name.slice('AudioSourceDot'.length);
+            const selectedScale = this.mixerConnectionSourceId === clipId && !this.mixerConnectionBlockId ? 1.18 : 1;
+            Tween.stopAllByTarget(dot);
+            if (collapsing) dot.setScale(.35, .35, 1);
+            tween(dot).to(duration, { scale: new Vec3(collapsing ? selectedScale : .35, collapsing ? selectedScale : .35, 1) }, { easing: 'sineInOut' }).start();
+        }
+        this.scheduleOnce(() => {
+            for (const name of staticNames) {
+                const node = this.mixerSourcePane?.getChildByName(name); if (node) node.active = !collapsing;
+            }
+            for (const row of this.clipRows) row.active = !collapsing;
+            for (const dot of this.mixerCollapsedSourceDots) dot.active = collapsing;
+            this.refreshCollapsedSourceDotSelection(false); this.updateMixerConnections();
+        }, duration);
+    }
 
     private toggleMixerSourcePane() {
         if (!this.audioPanel || !this.mixerViewport || !this.mixerSourcePane || this.mixerSourcePaneAnimating) return;
         this.stopMixerTimelineReturnAnimation();
-        this.stopMixerInertia(true);
-        const view = this.userViewport(false), leftWidth = view.w / 5, viewport = this.mixerViewport, pane = this.mixerSourcePane;
+        // Stop input inertia without its eager redraw; that redraw briefly resets the
+        // timeline transform and causes a visible jerk before the pane transition.
+        this.stopMixerInertia(false);
+        const view = this.userViewport(false), leftWidth = view.w / 5, collapsedWidth = this.mixerCollapsedSourceWidth(), viewport = this.mixerViewport, pane = this.mixerSourcePane;
         const button = this.audioPanel.getChildByName('AudioPanelTopBorder')?.getChildByName('AudioSourceCollapse');
-        const timeline = this.mixerTimeline, duration = .54, dividerTravel = leftWidth + 8;
+        // Resizing the centered viewport shifts its children by half the width
+        // delta. Compensate only that amount so the first transition frame keeps
+        // the grid and track heads at their pre-click screen coordinates.
+        const timeline = this.mixerTimeline, duration = .82, timelineTravel = (leftWidth - collapsedWidth) / 2 + 4;
         const collapseInset = MIXER_CONTENT_INSET + 12;
         const sourceOpacity = pane.getComponent(UIOpacity);
         if (sourceOpacity) sourceOpacity.opacity = 255;
         this.mixerSourcePaneAnimating = true;
         if (!this.mixerSourcePanelCollapsed) {
-            this.mixerCollapsedContentInsetExtra = Math.min(this.mixerScrollX, dividerTravel);
+            // The expanded viewport owns the newly exposed left side. Keeping the old
+            // pane travel as an inset leaves that area without grid lines after collapse.
+            this.mixerCollapsedContentInsetExtra = 0;
             this.mixerSourcePanelCollapsed = true;
-            viewport.getComponent(UITransform)!.setContentSize(view.w, view.h); viewport.setPosition(0, 0); this.redrawMixerTimeline();
-            const contentTravel = dividerTravel - this.mixerCollapsedContentInsetExtra;
+            const viewportTransform = viewport.getComponent(UITransform)!;
+            const startViewportWidth = viewportTransform.contentSize.width, startViewportX = viewport.position.x;
+            const targetViewportWidth = view.w - collapsedWidth, targetViewportX = collapsedWidth / 2;
+            viewportTransform.setContentSize(targetViewportWidth, view.h); viewport.setPosition(targetViewportX, 0);
+            this.mixerTimelinePendingTransitionPosition = new Vec3(timelineTravel, 0, 0); this.redrawMixerTimeline(); this.mixerTimelinePendingTransitionPosition = null;
+            viewportTransform.setContentSize(startViewportWidth, view.h); viewport.setPosition(startViewportX, 0, 0);
+            this.animateMixerSourceRows(true, duration);
+            const viewportProgress = { value: 0 };
+            tween(viewportProgress).to(duration, { value: 1 }, {
+                easing: 'sineInOut',
+                onUpdate: () => {
+                    const t = viewportProgress.value;
+                    viewportTransform.setContentSize(startViewportWidth + (targetViewportWidth - startViewportWidth) * t, view.h);
+                    viewport.setPosition(startViewportX + (targetViewportX - startViewportX) * t, 0, 0);
+                    this.updateMixerPlayheadVisual();
+                    this.updateMixerConnections();
+                },
+            }).start();
+            // Rebuild at the final width first, then move the complete timeline from its
+            // old screen position. This keeps the grid and track heads moving together.
             if (timeline) {
-                timeline.setPosition(contentTravel, 0, 0);
-                for (const head of timeline.children.filter(child => child.name.startsWith('TrackHead'))) { const target = head.position.clone(); head.setPosition(target.x + this.mixerCollapsedContentInsetExtra, target.y, 0); tween(head).to(duration, { position: target }, { easing: 'quadInOut' }).start(); }
-                tween(timeline).to(duration, { position: Vec3.ZERO }, { easing: 'quadInOut' }).call(() => { timeline.setPosition(Vec3.ZERO); this.mixerSourcePaneAnimating = false; this.redrawMixerTimeline(); }).start();
+                Tween.stopAllByTarget(timeline); timeline.setPosition(timelineTravel, 0, 0); timeline.setScale(Vec3.ONE);
+                tween(timeline).to(duration, { position: Vec3.ZERO }, { easing: 'sineInOut', onUpdate: () => this.updateMixerPlayheadVisual() }).start();
             }
-            tween(pane).to(duration, { position: new Vec3(-leftWidth, 0, 0) }, { easing: 'quadInOut' }).start();
-            if (button) tween(button).to(duration, { position: new Vec3(-view.w / 2 + collapseInset, -view.h / 2 + 42, 0) }, { easing: 'quadInOut' }).start();
+            if (button) tween(button).to(duration, {
+                position: new Vec3(-view.w / 2 + collapsedWidth / 2, -view.h / 2 + collapsedWidth / 2 + 2, 0),
+            }, { easing: 'sineInOut' }).start();
+            for (const child of button?.children ?? []) tween(child).to(duration, {
+                scale: new Vec3(MIXER_COLLAPSED_RESTORE_VISUAL_SCALE, MIXER_COLLAPSED_RESTORE_VISUAL_SCALE, 1),
+            }, { easing: 'sineInOut' }).start();
             const arrow = button?.getChildByName('Arrow')?.getComponent(Label); if (arrow) arrow.string = '→';
-            if (!timeline) this.scheduleOnce(() => { this.mixerSourcePaneAnimating = false; this.redrawMixerTimeline(); }, duration);
+            this.scheduleOnce(() => {
+                viewportTransform.setContentSize(targetViewportWidth, view.h); viewport.setPosition(targetViewportX, 0, 0); this.mixerSourcePaneAnimating = false;
+                this.rebuildAudioRows(); this.redrawMixerTimeline(); this.setMixerMultiSelectChrome(this.mixerMultiSelectMode); this.updateMixerConnections();
+            }, duration);
         } else {
-            const contentTravel = dividerTravel - this.mixerCollapsedContentInsetExtra;
+            // Apply the expanded viewport geometry before the pane starts moving so the
+            // timeline is redrawn into the correct area for the entire transition.
+            this.setMixerMultiSelectMode(false, false);
+            const multiSelect = this.audioPanel.getChildByName('AudioPanelTopBorder')?.getChildByName('AudioMultiSelect'); if (multiSelect) multiSelect.active = false;
+            const collapsedUndo = this.audioPanel.getChildByName('AudioPanelTopBorder')?.getChildByName('AudioCollapsedUndo'); if (collapsedUndo) collapsedUndo.active = false;
+            this.mixerSourcePanelCollapsed = false; this.mixerCollapsedContentInsetExtra = 0;
+            const viewportTransform = viewport.getComponent(UITransform)!;
+            const startViewportWidth = viewportTransform.contentSize.width, startViewportX = viewport.position.x;
+            const targetViewportWidth = view.w - leftWidth - 8, targetViewportX = -view.w / 2 + leftWidth + (view.w - leftWidth) / 2;
+            viewportTransform.setContentSize(targetViewportWidth, view.h); viewport.setPosition(targetViewportX, 0);
+            if (timeline) Tween.stopAllByTarget(timeline);
+            this.mixerTimelinePendingTransitionPosition = new Vec3(-timelineTravel, 0, 0); this.redrawMixerTimeline(); this.mixerTimelinePendingTransitionPosition = null;
+            viewportTransform.setContentSize(startViewportWidth, view.h); viewport.setPosition(startViewportX, 0, 0);
+            this.animateMixerSourceRows(false, duration);
+            const viewportProgress = { value: 0 };
+            tween(viewportProgress).to(duration, { value: 1 }, {
+                easing: 'sineInOut',
+                onUpdate: () => {
+                    const t = viewportProgress.value;
+                    viewportTransform.setContentSize(startViewportWidth + (targetViewportWidth - startViewportWidth) * t, view.h);
+                    viewport.setPosition(startViewportX + (targetViewportX - startViewportX) * t, 0, 0);
+                    this.updateMixerPlayheadVisual();
+                    this.updateMixerConnections();
+                },
+            }).start();
             if (timeline) {
-                for (const head of timeline.children.filter(child => child.name.startsWith('TrackHead'))) tween(head).to(duration, { position: new Vec3(head.position.x + this.mixerCollapsedContentInsetExtra, head.position.y, 0) }, { easing: 'quadInOut' }).start();
-                tween(timeline).to(duration, { position: new Vec3(contentTravel, 0, 0) }, { easing: 'quadInOut' }).call(() => {
-                    this.mixerSourcePanelCollapsed = false; this.mixerCollapsedContentInsetExtra = 0;
-                    viewport.getComponent(UITransform)!.setContentSize(view.w - leftWidth - 8, view.h);
-                    viewport.setPosition(-view.w / 2 + leftWidth + (view.w - leftWidth) / 2, 0);
-                    timeline.setPosition(Vec3.ZERO); this.mixerSourcePaneAnimating = false; this.redrawMixerTimeline();
-                }).start();
+                timeline.setPosition(-timelineTravel, 0, 0); timeline.setScale(Vec3.ONE);
+                tween(timeline).to(duration, { position: Vec3.ZERO }, { easing: 'sineInOut', onUpdate: () => this.updateMixerPlayheadVisual() }).start();
             }
-            pane.setPosition(-leftWidth, 0, 0); if (sourceOpacity) sourceOpacity.opacity = 255;
-            tween(pane).to(duration, { position: Vec3.ZERO }, { easing: 'quadInOut' }).start();
-            if (button) tween(button).to(duration, { position: new Vec3(-view.w / 2 + leftWidth + collapseInset, -view.h / 2 + 42, 0) }, { easing: 'quadInOut' }).start();
+            pane.setPosition(Vec3.ZERO); if (sourceOpacity) sourceOpacity.opacity = 255;
+            if (button) tween(button).to(duration, {
+                position: new Vec3(-view.w / 2 + leftWidth + collapseInset, -view.h / 2 + 42, 0),
+            }, { easing: 'sineInOut' }).start();
+            for (const child of button?.children ?? []) tween(child).to(duration, { scale: Vec3.ONE }, { easing: 'sineInOut' }).start();
             const arrow = button?.getChildByName('Arrow')?.getComponent(Label); if (arrow) arrow.string = '←';
-            if (!timeline) this.scheduleOnce(() => { this.mixerSourcePanelCollapsed = false; this.mixerCollapsedContentInsetExtra = 0; viewport.getComponent(UITransform)!.setContentSize(view.w - leftWidth - 8, view.h); viewport.setPosition(-view.w / 2 + leftWidth + (view.w - leftWidth) / 2, 0); this.mixerSourcePaneAnimating = false; this.redrawMixerTimeline(); }, duration);
+            this.scheduleOnce(() => {
+                viewportTransform.setContentSize(targetViewportWidth, view.h); viewport.setPosition(targetViewportX, 0, 0); this.mixerSourcePaneAnimating = false;
+                this.rebuildAudioRows(); this.redrawMixerTimeline(); this.setMixerMultiSelectChrome(this.mixerMultiSelectMode); this.updateMixerConnections();
+            }, duration);
         }
     }
 
@@ -3031,7 +3464,12 @@ export class GameManager extends Component {
             NativeBridge.stopAudioFiles();
             this.pushMixerUndo();
             this.recordedClips = [];
-            this.mixerTracks = [];
+            // Clear block contents while keeping the track rows and mute/solo controls.
+            this.mixerTracks = this.mixerTracks.length
+                ? this.mixerTracks.map(track => ({ ...track, blocks: [] }))
+                : Array.from({ length: 13 }, (_, index) => ({ id: `track_${Date.now()}_${index}`, muted: false, solo: false, blocks: [] }));
+            this.mixerSelectedBlockId = '';
+            this.mixerConnectionSourceId = ''; this.mixerConnectionBlockId = '';
             this.clipsPlaying = false; this.activePlaybackLoop = false;
             this.saveAudioClips(); this.saveMixerTracks(); this.rebuildAudioRows(); this.updateConsoleGlyphs(); this.redrawMixerTimeline();
             this.setEdgeMode(this.isRecording ? 'record' : 'idle');
@@ -3062,11 +3500,14 @@ export class GameManager extends Component {
 
     private rebuildAudioRows() {
         if (!this.audioPanel) return;
+        const sourceTransitionDuration = .24;
         const previousPositions = new Map<string, Vec3>();
         const previousHeights = new Map<string, number>();
         for (const row of this.clipRows) { previousPositions.set(row.name, row.position.clone()); previousHeights.set(row.name, row.getComponent(UITransform)?.contentSize.height ?? 48); }
         for (const row of this.clipRows) row.destroy();
         this.clipRows = [];
+        for (const dot of this.mixerCollapsedSourceDots) dot.destroy();
+        this.mixerCollapsedSourceDots = [];
         const panel = this.mixerSourcePane ?? this.audioPanel;
         const view = this.userViewport(false); const rowW = view.w - 40;
         const leftWidth = view.w / 5;
@@ -3076,10 +3517,14 @@ export class GameManager extends Component {
             const rowHeight = expanded ? 178 : 48;
             const row = new Node(`AudioSource${clip.id}`); row.layer = Layers.Enum.UI_2D;
             row.addComponent(UITransform).setContentSize(leftWidth - 18, rowHeight);
+            const rowOpacity = row.addComponent(UIOpacity);
             const targetPosition = new Vec3(-view.w / 2 + leftWidth / 2, sourceY - rowHeight / 2 + 24, 0);
+            (row as any).__expandedPosition = targetPosition.clone();
             const wasExpanded = (previousHeights.get(row.name) ?? 48) > 100;
             row.setPosition(wasExpanded === expanded ? (previousPositions.get(row.name) ?? targetPosition) : targetPosition);
-            const g = row.addComponent(Graphics); g.roundRect(-(leftWidth - 18) / 2, -rowHeight / 2, leftWidth - 18, rowHeight, 4); g.fillColor = new Color(18, 23, 34, 255); g.fill(); g.lineWidth = 1.5; g.strokeColor = this.mixerColor(clip.color ?? 'white'); g.stroke();
+            row.addComponent(Graphics);
+            (row as any).__mixerSourceRowStyle = { width: leftWidth - 18, height: rowHeight, color: this.mixerColor(clip.color ?? 'white') };
+            this.paintMixerSourceRow(row);
             const enabled = this.makePanelButton(row, clip.enabled !== false ? '●' : '○', -(leftWidth - 18) / 2 + 22, rowHeight / 2 - 24, 34, 34, () => { clip.enabled = clip.enabled === false; this.saveAudioClips(); this.queueMixerRedraw(); this.rebuildAudioRows(); }, clip.enabled !== false ? new Color(40, 150, 80, 255) : new Color(55, 65, 80, 255));
             const enabledLabel = enabled.getChildByName('Text')?.getComponent(Label); if (enabledLabel) enabledLabel.fontSize = 20;
             const label = this.makeLabel('SourceName', clip.name, 15, 22, new Color(240, 244, 250, 255), leftWidth - 155, 24); label.setPosition(-48, rowHeight / 2 - 16); row.addChild(label);
@@ -3096,15 +3541,33 @@ export class GameManager extends Component {
                 this.makeSourceColorButton(content, clip, -115, -rowHeight / 2 + 28);
                 this.makePanelButton(content, t('导出', 'Export'), -35, -rowHeight / 2 + 28, 82, 30, () => this.exportAudioClip(clip), new Color(42, 72, 115, 255));
                 this.makePanelButton(content, t('删除', 'Delete'), 65, -rowHeight / 2 + 28, 82, 30, () => this.deleteAudioSource(clip), new Color(110, 45, 55, 255));
-                if (!wasExpanded) { content.setPosition(0, 18); contentOpacity.opacity = 0; tween(content).to(.32, { position: Vec3.ZERO }, { easing: 'quadOut' }).start(); tween(contentOpacity).to(.2, { opacity: 255 }, { easing: 'quadOut' }).start(); }
+                if (!wasExpanded) { content.setPosition(0, 14); contentOpacity.opacity = 0; tween(content).to(sourceTransitionDuration, { position: Vec3.ZERO }, { easing: 'quadOut' }).start(); tween(contentOpacity).to(sourceTransitionDuration, { opacity: 255 }, { easing: 'quadOut' }).start(); }
             }
             this.attachMixerSourceDrag(row, clip);
             panel.addChild(row); this.clipRows.push(row);
+            const dot = new Node(`AudioSourceDot${clip.id}`); dot.layer = Layers.Enum.UI_2D;
+            dot.addComponent(UITransform).setContentSize(36, 36);
+            const dotColor = this.mixerColor(clip.color ?? 'white');
+            dot.addChild(this.makeLabel('DotFill', '●', 25, 32, dotColor, 36, 36));
+            dot.setPosition(-view.w / 2 + 18, targetPosition.y, 0);
+            dot.addComponent(Button).transition = Button.Transition.NONE;
+            dot.on(Button.EventType.CLICK, () => this.selectCollapsedMixerSource(clip), this);
+            // The top-border container is never clipped by the source background
+            // or timeline viewport. Connections remain beneath these endpoint dots.
+            (this.audioPanel?.getChildByName('AudioPanelTopBorder') ?? this.mixerConnectionLayer ?? panel).addChild(dot); this.mixerCollapsedSourceDots.push(dot);
+            if (this.mixerSourcePanelCollapsed && !this.mixerSourcePaneAnimating) {
+                rowOpacity.opacity = 0; row.active = false; dot.active = true;
+            } else {
+                rowOpacity.opacity = 255; dot.active = false;
+            }
             const previous = previousPositions.get(row.name);
-            if (previous && wasExpanded === expanded && !previous.equals(targetPosition)) tween(row).to(.34, { position: targetPosition }, { easing: 'quadOut' }).start();
+            if (previous && wasExpanded === expanded && !previous.equals(targetPosition)) tween(row).to(sourceTransitionDuration, { position: targetPosition }, { easing: 'quadInOut' }).start();
             else row.setPosition(targetPosition);
             sourceY -= rowHeight + 6;
         });
+        this.refreshCollapsedSourceDotSelection(false); this.setMixerMultiSelectChrome(this.mixerMultiSelectMode);
+        this.updateMixerConnections();
+        this.scheduleOnce(() => this.updateMixerConnections(), sourceTransitionDuration + .02);
         return;
         this.recordedClips.slice(0, 13).forEach((clip, i) => {
             const row = new Node(`ClipRow${clip.id}`); row.layer = Layers.Enum.UI_2D; row.addComponent(UITransform).setContentSize(rowW, 48); row.setPosition(0, view.h / 2 - 92 - i * 58);
@@ -3162,6 +3625,8 @@ export class GameManager extends Component {
 
     private deleteAudioSource(clip: AudioClipMeta) {
         this.pushMixerUndo();
+        const connectedBlock = this.mixerConnectionBlockId ? this.findMixerBlock(this.mixerConnectionBlockId)?.block : null;
+        if (this.mixerConnectionSourceId === clip.id || connectedBlock?.clipId === clip.id) { this.mixerConnectionSourceId = ''; this.mixerConnectionBlockId = ''; }
         this.recordedClips = this.recordedClips.filter(item => item.id !== clip.id);
         this.mixerTracks = this.mixerTracks.map(track => ({ ...track, blocks: track.blocks.filter(block => block.clipId !== clip.id) }));
         this.mixerExpandedSourceId = '';
@@ -3205,8 +3670,13 @@ export class GameManager extends Component {
             cancelRenameHold();
             if (dragging) { const target = this.mixerLocation(event); if (target) this.addMixerBlock(clip, target.track, target.beat); this.mixerDragGhost?.destroy(); this.mixerDragGhost = null; }
             else if (!moved && !renameTriggered) {
-                if (this.mixerExpandedSourceId === clip.id) { const content = row.getChildByName('SourceExpandedContent'); if (content) { const opacity = content.getComponent(UIOpacity); Tween.stopAllByTarget(content); if (opacity) { Tween.stopAllByTarget(opacity); tween(opacity).to(.12, { opacity: 0 }, { easing: 'quadIn' }).start(); } tween(content).to(.16, { position: new Vec3(0, 18, 0) }, { easing: 'quadIn' }).call(() => { this.mixerExpandedSourceId = ''; this.rebuildAudioRows(); }).start(); } else { this.mixerExpandedSourceId = ''; this.rebuildAudioRows(); } }
+                const previousBlockId = this.mixerSelectedBlockId;
+                this.mixerConnectionSourceId = clip.id; this.mixerConnectionBlockId = ''; this.mixerSelectedBlockId = '';
+                if (previousBlockId) { const previousBlock = this.mixerTimeline?.getChildByName(`MixerBlock${previousBlockId}`); previousBlock?.getChildByName('BlockSelectionBorder')?.destroy(); previousBlock?.getChildByName('BlockToolbar')?.destroy(); }
+                if (this.mixerSelectionBorderTransition) { Tween.stopAllByTarget(this.mixerSelectionBorderTransition); this.mixerSelectionBorderTransition.destroy(); this.mixerSelectionBorderTransition = null; }
+                if (this.mixerExpandedSourceId === clip.id) { const content = row.getChildByName('SourceExpandedContent'); if (content) { const opacity = content.getComponent(UIOpacity); Tween.stopAllByTarget(content); if (opacity) { Tween.stopAllByTarget(opacity); tween(opacity).to(.24, { opacity: 0 }, { easing: 'quadInOut' }).start(); } tween(content).to(.24, { position: new Vec3(0, 14, 0) }, { easing: 'quadInOut' }).call(() => { this.mixerExpandedSourceId = ''; this.rebuildAudioRows(); }).start(); } else { this.mixerExpandedSourceId = ''; this.rebuildAudioRows(); } }
                 else { this.mixerExpandedSourceId = clip.id; this.rebuildAudioRows(); }
+                this.updateMixerConnections();
             }
             dragging = false; moved = false; renameTriggered = false;
             event.propagationStopped = true;
@@ -3241,10 +3711,28 @@ export class GameManager extends Component {
     }
 
     private clipBeats(clip: AudioClipMeta, block?: MixerBlock): number {
-        const start = block?.trimStart ?? clip.trimStart;
-        const blockEnd = block?.trimEnd ?? clip.trimEnd;
-        const seconds = Math.max(.05, (blockEnd > start ? blockEnd : clip.duration) - start);
+        const seconds = block?.trimRanges?.length
+            ? block.trimRanges.reduce((sum, range) => sum + Math.max(0, range.end - range.start), 0)
+            : (() => {
+                const start = block?.trimStart ?? clip.trimStart;
+                const blockEnd = block?.trimEnd ?? clip.trimEnd;
+                return Math.max(.05, (blockEnd > start ? blockEnd : clip.duration) - start);
+            })();
         return Math.max(.1, seconds * this.metronomeBpm / 60 / Math.max(.25, Math.min(4, block?.speed ?? 1)));
+    }
+
+    private mixerBlockTrimRanges(clip: AudioClipMeta, block: MixerBlock): Array<{ start: number; end: number }> {
+        if (block.trimRanges?.length) return block.trimRanges.filter(range => range.end > range.start + .001).map(range => ({ start: range.start, end: range.end }));
+        const start = block.trimStart ?? clip.trimStart;
+        const blockEnd = block.trimEnd ?? clip.trimEnd;
+        const end = blockEnd > start ? blockEnd : clip.duration;
+        return [{ start, end }];
+    }
+
+    private setMixerBlockTrimRanges(block: MixerBlock, ranges: Array<{ start: number; end: number }>) {
+        const normalized = ranges.filter(range => range.end > range.start + .001).map(range => ({ start: range.start, end: range.end }));
+        block.trimRanges = normalized;
+        if (normalized.length) { block.trimStart = normalized[0].start; block.trimEnd = normalized[normalized.length - 1].end; }
     }
 
     private ensureMixerTrack(index: number): MixerTrack | null {
@@ -3290,6 +3778,7 @@ export class GameManager extends Component {
 
     private queueMixerRedraw() {
         if (this.mixerRedrawQueued) return;
+        this.mixerTimelineVisualDirty = true;
         this.mixerRedrawQueued = true;
         this.scheduleOnce(() => { this.mixerRedrawQueued = false; this.redrawMixerTimeline(); }, 0);
     }
@@ -3310,63 +3799,185 @@ export class GameManager extends Component {
         return position === 0 ? 2 : (compoundSecondary || simpleSecondary ? 1 : 0);
     }
 
+    private mixerTimelineSignature() {
+        return `${JSON.stringify(this.mixerTracks)}|${JSON.stringify(this.recordedClips.map(clip => ({ id: clip.id, name: clip.name, duration: clip.duration, trimStart: clip.trimStart, trimEnd: clip.trimEnd, volume: clip.volume, enabled: clip.enabled, color: clip.color })))}`;
+    }
+
     private redrawMixerTimeline() {
         const timeline = this.mixerTimeline, viewport = this.mixerViewport;
         if (!timeline || !viewport || !this.audioPanelOpen || this.mixerDraggingBlockId) return;
+        this.ensureMixerTrack(12);
         this.mixerDeferredRedrawGeneration++;
-        if (this.mixerSelectionBorderTransition) Tween.stopAllByTarget(this.mixerSelectionBorderTransition);
-        this.mixerSelectionBorderTransition = null;
-        const staleChildren = timeline.children.slice();
-        for (const child of staleChildren) { child.active = false; child.removeFromParent(); }
-        for (const child of staleChildren) child.destroy();
-        timeline.setPosition(0, 0, 0); timeline.setScale(Vec3.ONE);
-        this.mixerRenderedScrollX = this.mixerScrollX; this.mixerRenderedScrollY = this.mixerScrollY; this.mixerRenderedBeatWidth = this.mixerBeatWidth;
-        this.mixerGestureVisualBasePosition.set(0, 0, 0); this.mixerGestureVisualBaseScaleX = 1;
-        const size = viewport.getComponent(UITransform)!.contentSize; const w = size.width, h = size.height, contentInset = this.mixerTimelineContentInset();
-        const grid = new Node('TimelineGrid'); grid.layer = Layers.Enum.UI_2D; grid.addComponent(UITransform).setContentSize(w, h); const gg = grid.addComponent(Graphics);
-        grid.on(Node.EventType.TOUCH_END, (event: EventTouch) => {
-            if (!this.mixerGestureMoved) {
-                const p = event.getUILocation(); const local = grid.getComponent(UITransform)!.convertToNodeSpaceAR(new Vec3(p.x, p.y, 0));
-                if (local.y >= h / 2 - 42) { if (this.mixerPlaying) this.stopMixerTimelinePlayback(true); this.setMixerPlayheadFromLocalX(local.x, w, true); }
-                else this.deselectMixerBlockImmediately();
-            }
-        }, this);
-        const preloadStartBeat = Math.max(0, (this.mixerScrollX - contentInset - w * .5) / this.mixerBeatWidth), preloadEndBeat = Math.max(preloadStartBeat, (this.mixerScrollX - contentInset + w * 1.5) / this.mixerBeatWidth);
-        const firstBeat = Math.max(0, Math.floor(preloadStartBeat)); const lastBeat = Math.ceil(preloadEndBeat) + 1;
-        gg.lineWidth = 1; gg.strokeColor = new Color(255, 255, 255, 84);
-        for (let row = 0; row <= 13; row++) { const y = h / 2 - 34 - row * this.mixerRowHeight + this.mixerScrollY; gg.moveTo(-w / 2 - w * .5, y); gg.lineTo(w / 2 + w * .5, y); } gg.stroke();
-        const verticalGroups = [1, 1.5, 2].map((lineWidth, index) => { const layer = new Node(`BeatLines${index}`); layer.layer = Layers.Enum.UI_2D; layer.addComponent(UITransform).setContentSize(w * 2, h); const graphics = layer.addComponent(Graphics); graphics.lineWidth = lineWidth; graphics.strokeColor = new Color(255, 255, 255, 84); grid.addChild(layer); return graphics; });
-        const ruler = new Node('TimelineRuler'); ruler.layer = Layers.Enum.UI_2D; ruler.addComponent(UITransform).setContentSize(w * 2, 34); ruler.setPosition(0, h / 2 - 17);
-        const rulerG = ruler.addComponent(Graphics); rulerG.rect(-w, -17, w * 2, 34); rulerG.fillColor = new Color(0, 0, 0, 255); rulerG.fill(); rulerG.lineWidth = 1; rulerG.strokeColor = new Color(105, 115, 135, 220); rulerG.moveTo(-w, -17); rulerG.lineTo(w, -17); rulerG.stroke();
-        for (let beat = firstBeat; beat <= lastBeat; beat++) {
-            const x = -w / 2 + contentInset + beat * this.mixerBeatWidth - this.mixerScrollX, accent = this.mixerBeatAccent(beat);
-            verticalGroups[accent].moveTo(x, -h / 2); verticalGroups[accent].lineTo(x, h / 2 - 34);
-            const fontSize = accent === 2 ? 17 : (accent === 1 ? 11 : 6), lineHeight = accent === 2 ? 22 : (accent === 1 ? 16 : 10);
-            const label = this.makeLabel(`Beat${beat}`, String(beat + 1), fontSize, lineHeight, new Color(210, 215, 225, 220), 40, 24); label.setPosition(x - 1, 0); ruler.addChild(label);
+        if (this.mixerSelectionBorderTransition) {
+            Tween.stopAllByTarget(this.mixerSelectionBorderTransition);
+            this.mixerSelectionBorderTransition.destroy();
         }
-        for (const graphics of verticalGroups) graphics.stroke(); timeline.addChild(grid);
-        this.mixerTracks.forEach((track, trackIndex) => {
+        this.mixerSelectionBorderTransition = null;
+        const size = viewport.getComponent(UITransform)!.contentSize; const w = size.width, h = size.height, contentInset = this.mixerTimelineContentInset();
+        this.mixerTimelineViewportHeight = h;
+        const signature = this.mixerTimelineSignature();
+        const viewportWidthChanged = Math.abs(this.mixerTimelineCacheViewportWidth - w) > .001;
+        const rebuild = this.mixerTimelineVisualDirty || !this.mixerTimelineCacheReady || signature !== this.mixerTimelineCacheSignature
+            || Math.abs(this.mixerTimelineCacheBeatWidth - this.mixerBeatWidth) > .001
+            || Math.abs(this.mixerTimelineCacheInset - contentInset) > .001;
+        const preservedTimelinePosition = this.mixerTimelinePendingTransitionPosition
+            ?? (this.mixerSourcePaneAnimating ? timeline.position.clone() : Vec3.ZERO);
+        timeline.setPosition(preservedTimelinePosition); timeline.setScale(Vec3.ONE);
+        if (rebuild) {
+            // Detached nodes stay retained so scrolling never destroys already loaded content.
+            const staleChildren = timeline.children.slice();
+            for (const child of staleChildren) {
+                // Keep the playhead in the timeline so its layer and transform stay
+                // identical to the grid during scroll and pane transitions.
+                if (child.name === 'MixerPlayhead') { child.active = true; continue; }
+                if (child.name === 'MixerMultiSelectOverlay') { child.destroy(); this.mixerMultiSelectOverlay = null; continue; }
+                child.active = false; child.removeFromParent(); this.mixerRetainedTimelineNodes.push(child);
+            }
+            this.mixerTimelineLoadedThroughBeat = 0;
+            this.mixerTimelineCacheReady = true;
+            this.mixerTimelineCacheSignature = signature;
+            this.mixerTimelineCacheBeatWidth = this.mixerBeatWidth;
+            this.mixerTimelineCacheInset = contentInset;
+            this.mixerTimelineCacheViewportWidth = w;
+            this.mixerTimelineVisualDirty = false;
+            this.mixerRenderedScrollX = this.mixerScrollX;
+            this.mixerRenderedScrollY = this.mixerScrollY;
+            this.mixerRenderedBeatWidth = this.mixerBeatWidth;
+            this.mixerGestureVisualBasePosition.set(0, 0, 0); this.mixerGestureVisualBaseScaleX = 1;
+            const gridHeight = Math.max(h, 34 + Math.max(1, this.mixerTracks.length) * this.mixerRowHeight);
+            const grid = new Node('TimelineGrid'); grid.layer = Layers.Enum.UI_2D; grid.addComponent(UITransform).setContentSize(w, gridHeight); const gg = grid.addComponent(Graphics);
+            grid.on(Node.EventType.TOUCH_END, (event: EventTouch) => {
+                if (this.mixerMultiSelectMode) return;
+                if (!this.mixerGestureMoved) {
+                    const p = event.getUILocation();
+                    const viewportTransform = this.mixerViewport?.getComponent(UITransform);
+                    const local = viewportTransform?.convertToNodeSpaceAR(new Vec3(p.x, p.y, 0));
+                    if (local) {
+                        const currentWidth = viewportTransform?.contentSize.width ?? w, currentHeight = viewportTransform?.contentSize.height ?? h;
+                        if (local.y >= currentHeight / 2 - 42) { if (this.mixerPlaying) this.stopMixerTimelinePlayback(true); this.setMixerPlayheadFromLocalX(local.x, currentWidth, true); }
+                        else this.deselectMixerBlockImmediately();
+                    }
+                }
+            }, this);
+            const verticalGroups = [1, 1.5, 3].map((lineWidth, index) => { const layer = new Node(`BeatLines${index}`); layer.layer = Layers.Enum.UI_2D; layer.addComponent(UITransform).setContentSize(w * 2, gridHeight); const graphics = layer.addComponent(Graphics); graphics.lineWidth = lineWidth; graphics.strokeColor = new Color(255, 255, 255, 84); grid.addChild(layer); return graphics; });
+            grid.setPosition(-this.mixerScrollX, this.mixerScrollY, 0);
+            const ruler = new Node('TimelineRuler'); ruler.layer = Layers.Enum.UI_2D; ruler.addComponent(UITransform).setContentSize(w * 2, 34); ruler.setPosition(-this.mixerScrollX, h / 2 - 17);
+            const rulerG = ruler.addComponent(Graphics); rulerG.rect(-w, -17, w * 2, 34); rulerG.fillColor = new Color(0, 0, 0, 255); rulerG.fill(); rulerG.lineWidth = 1; rulerG.strokeColor = new Color(105, 115, 135, 220); rulerG.moveTo(-w, -17); rulerG.lineTo(w, -17); rulerG.stroke();
+            const rulerLabels = new Node('TimelineRulerLabels'); rulerLabels.layer = Layers.Enum.UI_2D; rulerLabels.addComponent(UITransform).setContentSize(w * 2, 34); rulerLabels.setPosition(-this.mixerScrollX, h / 2 - 17);
+            timeline.addChild(grid);
+            this.mixerTracks.forEach((track, trackIndex) => {
+                const y = h / 2 - 34 - trackIndex * this.mixerRowHeight - this.mixerRowHeight / 2 + this.mixerScrollY;
+                const head = new Node(`TrackHead${trackIndex}`); head.layer = Layers.Enum.UI_2D; head.addComponent(UITransform).setContentSize(MIXER_TRACK_HEAD_WIDTH, this.mixerRowHeight - 4); head.setPosition(-w / 2 + MIXER_TRACK_HEAD_WIDTH / 2 + 2, y); head.addComponent(Graphics); this.paintMixerTrackHead(head, track);
+                const number = this.makeLabel('TrackNumber', `${trackIndex + 1}${track.solo ? ' S' : ''}`, 11, 16, new Color(255, 255, 255, 255), 32, 20); head.addChild(number); this.attachTrackMuteGesture(head, track, trackIndex); timeline.addChild(head);
+            });
+            timeline.addChild(ruler);
+            timeline.addChild(rulerLabels);
+            this.createMixerPlayhead(timeline, w, h, ruler);
+            ruler.on(Node.EventType.TOUCH_END, (event: EventTouch) => { if (this.mixerMultiSelectMode) return; if (!this.mixerGestureMoved) { const p = event.getUILocation(); const viewportTransform = this.mixerViewport?.getComponent(UITransform); const local = viewportTransform?.convertToNodeSpaceAR(new Vec3(p.x, p.y, 0)); if (local) { if (this.mixerPlaying) this.stopMixerTimelinePlayback(true); this.setMixerPlayheadFromLocalX(local.x, viewportTransform?.contentSize.width ?? w, true); } } event.propagationStopped = true; }, this);
+        } else {
+            if (viewportWidthChanged) {
+                // Reuse the existing draw nodes during pane animation. Every timeline
+                // element is anchored from the viewport center, so a width change only
+                // requires this single shared horizontal offset.
+                const widthOffset = (this.mixerTimelineCacheViewportWidth - w) / 2;
+                if (Math.abs(widthOffset) > .001) {
+                    for (const child of timeline.children) child.setPosition(child.position.x + widthOffset, child.position.y, 0);
+                }
+                this.mixerTimelineCacheViewportWidth = w;
+            }
+            const dx = this.mixerRenderedScrollX - this.mixerScrollX, dy = this.mixerScrollY - this.mixerRenderedScrollY;
+            if (Math.abs(dx) > .001 || Math.abs(dy) > .001) {
+                for (const child of timeline.children) {
+                    if (child.name.startsWith('TrackHead')) continue;
+                    if (child.name === 'TimelineGrid') child.setPosition(child.position.x + dx, child.position.y + dy, 0);
+                    else if (child.name === 'TimelineRuler' || child.name === 'TimelineRulerLabels') child.setPosition(child.position.x + dx, child.position.y, 0);
+                    else if (child.name.startsWith('MixerBlock')) child.setPosition(child.position.x + dx, child.position.y + dy, 0);
+                }
+            }
+            this.mixerRenderedScrollX = this.mixerScrollX;
+            this.mixerRenderedScrollY = this.mixerScrollY;
+            if (!this.mixerSelectedBlockId) {
+                for (const child of timeline.children) {
+                    child.getChildByName('BlockSelectionBorder')?.destroy();
+                    child.getChildByName('BlockToolbar')?.destroy();
+                }
+            }
+        }
+        const desiredEndBeat = Math.max(200, (this.mixerScrollX - contentInset + w * 1.5) / this.mixerBeatWidth);
+        if (desiredEndBeat > this.mixerTimelineLoadedThroughBeat) {
+            const appendTo = this.mixerTimelineLoadedThroughBeat <= 0 ? 200 : Math.ceil(desiredEndBeat / 100) * 100;
+            this.appendMixerTimelineRange(this.mixerTimelineLoadedThroughBeat, appendTo, w, h, contentInset);
+            this.mixerTimelineLoadedThroughBeat = appendTo;
+        }
+        for (let trackIndex = 0; trackIndex < this.mixerTracks.length; trackIndex++) {
+            const head = timeline.getChildByName(`TrackHead${trackIndex}`); if (!head) continue;
             const y = h / 2 - 34 - trackIndex * this.mixerRowHeight - this.mixerRowHeight / 2 + this.mixerScrollY;
-            if (y < -h / 2 - this.mixerRowHeight * 2 || y > h / 2 + this.mixerRowHeight * 2) return;
-            const head = new Node(`TrackHead${trackIndex}`); head.layer = Layers.Enum.UI_2D; head.addComponent(UITransform).setContentSize(MIXER_TRACK_HEAD_WIDTH, this.mixerRowHeight - 4); head.setPosition(-w / 2 + MIXER_TRACK_HEAD_WIDTH / 2 + 2, y); head.addComponent(Graphics); this.paintMixerTrackHead(head, track);
-            for (const block of track.blocks) { const clip = this.recordedClips.find(item => item.id === block.clipId); if (!clip) continue; const endBeat = block.startBeat + this.clipBeats(clip, block); if (endBeat >= preloadStartBeat && block.startBeat <= preloadEndBeat) this.drawMixerBlock(timeline, block, trackIndex, w, h, y); }
-            const number = this.makeLabel('TrackNumber', `${trackIndex + 1}${track.solo ? ' S' : ''}`, 11, 16, new Color(255, 255, 255, 255), 32, 20); head.addChild(number); this.attachTrackMuteGesture(head, track, trackIndex); timeline.addChild(head);
-        });
-        timeline.addChild(ruler);
-        this.createMixerPlayhead(timeline, w, h, ruler);
-        ruler.on(Node.EventType.TOUCH_END, (event: EventTouch) => { if (!this.mixerGestureMoved) { const p = event.getUILocation(); const local = ruler.getComponent(UITransform)!.convertToNodeSpaceAR(new Vec3(p.x, p.y, 0)); if (this.mixerPlaying) this.stopMixerTimelinePlayback(true); this.setMixerPlayheadFromLocalX(local.x, w, true); } event.propagationStopped = true; }, this);
+            head.setPosition(-w / 2 + MIXER_TRACK_HEAD_WIDTH / 2 + 2, y, 0);
+        }
+        const fixedRulerY = h / 2 - 17;
+        const ruler = timeline.getChildByName('TimelineRuler');
+        const rulerLabels = timeline.getChildByName('TimelineRulerLabels');
+        // Ruler labels and the black ruler strip must share the grid's x origin.
+        // Gesture preview temporarily changes these nodes independently; leaving
+        // that preview coordinate in place makes labels disappear or jump during
+        // the pane transition.
+        const rulerX = timeline.getChildByName('TimelineGrid')?.position.x ?? -this.mixerScrollX;
+        if (ruler) ruler.setPosition(rulerX, fixedRulerY, 0);
+        if (rulerLabels) rulerLabels.setPosition(rulerX, fixedRulerY, 0);
+        this.mixerGestureVisualBasePosition.set(0, 0, 0); this.mixerGestureVisualBaseScaleX = 1;
+        this.ensureMixerBlockSelectionVisual();
         this.updateMixerPlayheadVisual();
+        if (this.mixerMultiSelectMode) this.paintMixerMultiSelectOverlay();
         const audioPanelTopBorder = this.audioPanel?.getChildByName('AudioPanelTopBorder');
         if (audioPanelTopBorder && this.audioPanel) {
             audioPanelTopBorder.setSiblingIndex(this.audioPanel.children.length - 1);
         }
         const magnet = this.audioPanel?.getChildByName('AudioMagnet'); if (magnet) { (magnet as any).__panelButtonStyle.color = this.mixerMagnet ? new Color(245, 245, 245, 255) : new Color(8, 10, 15, 255); const label = magnet.getChildByName('Text')?.getComponent(Label); if (label) label.color = this.mixerMagnet ? new Color(0, 0, 0, 255) : new Color(255, 255, 255, 255); this.redrawPanelButton(magnet); }
+        this.updateMixerConnections();
         this.redrawMixerTransportButtons();
+    }
+
+    private appendMixerTimelineRange(startBeat: number, endBeat: number, w: number, h: number, contentInset: number) {
+        const timeline = this.mixerTimeline; if (!timeline) return;
+        const grid = timeline.getChildByName('TimelineGrid'); const ruler = timeline.getChildByName('TimelineRuler'); const rulerLabels = timeline.getChildByName('TimelineRulerLabels');
+        if (!grid || !ruler || !rulerLabels) return;
+        const groups = [0, 1, 2].map(index => grid.getChildByName(`BeatLines${index}`)?.getComponent(Graphics)).filter(Boolean) as Graphics[];
+        const firstBeat = Math.max(0, Math.floor(startBeat)); const lastBeat = Math.max(firstBeat, Math.ceil(endBeat));
+        for (let beat = firstBeat; beat <= lastBeat; beat++) {
+            if (grid.getChildByName(`Beat${beat}`)) continue;
+            const x = -w / 2 + contentInset + beat * this.mixerBeatWidth, accent = this.mixerBeatAccent(beat);
+            const group = groups[accent]; if (group) { group.moveTo(x, h / 2 - 34); group.lineTo(x, h / 2 - 34 - this.mixerTracks.length * this.mixerRowHeight); }
+            const fontSize = accent === 2 ? 17 : (accent === 1 ? 11 : 6), lineHeight = accent === 2 ? 22 : (accent === 1 ? 16 : 10);
+            const label = this.makeLabel(`Beat${beat}`, String(beat + 1), fontSize, lineHeight, new Color(210, 215, 225, 220), 40, 24);
+            const labelComponent = label.getComponent(Label); if (labelComponent) labelComponent.isBold = accent === 2;
+            label.setPosition(x - 1, 0, 0); rulerLabels.addChild(label);
+        }
+        for (const group of groups) group.stroke();
+        const horizontalName = `TimelineHorizontalLines${firstBeat}`;
+        if (!grid.getChildByName(horizontalName)) {
+            const segmentWidth = Math.max(this.mixerBeatWidth, (lastBeat - firstBeat) * this.mixerBeatWidth);
+            const horizontal = new Node(horizontalName); horizontal.layer = Layers.Enum.UI_2D;
+            const gridHeight = Math.max(h, 34 + Math.max(1, this.mixerTracks.length) * this.mixerRowHeight);
+            horizontal.addComponent(UITransform).setContentSize(segmentWidth, gridHeight);
+            horizontal.setPosition(-w / 2 + contentInset + (firstBeat + lastBeat) * this.mixerBeatWidth / 2, 0, 0);
+            const hg = horizontal.addComponent(Graphics); hg.lineWidth = 1; hg.strokeColor = new Color(255, 255, 255, 84);
+            for (let row = 0; row <= this.mixerTracks.length; row++) { const y = h / 2 - 34 - row * this.mixerRowHeight; hg.moveTo(-segmentWidth / 2, y); hg.lineTo(segmentWidth / 2, y); }
+            hg.stroke(); grid.addChild(horizontal);
+        }
+        for (const [trackIndex, track] of this.mixerTracks.entries()) {
+            const y = h / 2 - 34 - trackIndex * this.mixerRowHeight - this.mixerRowHeight / 2 + this.mixerScrollY;
+            for (const block of track.blocks) {
+                const clip = this.recordedClips.find(item => item.id === block.clipId); if (!clip) continue;
+                const blockEnd = block.startBeat + this.clipBeats(clip, block);
+                if (blockEnd < startBeat || block.startBeat > endBeat || timeline.getChildByName(`MixerBlock${block.id}`)) continue;
+                this.drawMixerBlock(timeline, block, trackIndex, w, h, y);
+            }
+        }
     }
 
     private drawMixerBlock(parent: Node, block: MixerBlock, trackIndex: number, viewW: number, viewH: number, y: number) {
         const clip = this.recordedClips.find(item => item.id === block.clipId); if (!clip) return;
-        const length = this.clipBeats(clip, block); const width = Math.max(18, length * this.mixerBeatWidth); const color = this.mixerColor(block.color); const selected = block.id === this.mixerSelectedBlockId;
+        const length = this.clipBeats(clip, block); const width = Math.max(18, length * this.mixerBeatWidth); const color = this.mixerColor(block.color); const selected = this.mixerMultiSelectMode ? this.mixerMultiSelectedBlockIds.has(block.id) : block.id === this.mixerSelectedBlockId;
         const blockHeight = this.mixerRowHeight - 2; const node = new Node(`MixerBlock${block.id}`); node.layer = Layers.Enum.UI_2D; node.addComponent(UITransform).setContentSize(width, blockHeight); const target = new Vec3(-viewW / 2 + this.mixerTimelineContentInset() + block.startBeat * this.mixerBeatWidth - this.mixerScrollX + width / 2, y, 0); node.setPosition(target);
         const bg = node.addComponent(Graphics); const hh = blockHeight / 2, radius = Math.min(MIXER_BLOCK_CORNER_RADIUS, width / 2, hh); bg.roundRect(-width / 2, -hh, width, hh * 2, radius); bg.fillColor = new Color(2, 3, 5, 255); bg.fill(); bg.lineWidth = 2; bg.strokeColor = color; bg.stroke();
         const automation = block.volumeAutomation?.length ? block.volumeAutomation : [1, 1]; const kappa = .5522848;
@@ -3377,19 +3988,50 @@ export class GameManager extends Component {
         if (selected) { this.drawMixerBlockSelectionBorder(node, width, hh, color); this.drawMixerBlockToolbar(node, block, clip, width, hh, color); }
         else { const label = this.makeLabel('BlockName', clip.name, 12, 18, new Color(255, 255, 255, 230), Math.max(20, width - 8), 18); label.setPosition(0, hh - 11); node.addChild(label); }
         this.attachMixerBlockGesture(node, block, trackIndex);
-        parent.addChild(node); const from = this.mixerAnimateFrom.get(block.id); if (from) { node.setPosition(from); tween(node).to(1, { position: target }, { easing: 'quadInOut' }).start(); this.mixerAnimateFrom.delete(block.id); }
+        parent.addChild(node);
+        // Keep audio blocks below the track heads/mute buttons and the ruler background.
+        const firstTrackHead = parent.children.findIndex(child => child.name.startsWith('TrackHead'));
+        const rulerIndex = parent.children.findIndex(child => child.name === 'TimelineRuler');
+        const blockIndex = firstTrackHead >= 0 ? firstTrackHead : (rulerIndex >= 0 ? rulerIndex : parent.children.length - 1);
+        node.setSiblingIndex(Math.max(1, blockIndex));
+        if (selected && !this.mixerMultiSelectMode) this.promoteMixerSelectedBlock(node);
+        const from = this.mixerAnimateFrom.get(block.id); if (from) { node.setPosition(from); tween(node).to(1, { position: target }, { easing: 'quadInOut' }).start(); this.mixerAnimateFrom.delete(block.id); }
+    }
+
+    /** Keep the selected block above every other block, while track heads and the ruler remain above it. */
+    private promoteMixerSelectedBlock(node: Node) {
+        const timeline = this.mixerTimeline;
+        if (!timeline || node.parent !== timeline) return;
+        const lastBlockIndex = timeline.children.reduce((last, child, index) => child.name.startsWith('MixerBlock') ? index : last, -1);
+        if (lastBlockIndex >= 0 && node.getSiblingIndex() !== lastBlockIndex) node.setSiblingIndex(lastBlockIndex);
+    }
+
+    private ensureMixerBlockSelectionVisual() {
+        if (this.mixerMultiSelectMode || !this.mixerSelectedBlockId || this.mixerSelectionBorderTransition) return;
+        const found = this.findMixerBlock(this.mixerSelectedBlockId);
+        const node = this.mixerTimeline?.getChildByName(`MixerBlock${this.mixerSelectedBlockId}`);
+        const transform = node?.getComponent(UITransform);
+        if (!found || !node || !transform) return;
+        const clip = this.recordedClips.find(item => item.id === found.block.clipId);
+        if (!clip) return;
+        node.getChildByName('BlockName')?.destroy();
+        const color = this.mixerColor(found.block.color);
+        if (!node.getChildByName('BlockSelectionBorder')) this.drawMixerBlockSelectionBorder(node, transform.contentSize.width, transform.contentSize.height / 2, color);
+        if (!node.getChildByName('BlockToolbar')) this.drawMixerBlockToolbar(node, found.block, clip, transform.contentSize.width, transform.contentSize.height / 2, color);
+        this.promoteMixerSelectedBlock(node);
     }
 
     private drawMixerBlockSelectionBorder(node: Node, width: number, hh: number, color: Color) {
         node.getChildByName('BlockSelectionBorder')?.destroy();
-        const border = new Node('BlockSelectionBorder'); border.layer = Layers.Enum.UI_2D; border.addComponent(UITransform).setContentSize(width + 8, hh * 2 + 8);
-        const g = border.addComponent(Graphics); g.lineWidth = 1.5; g.strokeColor = color; g.roundRect(-width / 2 - 3, -hh - 3, width + 6, hh * 2 + 6, MIXER_BLOCK_CORNER_RADIUS + 3); g.stroke(); node.addChild(border);
+        const inset = 5;
+        const border = new Node('BlockSelectionBorder'); border.layer = Layers.Enum.UI_2D; border.addComponent(UITransform).setContentSize(width + inset * 2 + 2, hh * 2 + inset * 2 + 2);
+        const g = border.addComponent(Graphics); g.lineWidth = 1.5; g.strokeColor = color; g.roundRect(-width / 2 - inset, -hh - inset, width + inset * 2, hh * 2 + inset * 2, MIXER_BLOCK_CORNER_RADIUS + inset); g.stroke(); node.addChild(border);
     }
 
     private animateMixerBlockSelectionBorder(fromNode: Node | null, toNode: Node, blockId: string, color: Color) {
         const timeline = this.mixerTimeline, targetTransform = toNode.getComponent(UITransform);
         if (!timeline || !targetTransform) return;
-        const targetWidth = targetTransform.contentSize.width + 6, targetHeight = targetTransform.contentSize.height + 6;
+        const targetWidth = targetTransform.contentSize.width + 10, targetHeight = targetTransform.contentSize.height + 10;
         let sourcePosition = toNode.position.clone(), sourceWidth = targetWidth, sourceHeight = targetHeight;
         const active = this.mixerSelectionBorderTransition;
         if (active) {
@@ -3404,17 +4046,18 @@ export class GameManager extends Component {
             const sourceTransform = fromNode.getComponent(UITransform);
             sourcePosition = fromNode.position.clone();
             if (sourceTransform) {
-                sourceWidth = sourceTransform.contentSize.width + 6;
-                sourceHeight = sourceTransform.contentSize.height + 6;
+                sourceWidth = sourceTransform.contentSize.width + 10;
+                sourceHeight = sourceTransform.contentSize.height + 10;
             }
         }
         const transition = new Node('BlockSelectionBorderTransition'); transition.layer = Layers.Enum.UI_2D;
         transition.addComponent(UITransform).setContentSize(sourceWidth, sourceHeight); transition.setPosition(sourcePosition);
         const g = transition.addComponent(Graphics); g.lineWidth = 1.5; g.strokeColor = color;
-        g.roundRect(-sourceWidth / 2, -sourceHeight / 2, sourceWidth, sourceHeight, Math.min(MIXER_BLOCK_CORNER_RADIUS + 3, sourceWidth / 2, sourceHeight / 2)); g.stroke();
+        g.roundRect(-sourceWidth / 2, -sourceHeight / 2, sourceWidth, sourceHeight, Math.min(MIXER_BLOCK_CORNER_RADIUS + 5, sourceWidth / 2, sourceHeight / 2)); g.stroke();
         timeline.addChild(transition);
-        const ruler = timeline.getChildByName('TimelineRuler'), rulerIndex = ruler ? timeline.children.indexOf(ruler) : -1;
-        if (rulerIndex >= 0) transition.setSiblingIndex(rulerIndex);
+        this.promoteMixerSelectedBlock(toNode);
+        const lastBlockIndex = timeline.children.reduce((last, child, index) => child.name.startsWith('MixerBlock') ? index : last, -1);
+        if (lastBlockIndex >= 0) transition.setSiblingIndex(lastBlockIndex + 1);
         this.mixerSelectionBorderTransition = transition;
         tween(transition).to(.3, {
             position: toNode.position.clone(),
@@ -3423,13 +4066,13 @@ export class GameManager extends Component {
             if (this.mixerSelectionBorderTransition !== transition) return;
             this.mixerSelectionBorderTransition = null; transition.destroy();
             if (this.mixerSelectedBlockId !== blockId) return;
-            if (this.mixerDraggingBlockId) this.drawMixerBlockSelectionBorder(toNode, targetTransform.contentSize.width, targetTransform.contentSize.height / 2, color);
-            else this.redrawMixerTimeline();
+            this.drawMixerBlockSelectionBorder(toNode, targetTransform.contentSize.width, targetTransform.contentSize.height / 2, color);
+            this.promoteMixerSelectedBlock(toNode);
         }).start();
     }
 
     private drawMixerBlockToolbar(node: Node, block: MixerBlock, clip: AudioClipMeta, width: number, hh: number, color: Color) {
-        const bar = new Node('BlockToolbar'); bar.layer = Layers.Enum.UI_2D; bar.addComponent(UITransform).setContentSize(width - 4, 24); const barG = bar.addComponent(Graphics); barG.roundRect(-(width - 4) / 2, -12, width - 4, 24, Math.min(MIXER_BLOCK_CORNER_RADIUS, 12)); barG.fillColor = new Color(2, 3, 5, 255); barG.fill(); barG.lineWidth = 1; barG.strokeColor = color; barG.moveTo(-(width - 4) / 2, -12); barG.lineTo((width - 4) / 2, -12); barG.stroke(); bar.setPosition(0, hh + 4); node.addChild(bar); tween(bar).to(.06, { position: new Vec3(0, hh - 12, 0) }, { easing: 'quadOut' }).start();
+        const bar = new Node('BlockToolbar'); bar.layer = Layers.Enum.UI_2D; bar.addComponent(UITransform).setContentSize(width - 4, 24); const barG = bar.addComponent(Graphics); barG.roundRect(-(width - 4) / 2, -12, width - 4, 24, Math.min(MIXER_BLOCK_CORNER_RADIUS, 12)); barG.fillColor = new Color(2, 3, 5, 255); barG.fill(); barG.lineWidth = 1; barG.strokeColor = color; barG.moveTo(-(width - 4) / 2, -12); barG.lineTo((width - 4) / 2, -12); barG.stroke(); bar.setPosition(0, this.mixerMultiSelectMode ? hh - 12 : hh + 4); node.addChild(bar); if (!this.mixerMultiSelectMode) tween(bar).to(.06, { position: new Vec3(0, hh - 12, 0) }, { easing: 'quadOut' }).start();
         const label = this.makeLabel('BlockName', clip.name, 12, 18, new Color(255, 255, 255, 255), Math.max(30, width - 132), 18); label.setPosition(-Math.max(0, width / 2 - 65), 0); bar.addChild(label);
         if (width < 150) return;
         const actions: Array<[string, () => void, Color]> = [
@@ -3462,9 +4105,10 @@ export class GameManager extends Component {
         let startY = 0, lastIndex = trackIndex, sliding = false, targetMuted = false;
         const applyIndex = (index: number) => { const item = this.mixerTracks[index]; if (!item || item.muted === targetMuted) return; item.muted = targetMuted; const head = this.mixerTimeline?.getChildByName(`TrackHead${index}`); if (head) this.paintMixerTrackHead(head, item); };
         const indexAt = (e: EventTouch) => { if (!this.mixerViewport) return trackIndex; const p = e.getUILocation(); const local = this.mixerViewport.getComponent(UITransform)!.convertToNodeSpaceAR(new Vec3(p.x, p.y, 0)); const height = this.mixerViewport.getComponent(UITransform)!.contentSize.height; return Math.max(0, Math.min(this.mixerTracks.length - 1, Math.floor((height / 2 - 34 + this.mixerScrollY - local.y) / this.mixerRowHeight))); };
-        node.on(Node.EventType.TOUCH_START, e => { this.stopMixerInertia(false); startY = e.getUILocation().y; lastIndex = trackIndex; sliding = false; targetMuted = !track.muted; e.propagationStopped = true; }, this);
-        node.on(Node.EventType.TOUCH_MOVE, e => { const current = indexAt(e); if (!sliding && Math.abs(e.getUILocation().y - startY) > 7) { sliding = true; applyIndex(trackIndex); } if (sliding) { const from = Math.min(lastIndex, current), to = Math.max(lastIndex, current); for (let index = from; index <= to; index++) applyIndex(index); lastIndex = current; } e.propagationStopped = true; }, this);
+        node.on(Node.EventType.TOUCH_START, e => { if (this.mixerMultiSelectMode) return; this.stopMixerInertia(false); startY = e.getUILocation().y; lastIndex = trackIndex; sliding = false; targetMuted = !track.muted; e.propagationStopped = true; }, this);
+        node.on(Node.EventType.TOUCH_MOVE, e => { if (this.mixerMultiSelectMode) return; const current = indexAt(e); if (!sliding && Math.abs(e.getUILocation().y - startY) > 7) { sliding = true; applyIndex(trackIndex); } if (sliding) { const from = Math.min(lastIndex, current), to = Math.max(lastIndex, current); for (let index = from; index <= to; index++) applyIndex(index); lastIndex = current; } e.propagationStopped = true; }, this);
         const finish = (e: EventTouch) => {
+            if (this.mixerMultiSelectMode) return;
             if (sliding) { this.saveMixerTracks(); this.refreshMixerTimelineAudio(); this.queueMixerRedraw(); }
             else {
                 const pending = this.mixerTrackTapTimers.get(track.id);
@@ -3479,10 +4123,73 @@ export class GameManager extends Component {
 
     private attachMixerBlockGesture(node: Node, block: MixerBlock, trackIndex: number) {
         let start = new Vec3(); let dragOrigin = new Vec3(); let moved = false; let holding = false; let selectedAtStart = false; let holdTimer: ReturnType<typeof setTimeout> | null = null;
+        let multiBoxing = false, multiMoved = false; const multiOrigins = new Map<string, Vec3>();
         const isToolbarControl = (target: Node | null) => { let current = target; while (current && current !== node) { if (current.getComponent(Button) || current.getComponent(Label)?.node?.name === 'Text') return true; current = current.parent; } return false; };
-        node.on(Node.EventType.TOUCH_START, e => { if (isToolbarControl(e.target as Node)) return; this.stopMixerInertia(false); selectedAtStart = this.mixerSelectedBlockId === block.id; if (!selectedAtStart) { const previousNode = this.mixerSelectedBlockId ? this.mixerTimeline?.getChildByName(`MixerBlock${this.mixerSelectedBlockId}`) ?? null : null; previousNode?.getChildByName('BlockSelectionBorder')?.destroy(); previousNode?.getChildByName('BlockToolbar')?.destroy(); this.mixerSelectedBlockId = block.id; node.getChildByName('BlockName')?.destroy(); const clip = this.recordedClips.find(item => item.id === block.clipId); const transform = node.getComponent(UITransform); if (clip && transform) { const color = this.mixerColor(block.color); if (previousNode || this.mixerSelectionBorderTransition) this.animateMixerBlockSelectionBorder(previousNode, node, block.id, color); else this.drawMixerBlockSelectionBorder(node, transform.contentSize.width, transform.contentSize.height / 2, color); if (!node.getChildByName('BlockToolbar')) this.drawMixerBlockToolbar(node, block, clip, transform.contentSize.width, transform.contentSize.height / 2, color); } } this.mixerDraggingBlockId = block.id; const p = e.getUILocation(); start.set(p.x, p.y, 0); dragOrigin.set(node.position); moved = false; holding = false; holdTimer = setTimeout(() => { holding = true; node.active = true; node.setSiblingIndex(node.parent!.children.length - 2); tween(node).to(.18, { scale: new Vec3(1.05, 1.05, 1) }, { easing: 'quadOut' }).start(); }, 1000); e.propagationStopped = true; }, this);
-        node.on(Node.EventType.TOUCH_MOVE, e => { if (isToolbarControl(e.target as Node)) return; const p = e.getUILocation(); if (Math.abs(p.x - start.x) + Math.abs(p.y - start.y) > 10) moved = true; if (holding) node.setPosition(dragOrigin.x + p.x - start.x, dragOrigin.y + p.y - start.y, 0); e.propagationStopped = true; }, this);
-        const finish = (e: EventTouch) => { if (isToolbarControl(e.target as Node)) return; if (holdTimer) clearTimeout(holdTimer); this.mixerDraggingBlockId = ''; if (holding) { const target = this.mixerBlockLocation(node, block); if (target) this.moveMixerBlock(block.id, target.track, target.beat, node.position.clone()); else this.queueMixerRedraw(); } else if (!moved) this.handleMixerBlockTap(block, selectedAtStart); else this.queueMixerRedraw(); e.propagationStopped = true; };
+        node.on(Node.EventType.TOUCH_START, e => {
+            if (isToolbarControl(e.target as Node)) return;
+            this.stopMixerInertia(false); const p = e.getUILocation(); start.set(p.x, p.y, 0); dragOrigin.set(node.position); moved = false; holding = false; multiBoxing = false; multiMoved = false; multiOrigins.clear();
+            if (this.mixerMultiSelectMode) {
+                selectedAtStart = this.mixerMultiSelectedBlockIds.has(block.id);
+                if (selectedAtStart) holdTimer = setTimeout(() => {
+                    if (!this.mixerMultiSelectMode || moved) return;
+                    holding = true;
+                    for (const id of this.mixerMultiSelectedBlockIds) {
+                        const selectedNode = this.mixerTimeline?.getChildByName(`MixerBlock${id}`); if (!selectedNode) continue;
+                        multiOrigins.set(id, selectedNode.position.clone()); Tween.stopAllByTarget(selectedNode);
+                        tween(selectedNode).to(.1, { scale: new Vec3(1.045, 1.045, 1) }, { easing: 'quadOut' }).start();
+                    }
+                }, 340);
+                e.propagationStopped = true; return;
+            }
+            selectedAtStart = this.mixerSelectedBlockId === block.id;
+            if (!selectedAtStart) {
+                const previousNode = this.mixerSelectedBlockId ? this.mixerTimeline?.getChildByName(`MixerBlock${this.mixerSelectedBlockId}`) ?? null : null;
+                previousNode?.getChildByName('BlockSelectionBorder')?.destroy(); previousNode?.getChildByName('BlockToolbar')?.destroy(); this.mixerSelectedBlockId = block.id; this.promoteMixerSelectedBlock(node); node.getChildByName('BlockName')?.destroy();
+                const clip = this.recordedClips.find(item => item.id === block.clipId); const transform = node.getComponent(UITransform);
+                if (clip && transform) { const color = this.mixerColor(block.color); if (previousNode || this.mixerSelectionBorderTransition) this.animateMixerBlockSelectionBorder(previousNode, node, block.id, color); else this.drawMixerBlockSelectionBorder(node, transform.contentSize.width, transform.contentSize.height / 2, color); if (!node.getChildByName('BlockToolbar')) this.drawMixerBlockToolbar(node, block, clip, transform.contentSize.width, transform.contentSize.height / 2, color); }
+            }
+            this.mixerDraggingBlockId = block.id;
+            holdTimer = setTimeout(() => { holding = true; node.active = true; this.promoteMixerSelectedBlock(node); tween(node).to(.18, { scale: new Vec3(1.05, 1.05, 1) }, { easing: 'quadOut' }).start(); }, 1000);
+            e.propagationStopped = true;
+        }, this);
+        node.on(Node.EventType.TOUCH_MOVE, e => {
+            if (isToolbarControl(e.target as Node)) return;
+            const p = e.getUILocation(), dx = p.x - start.x, dy = p.y - start.y;
+            if (this.mixerMultiSelectMode) {
+                if (holding) {
+                    multiMoved = multiMoved || Math.hypot(dx, dy) > 2;
+                    for (const [id, origin] of multiOrigins) this.mixerTimeline?.getChildByName(`MixerBlock${id}`)?.setPosition(origin.x + dx, origin.y + dy, 0);
+                }
+                else if (Math.hypot(dx, dy) >= 18) {
+                    moved = true; if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
+                    if (!multiBoxing) { const startLocal = this.mixerViewport?.getComponent(UITransform)?.convertToNodeSpaceAR(start); if (startLocal) { this.mixerMultiBoxStart = startLocal; this.mixerMultiBoxCurrent = null; this.mixerMultiBoxTouchId = e.getID(); multiBoxing = true; } }
+                    const local = this.mixerMultiViewportPoint(e); if (local) { this.mixerMultiBoxCurrent = local; this.paintMixerMultiSelectOverlay(); }
+                }
+                e.propagationStopped = true; return;
+            }
+            if (Math.abs(dx) + Math.abs(dy) > 10) moved = true;
+            if (holding) { node.setPosition(dragOrigin.x + dx, dragOrigin.y + dy, 0); this.updateMixerConnections(); }
+            e.propagationStopped = true;
+        }, this);
+        const finish = (e: EventTouch) => {
+            if (isToolbarControl(e.target as Node)) return;
+            if (holdTimer) clearTimeout(holdTimer); holdTimer = null;
+            if (this.mixerMultiSelectMode) {
+                const p = e.getUILocation(), dx = p.x - start.x, dy = p.y - start.y;
+                if (holding) {
+                    for (const id of this.mixerMultiSelectedBlockIds) { const selectedNode = this.mixerTimeline?.getChildByName(`MixerBlock${id}`); if (selectedNode) { Tween.stopAllByTarget(selectedNode); tween(selectedNode).to(.08, { scale: Vec3.ONE }, { easing: 'quadOut' }).start(); } }
+                    if (multiMoved) this.moveMixerMultiSelectedBlocks(dx, dy); else this.paintMixerMultiSelectOverlay();
+                }
+                else if (multiBoxing) { const local = this.mixerMultiViewportPoint(e); if (local) this.mixerMultiBoxCurrent = local; this.finishMixerMultiBoxSelection(); }
+                else if (!moved) { this.showMixerMultiTapFeedback(e); this.toggleMixerMultiBlockSelection(node, block); }
+                holding = false; multiBoxing = false; multiMoved = false; e.propagationStopped = true; return;
+            }
+            this.mixerDraggingBlockId = '';
+            if (holding && moved) { const target = this.mixerBlockLocation(node, block); if (target) this.moveMixerBlock(block.id, target.track, target.beat, undefined, true); else { Tween.stopAllByTarget(node); node.setScale(Vec3.ONE); } }
+            else if (holding) { Tween.stopAllByTarget(node); node.setScale(Vec3.ONE); this.promoteMixerSelectedBlock(node); this.updateMixerConnections(); }
+            else if (!moved) this.handleMixerBlockTap(block, selectedAtStart); else this.queueMixerRedraw();
+            e.propagationStopped = true;
+        };
         node.on(Node.EventType.TOUCH_END, finish, this); node.on(Node.EventType.TOUCH_CANCEL, finish, this);
     }
 
@@ -3498,7 +4205,26 @@ export class GameManager extends Component {
         return { track, beat: this.mixerMagnet ? Math.round(rawBeat) : rawBeat };
     }
 
+    private mixerBlockPosition(block: MixerBlock, trackIndex: number): Vec3 | null {
+        const transform = this.mixerViewport?.getComponent(UITransform); if (!transform) return null;
+        const clip = this.recordedClips.find(item => item.id === block.clipId); if (!clip) return null;
+        const size = transform.contentSize, width = Math.max(18, this.clipBeats(clip, block) * this.mixerBeatWidth);
+        return new Vec3(
+            -size.width / 2 + this.mixerTimelineContentInset() + block.startBeat * this.mixerBeatWidth - this.mixerScrollX + width / 2,
+            size.height / 2 - 34 - trackIndex * this.mixerRowHeight - this.mixerRowHeight / 2 + this.mixerScrollY,
+            0,
+        );
+    }
+
+    private settleMixerBlockNode(block: MixerBlock, trackIndex: number) {
+        const node = this.mixerTimeline?.getChildByName(`MixerBlock${block.id}`), position = this.mixerBlockPosition(block, trackIndex);
+        if (!node || !position) return;
+        Tween.stopAllByTarget(node); node.setPosition(position); node.setScale(Vec3.ONE);
+        if (!this.mixerMultiSelectMode && this.mixerSelectedBlockId === block.id) this.promoteMixerSelectedBlock(node);
+    }
+
     private handleMixerBlockTap(block: MixerBlock, wasSelected = this.mixerSelectedBlockId === block.id) {
+        this.mixerConnectionBlockId = block.id; this.mixerConnectionSourceId = ''; this.refreshCollapsedSourceDotSelection(true); this.updateMixerConnections();
         const now = Date.now();
         if (this.mixerLastBlockTap.id === block.id && now - this.mixerLastBlockTap.at < 330) { this.mixerSelectedBlockId = block.id; this.previewMixerBlock(block); this.queueMixerRedraw(); this.mixerLastBlockTap = { id: '', at: 0 }; return; }
         this.mixerLastBlockTap = { id: block.id, at: now };
@@ -3508,6 +4234,7 @@ export class GameManager extends Component {
 
     private deselectMixerBlockImmediately() {
         this.mixerLastBlockTap = { id: '', at: 0 };
+        this.mixerConnectionBlockId = ''; this.mixerConnectionSourceId = ''; this.refreshCollapsedSourceDotSelection(true); this.updateMixerConnections();
         if (this.mixerSelectionBorderTransition) { Tween.stopAllByTarget(this.mixerSelectionBorderTransition); this.mixerSelectionBorderTransition.destroy(); this.mixerSelectionBorderTransition = null; }
         if (!this.mixerSelectedBlockId) return;
         this.mixerSelectedBlockId = ''; this.mixerColorPalette?.destroy(); this.mixerColorPalette = null;
@@ -3517,18 +4244,110 @@ export class GameManager extends Component {
     private previewMixerBlock(block: MixerBlock) {
         const clip = this.recordedClips.find(item => item.id === block.clipId);
         if (!clip) return;
-        const automation = block.volumeAutomation?.length ? block.volumeAutomation : [1];
-        const average = automation.reduce((sum, value) => sum + Math.max(0, Math.min(1, value)), 0) / automation.length;
-        NativeBridge.playTimeline([{ ...clip, trimStart: block.trimStart ?? clip.trimStart, trimEnd: block.trimEnd ?? clip.trimEnd, volume: clip.volume * average, startBeat: 0, speed: Math.max(.25, Math.min(4, block.speed ?? 1)), volumeAutomation: block.volumeAutomation, pitchAutomation: block.pitchAutomation, panAutomation: block.panAutomation }], this.metronomeBpm);
+        const speed = Math.max(.25, Math.min(4, block.speed ?? 1)); let elapsedSeconds = 0;
+        const entries = this.mixerBlockTrimRanges(clip, block).map(range => {
+            const entry = { ...clip, trimStart: range.start, trimEnd: range.end, volume: clip.volume, startBeat: elapsedSeconds * this.metronomeBpm / 60 / speed, speed, volumeAutomation: block.volumeAutomation, pitchAutomation: block.pitchAutomation, panAutomation: block.panAutomation };
+            elapsedSeconds += range.end - range.start; return entry;
+        });
+        NativeBridge.playTimeline(entries, this.metronomeBpm);
     }
 
-    private moveMixerBlock(blockId: string, requestedTrack: number, beat: number, from?: Vec3) {
-        const found = this.findMixerBlock(blockId); if (!found) return; const clip = this.recordedClips.find(item => item.id === found.block.clipId); if (!clip) return; this.pushMixerUndo(); found.track.blocks = found.track.blocks.filter(item => item.id !== blockId); found.block.startBeat = Math.max(0, this.mixerMagnet ? Math.round(beat) : beat); const trackIndex = this.findFreeMixerTrack(requestedTrack, found.block.startBeat, this.clipBeats(clip, found.block), blockId); this.ensureMixerTrack(trackIndex)?.blocks.push(found.block); if (from) this.mixerAnimateFrom.set(blockId, from); this.saveMixerTracks(); this.queueMixerRedraw();
+    private moveMixerBlock(blockId: string, requestedTrack: number, beat: number, from?: Vec3, settleImmediately = false) {
+        const found = this.findMixerBlock(blockId); if (!found) return; const clip = this.recordedClips.find(item => item.id === found.block.clipId); if (!clip) return;
+        this.pushMixerUndo(); found.track.blocks = found.track.blocks.filter(item => item.id !== blockId);
+        found.block.startBeat = Math.max(0, this.mixerMagnet ? Math.round(beat) : beat);
+        const trackIndex = this.findFreeMixerTrack(requestedTrack, found.block.startBeat, this.clipBeats(clip, found.block), blockId);
+        this.ensureMixerTrack(trackIndex)?.blocks.push(found.block); this.saveMixerTracks();
+        if (settleImmediately) {
+            this.mixerAnimateFrom.delete(blockId); this.settleMixerBlockNode(found.block, trackIndex);
+            this.mixerTimelineCacheSignature = this.mixerTimelineSignature(); this.updateMixerConnections();
+        } else {
+            if (from) this.mixerAnimateFrom.set(blockId, from);
+            this.queueMixerRedraw();
+        }
     }
 
-    private cloneMixerBlock(blockId: string) { const found = this.findMixerBlock(blockId); if (!found) return; const clip = this.recordedClips.find(item => item.id === found.block.clipId); if (!clip || !this.mixerViewport) return; this.pushMixerUndo(); const clone: MixerBlock = JSON.parse(JSON.stringify(found.block)); clone.id = `block_${Date.now()}`; clone.startBeat = found.block.startBeat + this.clipBeats(clip, found.block); const targetTrack = this.findFreeMixerTrack(found.trackIndex, clone.startBeat, this.clipBeats(clip, clone)); this.ensureMixerTrack(targetTrack)?.blocks.push(clone); const size = this.mixerViewport.getComponent(UITransform)!.contentSize; const originalWidth = this.clipBeats(clip, found.block) * this.mixerBeatWidth; this.mixerAnimateFrom.set(clone.id, new Vec3(-size.width / 2 + this.mixerTimelineContentInset() + found.block.startBeat * this.mixerBeatWidth - this.mixerScrollX + originalWidth / 2, size.height / 2 - 34 - found.trackIndex * this.mixerRowHeight - this.mixerRowHeight / 2 + this.mixerScrollY, 0)); this.mixerSelectedBlockId = clone.id; this.saveMixerTracks(); this.queueMixerRedraw(); }
-    private alignMixerBlockLeft(blockId: string) { const found = this.findMixerBlock(blockId); if (!found) return; const from = this.mixerTimeline?.getChildByName(`MixerBlock${blockId}`)?.position.clone(); let best = 0; for (const track of this.mixerTracks) for (const other of track.blocks) { if (other.id === blockId) continue; const clip = this.recordedClips.find(item => item.id === other.clipId); if (!clip) continue; const end = other.startBeat + this.clipBeats(clip, other); if (end < found.block.startBeat && end > best) best = end; } this.moveMixerBlock(blockId, found.trackIndex, best, from); }
-    private deleteMixerBlock(blockId: string) { const found = this.findMixerBlock(blockId); if (!found) return; this.pushMixerUndo(); found.track.blocks = found.track.blocks.filter(item => item.id !== blockId); this.mixerSelectedBlockId = ''; this.saveMixerTracks(); this.redrawMixerTimeline(); }
+    private mixerMultiOperationIds(blockId: string) {
+        if (this.mixerMultiSelectMode && this.mixerMultiSelectedBlockIds.has(blockId)) return Array.from(this.mixerMultiSelectedBlockIds).filter(id => !!this.findMixerBlock(id));
+        return [blockId];
+    }
+
+    private moveMixerMultiSelectedBlocks(deltaX: number, deltaY: number) {
+        const ids = Array.from(this.mixerMultiSelectedBlockIds), idSet = new Set(ids);
+        const entries = ids.map(id => this.findMixerBlock(id)).filter(Boolean) as Array<{ block: MixerBlock; track: MixerTrack; trackIndex: number }>;
+        if (!entries.length) return;
+        this.pushMixerUndo();
+        const leftmost = Math.min(...entries.map(entry => entry.block.startBeat));
+        let targetLeft = Math.max(0, leftmost + deltaX / this.mixerBeatWidth); if (this.mixerMagnet) targetLeft = Math.round(targetLeft);
+        const beatDelta = targetLeft - leftmost, trackDelta = Math.round(-deltaY / this.mixerRowHeight);
+        for (const track of this.mixerTracks) track.blocks = track.blocks.filter(item => !idSet.has(item.id));
+        entries.sort((a, b) => a.trackIndex - b.trackIndex || a.block.startBeat - b.block.startBeat);
+        const finalTracks = new Map<string, number>();
+        for (const entry of entries) {
+            entry.block.startBeat = Math.max(0, entry.block.startBeat + beatDelta);
+            const clip = this.recordedClips.find(item => item.id === entry.block.clipId); if (!clip) continue;
+            const desiredTrack = Math.max(0, Math.min(12, entry.trackIndex + trackDelta));
+            const targetTrack = this.findFreeMixerTrack(desiredTrack, entry.block.startBeat, this.clipBeats(clip, entry.block), entry.block.id);
+            this.ensureMixerTrack(targetTrack)?.blocks.push(entry.block);
+            finalTracks.set(entry.block.id, targetTrack);
+        }
+        this.saveMixerTracks();
+        for (const entry of entries) {
+            const finalTrack = finalTracks.get(entry.block.id); if (finalTrack === undefined) continue;
+            this.mixerAnimateFrom.delete(entry.block.id); this.settleMixerBlockNode(entry.block, finalTrack);
+        }
+        this.mixerTimelineCacheSignature = this.mixerTimelineSignature(); this.paintMixerMultiSelectOverlay(); this.updateMixerConnections();
+    }
+
+    private cloneMixerMultiSelectedBlocks() {
+        const ids = Array.from(this.mixerMultiSelectedBlockIds);
+        const entries = ids.map(id => this.findMixerBlock(id)).filter(Boolean) as Array<{ block: MixerBlock; track: MixerTrack; trackIndex: number }>;
+        if (!entries.length) return;
+        const minStart = Math.min(...entries.map(entry => entry.block.startBeat));
+        const maxEnd = Math.max(...entries.map(entry => { const clip = this.recordedClips.find(item => item.id === entry.block.clipId); return entry.block.startBeat + (clip ? this.clipBeats(clip, entry.block) : 0); }));
+        const offset = Math.max(.001, maxEnd - minStart), stamp = Date.now(), cloneIds = new Set<string>();
+        this.pushMixerUndo();
+        entries.sort((a, b) => a.trackIndex - b.trackIndex || a.block.startBeat - b.block.startBeat).forEach((entry, index) => {
+            const clip = this.recordedClips.find(item => item.id === entry.block.clipId); if (!clip) return;
+            const clone: MixerBlock = JSON.parse(JSON.stringify(entry.block)); clone.id = `block_${stamp}_${index}`; clone.startBeat += offset;
+            const targetTrack = this.findFreeMixerTrack(entry.trackIndex, clone.startBeat, this.clipBeats(clip, clone)); this.ensureMixerTrack(targetTrack)?.blocks.push(clone); cloneIds.add(clone.id);
+            const sourceNode = this.mixerTimeline?.getChildByName(`MixerBlock${entry.block.id}`); if (sourceNode) this.mixerAnimateFrom.set(clone.id, sourceNode.position.clone());
+        });
+        this.mixerMultiSelectedBlockIds = cloneIds; this.saveMixerTracks(); this.queueMixerRedraw();
+    }
+
+    private alignMixerMultiSelectedBlocks() {
+        const ids = Array.from(this.mixerMultiSelectedBlockIds), idSet = new Set(ids);
+        const entries = ids.map(id => this.findMixerBlock(id)).filter(Boolean) as Array<{ block: MixerBlock; track: MixerTrack; trackIndex: number }>;
+        if (!entries.length) return;
+        const leftmost = Math.min(...entries.map(entry => entry.block.startBeat)); let best = 0;
+        for (const track of this.mixerTracks) for (const other of track.blocks) {
+            if (idSet.has(other.id)) continue;
+            const clip = this.recordedClips.find(item => item.id === other.clipId); if (!clip) continue;
+            const end = other.startBeat + this.clipBeats(clip, other); if (end <= leftmost + .001 && end > best) best = end;
+        }
+        const delta = best - leftmost; this.pushMixerUndo();
+        for (const track of this.mixerTracks) track.blocks = track.blocks.filter(item => !idSet.has(item.id));
+        entries.sort((a, b) => a.trackIndex - b.trackIndex || a.block.startBeat - b.block.startBeat).forEach(entry => {
+            const clip = this.recordedClips.find(item => item.id === entry.block.clipId); if (!clip) return;
+            entry.block.startBeat = Math.max(0, entry.block.startBeat + delta);
+            const targetTrack = this.findFreeMixerTrack(entry.trackIndex, entry.block.startBeat, this.clipBeats(clip, entry.block), entry.block.id); this.ensureMixerTrack(targetTrack)?.blocks.push(entry.block);
+        });
+        this.saveMixerTracks(); this.queueMixerRedraw();
+    }
+
+    private deleteMixerMultiSelectedBlocks() {
+        const ids = new Set(this.mixerMultiSelectedBlockIds); if (!ids.size) return;
+        this.pushMixerUndo(); for (const track of this.mixerTracks) track.blocks = track.blocks.filter(item => !ids.has(item.id));
+        this.mixerMultiSelectedBlockIds.clear(); this.saveMixerTracks(); this.mixerTimelineVisualDirty = true; this.redrawMixerTimeline();
+    }
+
+    private cloneMixerBlock(blockId: string) {
+        if (this.mixerMultiSelectMode && this.mixerMultiSelectedBlockIds.has(blockId)) { this.cloneMixerMultiSelectedBlocks(); return; }
+        const found = this.findMixerBlock(blockId); if (!found) return; const clip = this.recordedClips.find(item => item.id === found.block.clipId); if (!clip || !this.mixerViewport) return; this.pushMixerUndo(); const clone: MixerBlock = JSON.parse(JSON.stringify(found.block)); clone.id = `block_${Date.now()}`; clone.startBeat = found.block.startBeat + this.clipBeats(clip, found.block); const targetTrack = this.findFreeMixerTrack(found.trackIndex, clone.startBeat, this.clipBeats(clip, clone)); this.ensureMixerTrack(targetTrack)?.blocks.push(clone); const size = this.mixerViewport.getComponent(UITransform)!.contentSize; const originalWidth = this.clipBeats(clip, found.block) * this.mixerBeatWidth; this.mixerAnimateFrom.set(clone.id, new Vec3(-size.width / 2 + this.mixerTimelineContentInset() + found.block.startBeat * this.mixerBeatWidth - this.mixerScrollX + originalWidth / 2, size.height / 2 - 34 - found.trackIndex * this.mixerRowHeight - this.mixerRowHeight / 2 + this.mixerScrollY, 0)); this.mixerSelectedBlockId = clone.id; this.saveMixerTracks(); this.queueMixerRedraw();
+    }
+    private alignMixerBlockLeft(blockId: string) { if (this.mixerMultiSelectMode && this.mixerMultiSelectedBlockIds.has(blockId)) { this.alignMixerMultiSelectedBlocks(); return; } const found = this.findMixerBlock(blockId); if (!found) return; const from = this.mixerTimeline?.getChildByName(`MixerBlock${blockId}`)?.position.clone(); let best = 0; for (const track of this.mixerTracks) for (const other of track.blocks) { if (other.id === blockId) continue; const clip = this.recordedClips.find(item => item.id === other.clipId); if (!clip) continue; const end = other.startBeat + this.clipBeats(clip, other); if (end < found.block.startBeat && end > best) best = end; } this.moveMixerBlock(blockId, found.trackIndex, best, from); }
+    private deleteMixerBlock(blockId: string) { if (this.mixerMultiSelectMode && this.mixerMultiSelectedBlockIds.has(blockId)) { this.deleteMixerMultiSelectedBlocks(); return; } const found = this.findMixerBlock(blockId); if (!found) return; this.pushMixerUndo(); found.track.blocks = found.track.blocks.filter(item => item.id !== blockId); this.mixerSelectedBlockId = ''; if (this.mixerConnectionBlockId === blockId) this.mixerConnectionBlockId = ''; this.saveMixerTracks(); this.redrawMixerTimeline(); }
     private openMixerSourceColorPalette(clip: AudioClipMeta) {
         if (!this.audioPanel) return;
         this.mixerColorPalette?.destroy();
@@ -3561,53 +4380,137 @@ export class GameManager extends Component {
             const button = new Node(`Color-${name}`); button.layer = Layers.Enum.UI_2D; button.addComponent(UITransform).setContentSize(34, 34); button.setPosition(-width / 2 + 34 + index * 40, 6);
             const buttonG = button.addComponent(Graphics); buttonG.circle(0, 0, 15); buttonG.fillColor = this.mixerColor(name); buttonG.fill(); buttonG.lineWidth = 2; buttonG.strokeColor = name === found.block.color ? new Color(255, 255, 255, 255) : new Color(110, 125, 150, 255); buttonG.stroke();
             const buttonLabel = this.makeLabel('ColorName', names[index], 13, 18, name === 'black' ? new Color(235, 240, 248, 255) : new Color(18, 22, 30, 255), 34, 18); buttonLabel.setPosition(0, -28); button.addChild(buttonLabel);
-            const click = button.addComponent(Button); click.transition = Button.Transition.SCALE; button.on(Button.EventType.CLICK, () => { found.block.color = name; this.saveMixerTracks(); this.mixerColorPalette?.destroy(); this.mixerColorPalette = null; this.redrawMixerTimeline(); }, this); palette.addChild(button);
+            const click = button.addComponent(Button); click.transition = Button.Transition.SCALE; button.on(Button.EventType.CLICK, () => {
+                const ids = this.mixerMultiOperationIds(blockId); for (const id of ids) { const target = this.findMixerBlock(id); if (target) target.block.color = name; }
+                this.saveMixerTracks(); this.mixerColorPalette?.destroy(); this.mixerColorPalette = null; this.mixerTimelineVisualDirty = true; this.redrawMixerTimeline();
+            }, this); palette.addChild(button);
         });
         const close = this.makePanelButton(palette, '×', width / 2 - 24, height / 2 - 22, 34, 30, () => { palette.destroy(); this.mixerColorPalette = null; }, new Color(80, 38, 48, 255)); close.name = 'PaletteClose';
         this.audioPanel.addChild(palette); this.mixerColorPalette = palette;
     }
 
     private createMixerPlayhead(parent: Node, width: number, height: number, ruler: Node) {
+        const existing = parent.getChildByName('MixerPlayhead');
+        if (existing) {
+            existing.active = !this.mixerMultiSelectMode;
+            existing.getComponent(UITransform)?.setContentSize(30, height);
+            this.paintMixerPlayheadLine(existing, height);
+            let stamp = existing.getChildByName('MixerPlayheadStamp') ?? ruler.getChildByName('MixerPlayheadStamp');
+            if (!stamp) {
+                const retainedRuler = this.mixerRetainedTimelineNodes.find(node => node.name === 'TimelineRuler');
+                stamp = retainedRuler?.getChildByName('MixerPlayheadStamp');
+            }
+            if (!stamp) { stamp = new Node('MixerPlayheadStamp'); stamp.layer = Layers.Enum.UI_2D; stamp.addComponent(UITransform).setContentSize(30, 34); stamp.addComponent(Graphics); }
+            stamp.removeFromParent(); existing.addChild(stamp); stamp.setPosition(0, 0, 0); stamp.active = true;
+            const stampG = stamp.getComponent(Graphics)!; stampG.clear(); stampG.fillColor = new Color(255, 255, 255, 255); stampG.moveTo(-7, 16); stampG.lineTo(7, 16); stampG.lineTo(0, 5); stampG.close(); stampG.fill();
+            stamp.setSiblingIndex(existing.children.length - 1);
+            // The playhead and marker must render after the black ruler strip.
+            existing.setSiblingIndex(parent.children.length - 1);
+            return;
+        }
         const node = new Node('MixerPlayhead'); node.layer = Layers.Enum.UI_2D;
-        node.addComponent(UITransform).setContentSize(30, height); const g = node.addComponent(Graphics);
-        g.lineWidth = 2; g.strokeColor = new Color(255, 255, 255, 255); g.moveTo(0, -height / 2); g.lineTo(0, height / 2); g.stroke();
-        const setFromTouch = (event: EventTouch) => { const p = event.getUILocation(); const local = this.mixerViewport?.getComponent(UITransform)?.convertToNodeSpaceAR(new Vec3(p.x, p.y, 0)); if (local) this.setMixerPlayheadFromLocalX(local.x, width); event.propagationStopped = true; };
-        node.on(Node.EventType.TOUCH_START, (event: EventTouch) => { if (this.mixerPlaying) this.stopMixerTimelinePlayback(true); this.mixerDraggingPlayhead = true; setFromTouch(event); }, this);
+        node.active = !this.mixerMultiSelectMode;
+        node.addComponent(UITransform).setContentSize(30, height); node.addComponent(Graphics); this.paintMixerPlayheadLine(node, height);
+        const setFromTouch = (event: EventTouch) => {
+            const p = event.getUILocation();
+            const viewportTransform = this.mixerViewport?.getComponent(UITransform);
+            const local = viewportTransform?.convertToNodeSpaceAR(new Vec3(p.x, p.y, 0));
+            if (local) this.setMixerPlayheadFromLocalX(local.x - this.mixerPlayheadTouchOffsetX, viewportTransform?.contentSize.width ?? width);
+            event.propagationStopped = true;
+        };
+        node.on(Node.EventType.TOUCH_START, (event: EventTouch) => {
+            if (this.mixerPlaying) this.stopMixerTimelinePlayback(true);
+            const p = event.getUILocation();
+            const viewportTransform = this.mixerViewport?.getComponent(UITransform);
+            const touchLocal = viewportTransform?.convertToNodeSpaceAR(new Vec3(p.x, p.y, 0));
+            const playheadTransform = node.getComponent(UITransform);
+            const playheadWorld = playheadTransform?.convertToWorldSpaceAR(Vec3.ZERO);
+            const playheadLocal = playheadWorld && viewportTransform?.convertToNodeSpaceAR(playheadWorld);
+            this.mixerPlayheadTouchOffsetX = touchLocal && playheadLocal ? touchLocal.x - playheadLocal.x : 0;
+            this.mixerDraggingPlayhead = true;
+            setFromTouch(event);
+        }, this);
         node.on(Node.EventType.TOUCH_MOVE, setFromTouch, this);
-        const finish = (event: EventTouch) => { setFromTouch(event); this.mixerDraggingPlayhead = false; };
+        const finish = (event: EventTouch) => { setFromTouch(event); this.mixerDraggingPlayhead = false; this.mixerPlayheadTouchOffsetX = 0; };
         node.on(Node.EventType.TOUCH_END, finish, this); node.on(Node.EventType.TOUCH_CANCEL, finish, this);
-        parent.addChild(node);
         const stamp = new Node('MixerPlayheadStamp'); stamp.layer = Layers.Enum.UI_2D; stamp.addComponent(UITransform).setContentSize(30, 34); const stampG = stamp.addComponent(Graphics);
-        stampG.fillColor = new Color(255, 255, 255, 255); stampG.moveTo(-7, 17); stampG.lineTo(7, 17); stampG.lineTo(0, 6); stampG.close(); stampG.fill(); ruler.addChild(stamp);
+        stampG.fillColor = new Color(255, 255, 255, 255); stampG.moveTo(-7, 16); stampG.lineTo(7, 16); stampG.lineTo(0, 5); stampG.close(); stampG.fill(); node.addChild(stamp);
+        stamp.setPosition(0, 0, 0);
+        parent.addChild(node);
+        // Keep the line and marker above the ruler black strip. Track heads and
+        // audio blocks are inserted before the ruler, so they remain underneath it.
+        node.setSiblingIndex(parent.children.length - 1);
+    }
+
+    private paintMixerPlayheadLine(playhead: Node, height: number) {
+        const graphics = playhead.getComponent(Graphics) ?? playhead.addComponent(Graphics);
+        graphics.clear(); graphics.lineWidth = 2; graphics.strokeColor = new Color(255, 255, 255, 255);
+        graphics.moveTo(0, -height / 2); graphics.lineTo(0, height / 2); graphics.stroke();
     }
 
     private setMixerPlayheadFromLocalX(localX: number, width: number, animate = false) {
-        const playhead = this.mixerTimeline?.getChildByName('MixerPlayhead'), stamp = this.mixerTimeline?.getChildByName('TimelineRuler')?.getChildByName('MixerPlayheadStamp'); const from = playhead?.position.clone();
+        // A pane transition owns the playhead transform. Ignore any touch-end that
+        // arrives from the collapse button or the old viewport during that frame.
+        if (this.mixerSourcePaneAnimating) return;
+        const playhead = this.mixerTimeline?.getChildByName('MixerPlayhead'), stamp = playhead?.getChildByName('MixerPlayheadStamp'); const from = playhead?.position.clone();
         const contentInset = this.mixerTimelineContentInset();
         this.mixerPlayheadBeat = Math.max(0, (localX + width / 2 - contentInset + this.mixerScrollX) / this.mixerBeatWidth);
         if (this.mixerFollowPlayhead) this.mixerFollowPlayheadX = localX;
         const targetX = this.mixerPlayheadTimelineX(width);
-        if (playhead && animate && from) { Tween.stopAllByTarget(playhead); playhead.setPosition(from); tween(playhead).to(.3, { position: new Vec3(targetX, 0, 0) }, { easing: 'quadOut' }).start(); if (stamp) { Tween.stopAllByTarget(stamp); tween(stamp).to(.3, { position: new Vec3(targetX, 0, 0) }, { easing: 'quadOut' }).start(); } }
+        if (playhead && animate && from) {
+            Tween.stopAllByTarget(playhead); playhead.setPosition(from); tween(playhead).to(.3, { position: new Vec3(targetX, 0, 0) }, { easing: 'quadOut' }).start();
+            if (stamp) {
+                // The marker is a child of the playhead, so only its vertical
+                // anchor needs to be refreshed; tweening it to Vec3.ZERO makes
+                // the inverted triangle visibly fall during the horizontal move.
+                const stampY = (this.mixerViewport?.getComponent(UITransform)?.contentSize.height ?? width) / 2 - 17 - (this.mixerTimeline?.position.y ?? 0);
+                Tween.stopAllByTarget(stamp); stamp.setPosition(0, stampY, 0);
+            }
+        }
         else this.updateMixerPlayheadVisual();
     }
 
     private mixerPlayheadViewportX(width: number) {
-        return -width / 2 + this.mixerTimelineContentInset() + this.mixerPlayheadBeat * this.mixerBeatWidth - this.mixerScrollX;
+        // During a pane transition the viewport width is tweened, but the grid
+        // geometry remains based on the transition's rendered width. Use that
+        // same width for the playhead so it cannot drift or leave the mask while
+        // the parent timeline is moving.
+        const renderedWidth = this.mixerSourcePaneAnimating && this.mixerTimelineCacheReady
+            ? this.mixerTimelineCacheViewportWidth : width;
+        // During gesture/inertia preview the timeline parent carries the delta
+        // from renderedScrollX to mixerScrollX. Keep the playhead in the same
+        // rendered coordinate as the grid so that delta is applied exactly once.
+        const previewing = Math.abs(this.mixerScrollX - this.mixerRenderedScrollX) > .001
+            || Math.abs(this.mixerScrollY - this.mixerRenderedScrollY) > .001;
+        const visualScrollX = previewing ? this.mixerRenderedScrollX : this.mixerScrollX;
+        return -renderedWidth / 2 + this.mixerTimelineContentInset() + this.mixerPlayheadBeat * this.mixerBeatWidth - visualScrollX;
     }
 
     private mixerPlayheadTimelineX(width: number) {
-        const timeline = this.mixerTimeline, viewportX = this.mixerPlayheadViewportX(width);
-        if (!timeline) return viewportX;
-        return (viewportX - timeline.position.x) / Math.max(.001, timeline.scale.x);
+        // Playhead and grid are both children of the animated timeline. Keep the
+        // playhead in the same canonical local coordinate as the grid instead of
+        // subtracting the timeline's temporary transition/inertia transform. The
+        // parent movement must carry both visuals together.
+        return this.mixerPlayheadViewportX(width);
+    }
+
+    private mixerPlayheadPanelX(width: number) {
+        return this.mixerPlayheadTimelineX(width);
     }
 
     private updateMixerPlayheadVisual() {
-        const viewport = this.mixerViewport, playhead = this.mixerTimeline?.getChildByName('MixerPlayhead'), stamp = this.mixerTimeline?.getChildByName('TimelineRuler')?.getChildByName('MixerPlayheadStamp');
+        const viewport = this.mixerViewport, timeline = this.mixerTimeline, playhead = timeline?.getChildByName('MixerPlayhead'), stamp = playhead?.getChildByName('MixerPlayheadStamp');
         if (!viewport || !playhead) return;
+        playhead.active = !this.mixerMultiSelectMode; if (this.mixerMultiSelectMode) return;
         Tween.stopAllByTarget(playhead); if (stamp) Tween.stopAllByTarget(stamp);
-        const width = viewport.getComponent(UITransform)!.contentSize.width;
-        const x = this.mixerPlayheadTimelineX(width), inverseScale = 1 / Math.max(.001, this.mixerTimeline?.scale.x ?? 1);
-        playhead.setPosition(x, 0, 0); playhead.setScale(inverseScale, 1, 1); if (stamp) { stamp.setPosition(x, 0, 0); stamp.setScale(inverseScale, 1, 1); }
+        const viewportSize = viewport.getComponent(UITransform)!.contentSize;
+        const width = viewportSize.width;
+        const x = this.mixerPlayheadTimelineX(width), inverseScale = 1 / Math.max(.001, timeline?.scale.x ?? 1);
+        playhead.setPosition(x, 0, 0); playhead.setScale(inverseScale, 1, 1);
+        if (stamp) {
+            stamp.setPosition(0, viewportSize.height / 2 - 18 - (timeline?.position.y ?? 0), 0);
+            stamp.setScale(inverseScale, 1, 1);
+        }
     }
 
     private previewMixerGestureTransform(viewportWidth: number) {
@@ -3624,10 +4527,14 @@ export class GameManager extends Component {
             if (child.name.startsWith('TrackHead')) { child.setScale(1 / scaleX, 1, 1); child.setPosition((-viewportWidth / 2 + MIXER_TRACK_HEAD_WIDTH / 2 + 2 - offsetX) / scaleX, child.position.y, 0); }
         }
         const ruler = this.mixerTimeline.getChildByName('TimelineRuler');
-        const viewportHeight = this.mixerViewport?.getComponent(UITransform)?.contentSize.height ?? 0;
+        const grid = this.mixerTimeline.getChildByName('TimelineGrid');
+        const rulerLabels = this.mixerTimeline.getChildByName('TimelineRulerLabels');
+        const viewportHeight = this.mixerTimelineViewportHeight || this.mixerViewport?.getComponent(UITransform)?.contentSize.height || 0;
         if (ruler) ruler.setPosition(0, viewportHeight / 2 - 17 - offsetY, 0);
+        if (rulerLabels) rulerLabels.setPosition(grid?.position.x ?? 0, viewportHeight / 2 - 17 - offsetY, 0);
         if (this.mixerPlaying && this.mixerFollowPlayhead && this.mixerViewportInteractionActive()) this.captureMixerFollowPlayheadPosition();
         this.updateMixerPlayheadVisual();
+        this.updateMixerConnections();
     }
 
     private mixerViewportInteractionActive() {
@@ -3713,8 +4620,13 @@ export class GameManager extends Component {
             this.stopMixerInertia(false);
             let target = e.target as Node | null;
             while (target && target !== viewport) {
-                if (target.name.startsWith('MixerBlock') || target.name.startsWith('TrackHead')) return;
+                if (target.name.startsWith('MixerBlock') || (!this.mixerMultiSelectMode && target.name.startsWith('TrackHead'))) return;
                 target = target.parent;
+            }
+            if (this.mixerMultiSelectMode) {
+                const local = this.mixerMultiViewportPoint(e); if (!local) return;
+                this.mixerMultiBoxTouchId = e.getID(); this.mixerMultiBoxStart = local.clone(); this.mixerMultiBoxCurrent = null;
+                e.propagationStopped = true; return;
             }
             const activeTouches = (e as any).getAllTouches?.() as any[] | undefined; if (!activeTouches || activeTouches.length <= 1) this.mixerGestureTouches.clear();
             const p = e.getUILocation(); this.mixerGestureTouches.set(e.getID(), new Vec3(p.x, p.y, 0));
@@ -3728,6 +4640,12 @@ export class GameManager extends Component {
             e.propagationStopped = true;
         }, this);
         viewport.on(Node.EventType.TOUCH_MOVE, e => {
+            if (this.mixerMultiSelectMode) {
+                if (e.getID() !== this.mixerMultiBoxTouchId) return;
+                const local = this.mixerMultiViewportPoint(e), start = this.mixerMultiBoxStart;
+                if (local && start && (this.mixerMultiBoxCurrent || Math.hypot(local.x - start.x, local.y - start.y) >= 18)) { this.mixerMultiBoxCurrent = local; this.paintMixerMultiSelectOverlay(); }
+                e.propagationStopped = true; return;
+            }
             if (!this.mixerGestureTouches.has(e.getID())) return;
             const p = e.getUILocation(); this.mixerGestureTouches.set(e.getID(), new Vec3(p.x, p.y, 0)); const points = Array.from(this.mixerGestureTouches.values());
             if (points.length >= 2) {
@@ -3748,6 +4666,11 @@ export class GameManager extends Component {
             this.previewMixerGestureTransform(viewport.getComponent(UITransform)!.contentSize.width); e.propagationStopped = true;
         }, this);
         const end = (e: EventTouch) => {
+            if (this.mixerMultiSelectMode) {
+                if (e.getID() !== this.mixerMultiBoxTouchId) return;
+                const local = this.mixerMultiViewportPoint(e); if (local && this.mixerMultiBoxCurrent) this.mixerMultiBoxCurrent = local;
+                this.finishMixerMultiBoxSelection(); e.propagationStopped = true; return;
+            }
             if (!this.mixerGestureTouches.has(e.getID())) return;
             const gestureChanged = this.mixerGestureMoved, wasPinch = this.mixerGestureTouches.size > 1 || this.mixerLastPinchDistance > 0;
             const wasTap = !gestureChanged && this.mixerGestureTouches.size === 1; this.mixerGestureTouches.delete(e.getID());
@@ -3769,6 +4692,7 @@ export class GameManager extends Component {
     private redrawMixerTransportButtons() {
         this.redrawMixerTransportButton('AudioTimelineFollow', this.mixerFollowPlayhead);
         this.redrawMixerTransportButton('AudioTimelinePlay', this.mixerPlaying);
+        this.redrawMixerTransportButton('AudioTimelineStop', false);
     }
 
     private captureMixerFollowPlayheadPosition() {
@@ -3788,7 +4712,7 @@ export class GameManager extends Component {
         }
         this.mixerScrollX = Math.max(0, -width / 2 + this.mixerTimelineContentInset() + this.mixerPlayheadBeat * this.mixerBeatWidth - this.mixerFollowPlayheadX);
         this.previewMixerGestureTransform(width);
-        if (Math.abs(this.mixerScrollX - this.mixerRenderedScrollX) > width * .42) this.queueMixerRedraw();
+        if (Math.abs(this.mixerScrollX - this.mixerRenderedScrollX) > width * .42) this.redrawMixerTimeline();
     }
 
     private toggleMixerPlayheadFollow() {
@@ -3799,17 +4723,17 @@ export class GameManager extends Component {
 
     private toggleMixerTimelinePlayback() {
         if (this.mixerPlaying) { NativeBridge.stopAudioFiles(); this.mixerPlaying = false; if (this.mixerPlayTimer !== null) cancelAnimationFrame(this.mixerPlayTimer); this.mixerPlayTimer = null; this.mixerPlayheadBeat = this.mixerPlaybackAnchorBeat; this.updateMixerFollowPosition(); this.redrawMixerTransportButtons(); return; }
-        const allBlocks = this.timelineBlocks(true); if (!allBlocks.length) return;
+        const allBlocks = this.timelineBlocks(true);
         this.mixerPlaybackAnchorBeat = this.mixerPlayheadBeat;
         if (this.mixerFollowPlayhead) this.captureMixerFollowPlayheadPosition();
         const blocks = this.mixerTimelineBlocksFrom(this.mixerPlaybackAnchorBeat, allBlocks);
-        if (!blocks.length) return;
         this.mixerPlaybackEndBeat = this.mixerTimelineEndBeat(allBlocks);
-        NativeBridge.playTimeline(blocks, this.metronomeBpm); this.mixerPlaying = true; this.redrawMixerTransportButtons(); const started = performance.now();
+        if (blocks.length) NativeBridge.playTimeline(blocks, this.metronomeBpm);
+        else NativeBridge.stopAudioFiles();
+        this.mixerPlaying = true; this.redrawMixerTransportButtons(); const started = performance.now();
         const advance = (now: number) => {
             if (!this.mixerPlaying) return;
             this.mixerPlayheadBeat = this.mixerPlaybackAnchorBeat + (now - started) / 60000 * this.metronomeBpm;
-            if (this.mixerPlayheadBeat >= this.mixerPlaybackEndBeat) { this.mixerPlayheadBeat = this.mixerPlaybackEndBeat; this.stopMixerTimelinePlayback(true); return; }
             this.updateMixerFollowPosition();
             this.mixerPlayTimer = requestAnimationFrame(advance);
         };
@@ -3862,23 +4786,35 @@ export class GameManager extends Component {
         redraw = () => { const block = currentBlock(), clip = currentClip(); if (block && clip) this.drawAutomationGraph(gfx, graphW, graphH, block, clip, this.mixerEditorCropStart, this.mixerEditorCropEnd); };
         const touches = new Map<number, Vec3>(); let drawing = false; let pinchDistance = 0; let pinchSpeed = 1;
         const graphPoint = (event: EventTouch) => { const p = event.getUILocation(); const local = transform.convertToNodeSpaceAR(new Vec3(p.x, p.y, 0)); return { x: Math.max(0, Math.min(1, (local.x + graphW / 2) / graphW)), y: Math.max(0, Math.min(1, (local.y + graphH / 2) / graphH)) }; };
+        const cropGraphPoint = (event: EventTouch, block: MixerBlock) => { const point = graphPoint(event); const clip = currentClip(); if (this.mixerMagnet && clip) point.x = this.snapMixerCropRatio(block, clip, point.x); return point; };
         graph.on(Node.EventType.TOUCH_START, (event: EventTouch) => {
             const p = event.getUILocation(); touches.set(event.getID(), new Vec3(p.x, p.y, 0)); const block = currentBlock(); if (!block) return;
-            if (touches.size === 1) { this.pushMixerEditorUndo(); drawing = true; const point = graphPoint(event); if (this.mixerEditorCropping) this.mixerEditorCropStart = this.mixerEditorCropEnd = point.x; else { this.upsertAutomationPoint(block, point.x, this.mixerEditorMode === 'pan' ? point.y * 2 - 1 : point.y); this.syncAutomationSamples(block); } }
+            if (touches.size === 1) { this.pushMixerEditorUndo(); drawing = true; const point = this.mixerEditorCropping ? cropGraphPoint(event, block) : graphPoint(event); if (this.mixerEditorCropping) this.mixerEditorCropStart = this.mixerEditorCropEnd = point.x; else { this.upsertAutomationPoint(block, point.x, this.mixerEditorMode === 'pan' ? point.y * 2 - 1 : point.y); this.syncAutomationSamples(block); } }
             else if (touches.size === 2 && !this.mixerEditorCropping) { const beforeDraw = this.mixerEditorUndo.pop(); if (beforeDraw) this.restoreMixerEditorSnapshot(beforeDraw); this.pushMixerEditorUndo(); const points = Array.from(touches.values()); pinchDistance = Math.max(8, Math.abs(points[1].x - points[0].x)); pinchSpeed = currentBlock()?.speed ?? 1; drawing = false; }
             redraw(); event.propagationStopped = true;
         }, this);
         graph.on(Node.EventType.TOUCH_MOVE, (event: EventTouch) => {
             const p = event.getUILocation(); touches.set(event.getID(), new Vec3(p.x, p.y, 0)); const block = currentBlock(); if (!block) return;
             if (touches.size >= 2 && !this.mixerEditorCropping) { const points = Array.from(touches.values()); const distance = Math.max(8, Math.abs(points[1].x - points[0].x)); block.speed = Math.max(.25, Math.min(4, pinchSpeed * pinchDistance / distance)); updateSpeedLabel(); }
-            else if (drawing) { const point = graphPoint(event); if (this.mixerEditorCropping) this.mixerEditorCropEnd = point.x; else { this.upsertAutomationPoint(block, point.x, this.mixerEditorMode === 'pan' ? point.y * 2 - 1 : point.y); this.syncAutomationSamples(block); } }
+            else if (drawing) { const point = this.mixerEditorCropping ? cropGraphPoint(event, block) : graphPoint(event); if (this.mixerEditorCropping) this.mixerEditorCropEnd = point.x; else { this.upsertAutomationPoint(block, point.x, this.mixerEditorMode === 'pan' ? point.y * 2 - 1 : point.y); this.syncAutomationSamples(block); } }
             redraw(); event.propagationStopped = true;
         }, this);
         const finishGraphTouch = (event: EventTouch) => {
+            const block = currentBlock();
             const hadMultiple = touches.size >= 2; touches.delete(event.getID());
+            let timelineChanged = false;
             if (hadMultiple) { this.resolveMixerBlockOverlap(blockId); updateSpeedLabel(); }
-            else if (drawing && this.mixerEditorCropping) { const point = graphPoint(event); this.mixerEditorCropEnd = point.x; const a = Math.min(this.mixerEditorCropStart, this.mixerEditorCropEnd), b = Math.max(this.mixerEditorCropStart, this.mixerEditorCropEnd); if (b - a > .004) this.applyMixerCrop(blockId, a, b); this.mixerEditorCropping = false; this.mixerEditorCropStart = -1; this.mixerEditorCropEnd = -1; }
-            drawing = false; this.saveAudioClips(); this.saveMixerTracks(); redraw(); event.propagationStopped = true;
+            else if (drawing && this.mixerEditorCropping && block) {
+                const point = cropGraphPoint(event, block); this.mixerEditorCropEnd = point.x;
+                const a = Math.min(this.mixerEditorCropStart, this.mixerEditorCropEnd), b = Math.max(this.mixerEditorCropStart, this.mixerEditorCropEnd);
+                if (b - a > .004) { this.applyMixerCrop(blockId, a, b); timelineChanged = true; }
+                else {
+                    const clip = currentClip();
+                    if (clip && this.isMixerCropGridRatio(block, clip, this.mixerEditorCropStart)) { this.splitMixerBlockAtRatio(blockId, this.mixerEditorCropStart); timelineChanged = true; }
+                }
+            }
+            if (this.mixerEditorCropping) { this.mixerEditorCropping = false; this.mixerEditorCropStart = -1; this.mixerEditorCropEnd = -1; }
+            drawing = false; this.saveAudioClips(); this.saveMixerTracks(); if (timelineChanged) this.queueMixerRedraw(); redraw(); event.propagationStopped = true;
         };
         graph.on(Node.EventType.TOUCH_END, finishGraphTouch, this); graph.on(Node.EventType.TOUCH_CANCEL, finishGraphTouch, this);
         const modeY = -ph / 2 + 32; [['音量', 'volume'], ['音高', 'pitch'], ['声相', 'pan']].forEach((item, i) => this.makePanelButton(panel, t(item[0], item[1]), -250 + i * 85, modeY, 75, 34, () => { this.mixerEditorMode = item[1] as any; const block = currentBlock(); if (block) this.automationPoints(block); redraw(); }, new Color(32, 42, 62, 255)));
@@ -3891,7 +4827,7 @@ export class GameManager extends Component {
 
     private captureMixerEditorSnapshot(): MixerEditorSnapshot { return { tracks: JSON.parse(JSON.stringify(this.mixerTracks)), clips: JSON.parse(JSON.stringify(this.recordedClips)) }; }
     private pushMixerEditorUndo() { this.mixerEditorUndo.push(this.captureMixerEditorSnapshot()); if (this.mixerEditorUndo.length > 30) this.mixerEditorUndo.shift(); }
-    private restoreMixerEditorSnapshot(snapshot: MixerEditorSnapshot) { this.mixerTracks = JSON.parse(JSON.stringify(snapshot.tracks)); this.recordedClips = JSON.parse(JSON.stringify(snapshot.clips)); this.saveAudioClips(); this.saveMixerTracks(); }
+    private restoreMixerEditorSnapshot(snapshot: MixerEditorSnapshot) { this.mixerTracks = JSON.parse(JSON.stringify(snapshot.tracks)); this.ensureMixerTrack(12); this.recordedClips = JSON.parse(JSON.stringify(snapshot.clips)); this.saveAudioClips(); this.saveMixerTracks(); }
 
     private automationPoints(block: MixerBlock): AutomationPoint[] {
         const fallback = this.mixerEditorMode === 'pan' ? 0 : 1;
@@ -3973,12 +4909,88 @@ export class GameManager extends Component {
         }
     }
 
+    private snapMixerCropRatio(block: MixerBlock, clip: AudioClipMeta, ratio: number) {
+        const clamped = Math.max(0, Math.min(1, ratio));
+        if (!this.mixerMagnet) return clamped;
+        const durationBeats = Math.max(.001, this.clipBeats(clip, block));
+        const startBeat = Math.max(0, block.startBeat);
+        const endBeat = startBeat + durationBeats;
+        let nearest = clamped, nearestDistance = Infinity;
+        const consider = (candidate: number) => {
+            const distance = Math.abs(candidate - clamped);
+            if (distance < nearestDistance) { nearest = candidate; nearestDistance = distance; }
+        };
+        for (let beat = Math.ceil(startBeat - 1e-6); beat < endBeat - 1e-6; beat++) {
+            consider((beat - startBeat) / durationBeats);
+        }
+        // Prefer an interior grid line when it is exactly at the touch point;
+        // this keeps a short leading/trailing partial-beat cell selectable.
+        consider(0); consider(1);
+        return Math.max(0, Math.min(1, nearest));
+    }
+
+    private isMixerCropGridRatio(block: MixerBlock, clip: AudioClipMeta, ratio: number) {
+        const clamped = Math.max(0, Math.min(1, ratio));
+        if (clamped <= .004 || clamped >= .996) return false;
+        const durationBeats = Math.max(.001, this.clipBeats(clip, block));
+        const startBeat = Math.max(0, block.startBeat);
+        const endBeat = startBeat + durationBeats;
+        for (let beat = Math.ceil(startBeat - 1e-6); beat < endBeat - 1e-6; beat++) {
+            if (Math.abs((beat - startBeat) / durationBeats - clamped) <= .004) return true;
+        }
+        return false;
+    }
+
+    private splitMixerBlockAtRatio(blockId: string, ratio: number) {
+        const found = this.findMixerBlock(blockId); if (!found) return;
+        const clip = this.recordedClips.find(item => item.id === found.block.clipId); if (!clip) return;
+        const ranges = this.mixerBlockTrimRanges(clip, found.block);
+        const totalSeconds = ranges.reduce((sum, range) => sum + range.end - range.start, 0);
+        const cutOffset = totalSeconds * Math.max(0, Math.min(1, ratio));
+        if (cutOffset < .02 || totalSeconds - cutOffset < .02) return;
+        const left: Array<{ start: number; end: number }> = [], rightRanges: Array<{ start: number; end: number }> = [];
+        let elapsed = 0;
+        for (const range of ranges) {
+            const length = range.end - range.start;
+            if (cutOffset <= elapsed) rightRanges.push(range);
+            else if (cutOffset >= elapsed + length) left.push(range);
+            else { left.push({ start: range.start, end: range.start + cutOffset - elapsed }); rightRanges.push({ start: range.start + cutOffset - elapsed, end: range.end }); }
+            elapsed += length;
+        }
+        if (!left.length || !rightRanges.length) return;
+        const right: MixerBlock = JSON.parse(JSON.stringify(found.block));
+        right.id = `block_${Date.now()}_split`;
+        this.setMixerBlockTrimRanges(found.block, left);
+        this.setMixerBlockTrimRanges(right, rightRanges);
+        right.startBeat = found.block.startBeat + cutOffset * this.metronomeBpm / 60 / Math.max(.25, found.block.speed ?? 1);
+        const targetTrack = this.findFreeMixerTrack(found.trackIndex, right.startBeat, this.clipBeats(clip, right), blockId);
+        this.ensureMixerTrack(targetTrack)?.blocks.push(right);
+        this.saveMixerTracks();
+    }
+
     private applyMixerCrop(blockId: string, startRatio: number, endRatio: number) {
-        const found = this.findMixerBlock(blockId); if (!found) return; const clip = this.recordedClips.find(item => item.id === found.block.clipId); if (!clip) return; const baseStart = found.block.trimStart ?? clip.trimStart; const baseEnd = (found.block.trimEnd ?? clip.trimEnd) > baseStart ? (found.block.trimEnd ?? clip.trimEnd) : clip.duration; const cutStart = baseStart + (baseEnd - baseStart) * startRatio, cutEnd = baseStart + (baseEnd - baseStart) * endRatio;
-        if (endRatio - startRatio < .004 || cutEnd - cutStart >= baseEnd - baseStart - .02) return;
-        if (startRatio <= .01) found.block.trimStart = cutEnd;
-        else if (endRatio >= .99) found.block.trimEnd = cutStart;
-        else { const right: MixerBlock = JSON.parse(JSON.stringify(found.block)); right.id = `block_${Date.now()}_crop`; right.trimStart = cutEnd; right.trimEnd = baseEnd; found.block.trimEnd = cutStart; right.startBeat = found.block.startBeat + (cutStart - baseStart) * this.metronomeBpm / 60 / Math.max(.25, found.block.speed ?? 1); const targetTrack = this.findFreeMixerTrack(found.trackIndex, right.startBeat, this.clipBeats(clip, right)); this.ensureMixerTrack(targetTrack)?.blocks.push(right); }
+        const found = this.findMixerBlock(blockId); if (!found) return; const clip = this.recordedClips.find(item => item.id === found.block.clipId); if (!clip) return;
+        if (this.mixerMagnet) {
+            startRatio = this.snapMixerCropRatio(found.block, clip, startRatio);
+            endRatio = this.snapMixerCropRatio(found.block, clip, endRatio);
+        }
+        const ranges = this.mixerBlockTrimRanges(clip, found.block);
+        const totalSeconds = ranges.reduce((sum, range) => sum + range.end - range.start, 0);
+        const cutStart = totalSeconds * Math.max(0, Math.min(1, startRatio));
+        const cutEnd = totalSeconds * Math.max(0, Math.min(1, endRatio));
+        if (cutEnd - cutStart < .004 || cutEnd - cutStart >= totalSeconds - .02) return;
+        const kept: Array<{ start: number; end: number }> = [];
+        let elapsed = 0;
+        for (const range of ranges) {
+            const length = range.end - range.start;
+            const keepBefore = Math.max(0, Math.min(length, cutStart - elapsed));
+            const keepAfter = Math.max(0, Math.min(length, elapsed + length - cutEnd));
+            if (keepBefore > .001) kept.push({ start: range.start, end: range.start + keepBefore });
+            if (keepAfter > .001) kept.push({ start: range.end - keepAfter, end: range.end });
+            elapsed += length;
+        }
+        if (!kept.length) return;
+        this.setMixerBlockTrimRanges(found.block, kept);
         this.resolveMixerBlockOverlap(blockId);
     }
     private resolveMixerBlockOverlap(blockId: string) { const found = this.findMixerBlock(blockId); if (!found) return; const clip = this.recordedClips.find(item => item.id === found.block.clipId); if (!clip) return; const target = this.findFreeMixerTrack(found.trackIndex, found.block.startBeat, this.clipBeats(clip, found.block), blockId); if (target !== found.trackIndex) { found.track.blocks = found.track.blocks.filter(item => item.id !== blockId); this.ensureMixerTrack(target)?.blocks.push(found.block); } }
@@ -4029,10 +5041,13 @@ export class GameManager extends Component {
     }
 
     private redrawPanelButton(node: Node) {
-        const style = (node as any).__panelButtonStyle as { w: number; h: number; color: Color; fillColor?: Color; strokeColor?: Color } | undefined;
+        const style = (node as any).__panelButtonStyle as { w: number; h: number; color: Color; fillColor?: Color; strokeColor?: Color; graphicsOpacity?: number } | undefined;
         const g = node.getComponent(Graphics); if (!style || !g) return;
-        g.clear(); g.roundRect(-style.w / 2, -style.h / 2, style.w, style.h, Math.min(8, style.h / 3)); g.fillColor = style.fillColor ?? style.color; g.fill();
-        g.lineWidth = style.strokeColor ? 2 : 1.2; g.strokeColor = style.strokeColor ?? new Color(125, 150, 188, 230); g.stroke();
+        const opacity = Math.max(0, Math.min(1, style.graphicsOpacity ?? 1));
+        const fill = style.fillColor ?? style.color, stroke = style.strokeColor ?? new Color(125, 150, 188, 230);
+        g.clear(); g.roundRect(-style.w / 2, -style.h / 2, style.w, style.h, Math.min(8, style.h / 3));
+        g.fillColor = new Color(fill.r, fill.g, fill.b, Math.round(fill.a * opacity)); g.fill();
+        g.lineWidth = style.strokeColor ? 2 : 1.2; g.strokeColor = new Color(stroke.r, stroke.g, stroke.b, Math.round(stroke.a * opacity)); g.stroke();
     }
 
     private setPanelButtonBlackFill(node: Node) {
@@ -4850,16 +5865,22 @@ export class GameManager extends Component {
         const angle = this.readDeviceAngle(event);
         // 低通平滑（强平滑，抗抖动）
         this.deviceAngleSmoothed = this.deviceAngleSmoothed * 0.9 + angle * 0.1;
-        // 启动校零：等平滑值收敛后（前 12 次采样），按绝对方向确定初始朝向
+        // 首次启动以当前握持姿态作为横屏基准，避免系统横屏窗口内的 UI 又被传感器旋成竖向。
         if (!this.calibrated) {
             this.calibrationCount++;
             if (this.calibrationCount >= 12) {
                 this.calibrated = true;
-                this.calibOffset = 0;
-                this.currentSnapped = this.absSnapped();
+                if (this.startupLandscapePending) {
+                    this.calibOffset = this.deviceAngleSmoothed - GameManager.LANDSCAPE_ABS;
+                    this.currentSnapped = 0;
+                    this.startupLandscapePending = false;
+                } else {
+                    this.calibOffset = 0;
+                    this.currentSnapped = this.absSnapped();
+                }
                 const tgt = this.targetForSnapped(this.currentSnapped);
                 this.applyRotation(tgt, false);
-                console.warn('[CM] 校零完成(绝对) snapped=', this.currentSnapped, 'target=', tgt);
+                console.warn('[CM] 校零完成 snapped=', this.currentSnapped, 'target=', tgt);
             }
             return;
         }

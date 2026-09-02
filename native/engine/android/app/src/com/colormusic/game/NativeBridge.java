@@ -80,16 +80,37 @@ public class NativeBridge {
         return thread;
     });
     private static int sPlaybackGeneration = 0;
+    private static boolean sTimelineAutomationScheduled = false;
 
     private static final class TimelinePlayerState {
         final String trackId;
-        final float volume;
+        final float baseVolume;
+        final float[] volumeAutomation;
+        final long startMs;
+        final long endMs;
 
-        TimelinePlayerState(String trackId, float volume) {
+        TimelinePlayerState(String trackId, float baseVolume, float[] volumeAutomation, long startMs, long endMs) {
             this.trackId = trackId;
-            this.volume = volume;
+            this.baseVolume = baseVolume;
+            this.volumeAutomation = volumeAutomation;
+            this.startMs = startMs;
+            this.endMs = endMs;
         }
     }
+
+    private static final Runnable sTimelineAutomationTick = new Runnable() {
+        @Override public void run() {
+            synchronized (NativeBridge.class) {
+                sTimelineAutomationScheduled = false;
+                if (sTimelinePlayers.isEmpty()) return;
+                for (Map.Entry<MediaPlayer, TimelinePlayerState> entry : sTimelinePlayers.entrySet()) {
+                    applyTimelinePlayerVolume(entry.getKey(), entry.getValue());
+                }
+                sTimelineAutomationScheduled = true;
+                sPlaybackHandler.postDelayed(this, 16);
+            }
+        }
+    };
 
     private NativeBridge() { }
 
@@ -514,9 +535,11 @@ public class NativeBridge {
         final int sampleRate;
         final int frameBytes;
         final float volume;
+        final float[] volumeAutomation;
         final long startFrames;
         final long totalFrames;
         long framesRemaining;
+        long framesRead;
         byte[] block = new byte[0];
 
         MixInput(org.json.JSONObject clip) throws IOException {
@@ -540,6 +563,7 @@ public class NativeBridge {
                 framesRemaining = Math.max(0, end - start);
                 this.totalFrames = framesRemaining;
                 volume = Math.max(0f, Math.min(1f, (float) clip.optDouble("volume", 1)));
+                volumeAutomation = timelineAutomation(clip);
                 int bpm = Math.max(20, Math.min(320, clip.optInt("bpm", 120)));
                 startFrames = Math.max(0, Math.round(clip.optDouble("startBeat", 0) * 60.0 / bpm * sampleRate));
                 file.seek(44 + start * frameBytes);
@@ -568,10 +592,12 @@ public class NativeBridge {
                 int at = frame * frameBytes;
                 float l = (short) little16(block, at) / 32768f;
                 float r = channels == 1 ? l : (short) little16(block, at + 2) / 32768f;
-                left[frame + outputOffset] += l * volume;
-                right[frame + outputOffset] += r * volume;
+                float gain = volume * timelineAutomationGain(volumeAutomation, (framesRead + frame) / (float) Math.max(1, totalFrames - 1));
+                left[frame + outputOffset] += l * gain;
+                right[frame + outputOffset] += r * gain;
             }
             framesRemaining -= actualFrames;
+            framesRead += actualFrames;
             return actualFrames;
         }
 
@@ -746,6 +772,40 @@ public class NativeBridge {
         }
     }
 
+    private static float[] timelineAutomation(org.json.JSONObject block) {
+        org.json.JSONArray values = block.optJSONArray("volumeAutomation");
+        if (values == null || values.length() == 0) return new float[] { 1f };
+        float[] result = new float[values.length()];
+        for (int i = 0; i < result.length; i++) result[i] = Math.max(0f, Math.min(1f, (float) values.optDouble(i, 1)));
+        return result;
+    }
+
+    private static float timelineAutomationGain(float[] values, float ratio) {
+        if (values == null || values.length == 0) return 1f;
+        if (values.length == 1) return values[0] <= .005f ? 0f : values[0];
+        float position = Math.max(0f, Math.min(1f, ratio)) * (values.length - 1);
+        int left = Math.min(values.length - 1, (int) Math.floor(position));
+        int right = Math.min(values.length - 1, left + 1);
+        float gain = values[left] + (values[right] - values[left]) * (position - left);
+        return gain <= .005f ? 0f : gain;
+    }
+
+    private static void applyTimelinePlayerVolume(MediaPlayer player, TimelinePlayerState state) {
+        try {
+            float ratio = (player.getCurrentPosition() - state.startMs) / (float) Math.max(1, state.endMs - state.startMs);
+            float gain = timelineAutomationGain(state.volumeAutomation, ratio);
+            boolean audible = state.trackId.isEmpty() || Boolean.TRUE.equals(sTimelineTrackAudible.get(state.trackId));
+            float volume = audible ? state.baseVolume * gain : 0f;
+            player.setVolume(volume, volume);
+        } catch (Exception ignored) { }
+    }
+
+    private static void ensureTimelineAutomationTick() {
+        if (sTimelineAutomationScheduled) return;
+        sTimelineAutomationScheduled = true;
+        sPlaybackHandler.post(sTimelineAutomationTick);
+    }
+
     /** Play timeline blocks at beat offsets without blocking the Cocos thread. */
     public static synchronized void playTimeline(String blocksJson, int requestedBpm) {
         stopAudioFiles();
@@ -808,9 +868,6 @@ public class NativeBridge {
                     }
                     float volume = Math.max(0f, Math.min(1f, (float) block.optDouble("volume", 1)));
                     String trackId = block.optString("trackId", "");
-                    boolean audible = trackId.isEmpty() ? block.optBoolean("trackAudible", true) : Boolean.TRUE.equals(sTimelineTrackAudible.get(trackId));
-                    prepared.setVolume(audible ? volume : 0f, audible ? volume : 0f);
-                    sTimelinePlayers.put(prepared, new TimelinePlayerState(trackId, volume));
                     float speed = Math.max(.25f, Math.min(4f, (float) block.optDouble("speed", 1)));
                     if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M && Math.abs(speed - 1f) > .001f) {
                         try { prepared.setPlaybackParams(prepared.getPlaybackParams().setSpeed(speed)); } catch (Exception ignored) { }
@@ -819,6 +876,10 @@ public class NativeBridge {
                     long requestedEnd = Math.round(block.optDouble("trimEnd", 0) * 1000);
                     long endMs = requestedEnd > startMs ? Math.min(requestedEnd, prepared.getDuration()) : prepared.getDuration();
                     long playMs = Math.max(1, Math.round((endMs - startMs) / speed));
+                    TimelinePlayerState state = new TimelinePlayerState(trackId, volume, timelineAutomation(block), startMs, endMs);
+                    sTimelinePlayers.put(prepared, state);
+                    applyTimelinePlayerVolume(prepared, state);
+                    ensureTimelineAutomationTick();
                     Runnable begin = () -> beginPreparedTimelinePlayer(prepared, generation, endMs, playMs);
                     if (startMs > 0) {
                         prepared.setOnSeekCompleteListener(seeked -> begin.run());
@@ -871,8 +932,7 @@ public class NativeBridge {
             }
             for (Map.Entry<MediaPlayer, TimelinePlayerState> entry : sTimelinePlayers.entrySet()) {
                 TimelinePlayerState state = entry.getValue();
-                boolean audible = state.trackId.isEmpty() || Boolean.TRUE.equals(sTimelineTrackAudible.get(state.trackId));
-                try { entry.getKey().setVolume(audible ? state.volume : 0f, audible ? state.volume : 0f); } catch (Exception ignored) { }
+                applyTimelinePlayerVolume(entry.getKey(), state);
             }
         } catch (Exception error) {
             Log.e(TAG, "setTimelineTrackAudibility failed", error);
@@ -886,6 +946,8 @@ public class NativeBridge {
         for (Runnable scheduled : sScheduledPlayback) sPlaybackHandler.removeCallbacks(scheduled);
         sScheduledPlayback.clear();
         sLoopRestart = null;
+        sPlaybackHandler.removeCallbacks(sTimelineAutomationTick);
+        sTimelineAutomationScheduled = false;
         for (MediaPlayer player : sClipPlayers) {
             try { player.stop(); } catch (Exception ignored) { }
             try { player.release(); } catch (Exception ignored) { }

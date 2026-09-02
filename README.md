@@ -4,7 +4,7 @@ Neuro（demo） is an interactive image-to-sound instrument for Android. Choose 
 
 ## Release
 
-- Current release: **1.5**
+- Current release: **1.6**
 - Platform: **Android only**
 - Resolution: **automatically adapted**; tested on `2944 x 1840` tablets and `2800 x 1260` phones
 - Recommended architecture: `arm64-v8a`
@@ -83,7 +83,7 @@ Install it on a USB-debugging Android device with:
 
 ADB is optional. You can also install the release package directly:
 
-1. Download `Neuro-demo-1.5-arm64-v8a.apk` from the [v1.5 release](https://github.com/ColFumice/ColorMusic/releases/tag/v1.5) on the Android device, or transfer the APK to the device over USB, cloud storage, or a messaging app.
+1. Download `Neuro-demo-1.6-arm64-v8a.apk` from the [v1.6 release](https://github.com/ColFumice/ColorMusic/releases/tag/v1.6) on the Android device, or transfer the APK to the device over USB, cloud storage, or a messaging app.
 2. Open the APK in the device's file manager and confirm **Install**.
 3. If Android blocks the installation, enable **Allow from this source** for the file manager or browser when prompted, then retry.
 
@@ -113,7 +113,7 @@ native/engine/android/app/drum-assets Bundled redistributable drum samples
 
 ## Versioning
 
-The repository publishes releases **1.0**, **1.1**, **1.2**, **1.3**, **1.4**, and **1.5**. Releases 1.0 and 1.1 are preserved as the APK archives supplied for those versions; active source documentation follows the current 1.5 tree.
+The repository publishes releases **1.0**, **1.1**, **1.2**, **1.3**, **1.4**, **1.5**, and **1.6**. Releases 1.0 and 1.1 are preserved as the APK archives supplied for those versions; active source documentation follows the current 1.6 tree.
 
 ## License
 

@@ -26,6 +26,7 @@ package com.colormusic.game;
 
 import android.os.Bundle;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
 import android.content.res.Configuration;
 import android.view.MotionEvent;
 
@@ -48,6 +49,7 @@ public class AppActivity extends CocosActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
         super.onCreate(savedInstanceState);
         // DO OTHER INITIALIZATION BELOW
         SDKWrapper.shared().init(this);
