@@ -160,6 +160,25 @@ interface StyleSnapshot {
     drumWhiteId: string;
     metronome?: { enabled: boolean; beatsPerBar: number; beatUnit: number; bpm: number };
     flowNodes?: Array<{ styleId: string; delaySec: number }>;
+    fileKey?: string;
+}
+
+interface TrackSnapshot {
+    id: string;
+    name: string;
+    createdAt: number;
+    bpm: number;
+    tracks: MixerTrack[];
+    clips: AudioClipMeta[];
+    fileKey?: string;
+}
+
+interface ManagedAudioEntry {
+    key: string;
+    name: string;
+    format: 'wav' | 'mp3';
+    path: string;
+    duration: number;
 }
 
 @ccclass('GameManager')
@@ -294,6 +313,22 @@ export class GameManager extends Component {
     private styles: StyleSnapshot[] = [];
     private styleRows: Node[] = [];
     private expandedStyleId = '';
+    private fileCategory: 'style' | 'flow' | 'track' | 'audio' = 'style';
+    private fileNavButtons: Node[] = [];
+    private fileActionNodes: Node[] = [];
+    private trackSnapshots: TrackSnapshot[] = [];
+    private managedAudioEntries: ManagedAudioEntry[] = [];
+    private expandedManagedAudioKey = '';
+    private managedAudioPlayingKey = '';
+    private managedAudioStartedAt = 0;
+    private managedAudioStartSeconds = 0;
+    private managedAudioProgressFrame: number | null = null;
+    private managedAudioProgressDraw: (() => void) | null = null;
+    private trackExportPanel: Node | null = null;
+    private exportProgressPanel: Node | null = null;
+    private exportProgressFrame: number | null = null;
+    private exportProgressValue = 0;
+    private exportProgressRender: ((value: number) => void) | null = null;
     private flowEditorPanel: Node | null = null;
     private flowEditorNodes: Array<{ styleId: string; delaySec: number }> = [];
     private flowEditorDynamic: Node[] = [];
@@ -383,6 +418,13 @@ export class GameManager extends Component {
     private gridVolumeLabels: Node[] = [];
     private gridState: GridState = loadGridState();
     private gridSettings: GridSettingsUI | null = null;
+    private metronomeVisualStartedAt = -1;
+    private metronomeVisualBeat = -1;
+    private metronomeGridExtra = 0;
+    private displayPixelsPerCm = 0;
+    private gridTouchEffects = new Map<number, { x: number; y: number; strength: number; releasing: boolean }>();
+    private gridTouchPointerEffects = new Map<number, number>();
+    private gridTouchEffectSerial = 0;
     private gridResizeTouches = new Map<number, {
         edge: 'left' | 'right' | 'top' | 'bottom';
         startCoord: number;
@@ -420,11 +462,11 @@ export class GameManager extends Component {
     private calibOffset = 0;        // 手动校准微调（度）
     private calibrationCount = 0;
     private calibrated = false;
+    private hasDeviceAngleSample = false;
     private appWasHidden = false;   // 应用是否进入过后台（用于区分启动 SHOW / 恢复 SHOW）
     private diagCounter = 0;
     private currentSnapped = 0;    // 当前吸附的绝对方向（0/90/180/270）
     private currentTarget = 0;     // 图片当前角度（-90/0/90/180）
-    private startupLandscapePending = true;
 
     onLoad() {
         console.warn('[CM] onLoad start, isNative=', sys.isNative);
@@ -514,6 +556,7 @@ export class GameManager extends Component {
         this.calibrationCount = 0;
         this.calibOffset = 0;
         this.deviceAngleSmoothed = 0;
+        this.hasDeviceAngleSample = false;
     }
 
     /* ============================== UI 构建 ============================== */
@@ -663,6 +706,7 @@ export class GameManager extends Component {
     private toggleMetronome() {
         this.metronomeEnabled = !this.metronomeEnabled;
         NativeBridge.setMetronome(this.metronomeEnabled, this.metronomeBeatsPerBar, this.metronomeBeatUnit, this.metronomeBpm);
+        this.resetMetronomeGridAnimation();
         this.redrawMetronomeButton();
         this.setInfo(this.metronomeEnabled
             ? t(`节拍器已开启（${this.metronomeBeatsPerBar}/${this.metronomeBeatUnit}）`, `Metronome on (${this.metronomeBeatsPerBar}/${this.metronomeBeatUnit})`)
@@ -736,6 +780,19 @@ export class GameManager extends Component {
         this.redrawLockIcon();
         this.applyRotation(this.currentTarget, false);
         this.lockBtn.setSiblingIndex(this.uiRoot.children.length - 1);
+    }
+
+    /** 沉浸锁冻结全部方向；音频轨道和样式管理只允许横向。 */
+    private canFollowOrientation(snapped: number): boolean {
+        if (this.uiLocked) return false;
+        const portrait = snapped === 90 || snapped === 270;
+        return !portrait || (!this.audioPanelOpen && !this.stylePanelOpen);
+    }
+
+    private ensureLandscapePanelOrientation() {
+        if (this.currentTarget !== 90 && this.currentTarget !== -90) return;
+        this.currentSnapped = 0;
+        this.applyRotation(0, true);
     }
 
     private makeConsoleButton(name: string, glyph: string, cb: () => void, glyphColor: Color): Node {
@@ -852,7 +909,6 @@ export class GameManager extends Component {
         const g = menu.addComponent(Graphics);
         g.circle(0, 0, 31);
         g.fillColor = new Color(0, 0, 0, 245); g.fill();
-        g.lineWidth = 2.5; g.strokeColor = new Color(255, 255, 255, 255); g.stroke();
         menu.addComponent(UIOpacity).opacity = 204;
         const labelNode = this.makeLabel('MainMenuGlyph', '∏', 34, 40, new Color(255, 255, 255, 255), 56, 56);
         menu.addChild(labelNode);
@@ -959,17 +1015,18 @@ export class GameManager extends Component {
         this.settingsMenu.active = false;
         const controls = [this.pickBtn, this.testBtn, this.calibBtn, this.guideBtn, this.waveBtn];
         const mainScale = this.mainUiControlScale();
+        const menuListScale = mainScale * 1.5;
         for (let i = 0; i < controls.length; i++) {
             const node = controls[i];
             tween(node).stop();
             node.active = true;
             node.setPosition(this.mainMenuCollapsedPosition[0], this.mainMenuCollapsedPosition[1]);
-            node.setScale(.72 * mainScale, .72 * mainScale, 1);
+            node.setScale(.72 * menuListScale, .72 * menuListScale, 1);
             const opacity = node.getComponent(UIOpacity)!;
             tween(opacity).stop(); opacity.opacity = 0;
             tween(node).delay(i * .035).to(.22, {
                 position: new Vec3(this.mainMenuButtonPositions[i][0], this.mainMenuButtonPositions[i][1], 0),
-                scale: new Vec3(mainScale, mainScale, 1),
+                scale: new Vec3(menuListScale, menuListScale, 1),
             }, { easing: 'quadOut' }).start();
             tween(opacity).delay(i * .035).to(.17, { opacity: 204 }, { easing: 'quadOut' }).start();
         }
@@ -1048,8 +1105,9 @@ export class GameManager extends Component {
                 this.metronomeBeatUnit = unit;
                 this.metronomeBpm = bpm;
                 saveStr('cm_metronome_beats', String(beats)); saveStr('cm_metronome_unit', String(unit)); saveStr('cm_metronome_bpm', String(bpm));
-                if (this.metronomeEnabled) NativeBridge.setMetronome(true, beats, unit, bpm);
+                if (this.metronomeEnabled) { NativeBridge.setMetronome(true, beats, unit, bpm); this.resetMetronomeGridAnimation(); }
                 this.setInfo(t(`节拍器已设为 ${beats}/${unit}，${bpm} BPM`, `Metronome set to ${beats}/${unit}, ${bpm} BPM`), new Color(220, 225, 235, 255));
+                this.showSuccessToast(t('节拍器设置成功', 'Metronome settings saved'));
         });
     }
 
@@ -1833,6 +1891,7 @@ export class GameManager extends Component {
         this.whiteDd?.setValue(this.drumWhiteId);
         this.pushDrumToNative();
         this.setInfo('已全部重置（波形=正弦、RGB 鼓=无、效果器=无、黑白鼓=TR-808）', new Color(220, 225, 235, 255));
+        this.showSuccessToast(t('波表已重置', 'Wavetable reset'));
     }
 
     /** 黑/白鼓元素推给原生。 */
@@ -1868,9 +1927,99 @@ export class GameManager extends Component {
                     this.redrawPlayGrid();
                     this.refreshInfoVisibility();
                 },
-                () => this.gridSettings?.close());
+                () => this.gridSettings?.close(),
+                () => this.showSuccessToast(t('网格已重置', 'Grid reset')));
         }
         this.gridSettings.open(view.w, view.h, portrait);
+    }
+
+    private metronomeBeatSeconds() {
+        return 60 / Math.max(20, this.metronomeBpm) * 4 / Math.max(1, this.metronomeBeatUnit);
+    }
+
+    private resetMetronomeGridAnimation() {
+        this.metronomeVisualStartedAt = this.metronomeEnabled ? performance.now() : -1;
+        this.metronomeVisualBeat = -1;
+        this.metronomeGridExtra = 0;
+        if (this.gridGfx) this.redrawPlayGrid();
+    }
+
+    update(deltaTime: number) {
+        let redraw = false;
+        if (this.metronomeEnabled) {
+            if (this.metronomeVisualStartedAt < 0) this.resetMetronomeGridAnimation();
+            const beatMs = this.metronomeBeatSeconds() * 1000;
+            const elapsed = Math.max(0, performance.now() - this.metronomeVisualStartedAt);
+            const beat = Math.floor(elapsed / beatMs);
+            if (beat !== this.metronomeVisualBeat) this.metronomeVisualBeat = beat;
+            const accent = this.mixerBeatAccent(beat);
+            const peakExtra = accent === 2 ? 2 : (accent === 1 ? .5 : 0);
+            const phase = Math.max(0, Math.min(1, (elapsed - beat * beatMs) / beatMs));
+            const nextExtra = peakExtra * (1 - phase) * (1 - phase);
+            if (Math.abs(nextExtra - this.metronomeGridExtra) > .0001) redraw = true;
+            this.metronomeGridExtra = nextExtra;
+        } else if (this.metronomeGridExtra !== 0) {
+            this.metronomeGridExtra = 0;
+            redraw = true;
+        }
+
+        const releaseSeconds = this.metronomeBeatSeconds() * 1.5;
+        for (const [id, effect] of this.gridTouchEffects) {
+            const before = effect.strength;
+            if (effect.releasing) effect.strength = Math.max(0, effect.strength - deltaTime / releaseSeconds);
+            else effect.strength = Math.min(1, effect.strength + deltaTime / .1);
+            if (effect.strength <= 0) this.gridTouchEffects.delete(id);
+            if (Math.abs(effect.strength - before) > .0001 || effect.strength > 0) redraw = true;
+        }
+        if (redraw && this.gridGfx) this.redrawPlayGrid();
+    }
+
+    private gridTouchRadius(view: { w: number; h: number }) {
+        if (this.displayPixelsPerCm <= 0) this.displayPixelsPerCm = NativeBridge.displayPixelsPerCm();
+        const frame = screen.windowSize;
+        const pixelsPerUnit = ((Math.max(1, frame.width) / view.w) + (Math.max(1, frame.height) / view.h)) / 2;
+        return this.displayPixelsPerCm * 2.5 / Math.max(.01, pixelsPerUnit);
+    }
+
+    private drawTouchWeightedLine(g: Graphics, x1: number, y1: number, x2: number, y2: number, baseWidth: number, radius: number, drawBase = true) {
+        const globalMultiplier = 1 + this.metronomeGridExtra;
+        const baseStroke = new Color(g.strokeColor.r, g.strokeColor.g, g.strokeColor.b, g.strokeColor.a);
+        if (drawBase) {
+            g.lineWidth = baseWidth * globalMultiplier;
+            g.moveTo(x1, y1); g.lineTo(x2, y2); g.stroke();
+        }
+        if (!this.gridTouchEffects.size) return;
+        const dx = x2 - x1, dy = y2 - y1, length = Math.hypot(dx, dy);
+        if (length <= .001) return;
+        const ux = dx / length, uy = dy / length;
+        const segmentLength = Math.max(2, Math.min(6, radius / 32));
+        for (const effect of this.gridTouchEffects.values()) {
+            const relativeX = effect.x - x1, relativeY = effect.y - y1;
+            const projection = relativeX * ux + relativeY * uy;
+            const perpendicular = Math.abs(relativeX * uy - relativeY * ux);
+            if (perpendicular >= radius) continue;
+            const span = Math.sqrt(radius * radius - perpendicular * perpendicular);
+            const from = Math.max(0, projection - span), to = Math.min(length, projection + span);
+            if (to <= from) continue;
+            const segments = Math.max(1, Math.ceil((to - from) / segmentLength));
+            for (let i = 0; i < segments; i++) {
+                const a = from + (to - from) * i / segments;
+                const b = from + (to - from) * (i + 1) / segments;
+                const middle = (a + b) / 2;
+                const distance = Math.hypot(middle - projection, perpendicular);
+                const falloff = Math.max(0, 1 - distance / radius);
+                const multiplier = Math.max(globalMultiplier, 1 + 2 * effect.strength * falloff);
+                if (multiplier <= globalMultiplier + .005) continue;
+                g.lineWidth = baseWidth * multiplier;
+                // The original grid is already underneath this pass, so the touch overlay
+                // must fade to transparent at its edge instead of drawing the base alpha twice.
+                const opacity = 255 * effect.strength * falloff;
+                g.strokeColor = new Color(baseStroke.r, baseStroke.g, baseStroke.b, Math.round(opacity));
+                g.moveTo(x1 + ux * a, y1 + uy * a);
+                g.lineTo(x1 + ux * b, y1 + uy * b); g.stroke();
+            }
+        }
+        g.strokeColor = baseStroke;
     }
 
     private redrawPlayGrid() {
@@ -1880,6 +2029,7 @@ export class GameManager extends Component {
         this.gridTransform.setContentSize(view.w, view.h);
         const g = this.gridGfx; g.clear();
         const w = view.w, h = view.h;
+        const touchRadius = this.gridTouchRadius(view);
         const verticalLines = this.repeatedGridLines(this.gridState.verticalLines, this.gridState.verticalPeriod);
         const horizontalLines = this.repeatedGridLines(this.gridState.horizontalLines, this.gridState.horizontalPeriod);
         if (this.gridState.visible) {
@@ -1894,12 +2044,10 @@ export class GameManager extends Component {
                 const after = (i + 1 < verticalLines.length ? verticalLines[i + 1] : 1) - p;
                 const thickness = Math.max(MIN_GRID_LINE_WIDTH, Math.min(5, Math.min(Math.min(before, after) * w, h / (horizontalLines.length + 1)) / 30));
                 const x = -w / 2 + p * w;
-                g.lineWidth = thickness;
-                g.moveTo(x, -h / 2); g.lineTo(x, h / 2); g.stroke();
-                g.lineWidth = Math.max(3, thickness * 2.2);
-                g.moveTo(x, -h / 2 + rulerOuter); g.lineTo(x, -h / 2 + rulerInner);
-                g.moveTo(x, h / 2 - rulerOuter); g.lineTo(x, h / 2 - rulerInner);
-                g.stroke();
+                this.drawTouchWeightedLine(g, x, -h / 2, x, h / 2, thickness, touchRadius);
+                const rulerWidth = Math.max(3, thickness * 2.2);
+                this.drawTouchWeightedLine(g, x, -h / 2 + rulerOuter, x, -h / 2 + rulerInner, rulerWidth, touchRadius);
+                this.drawTouchWeightedLine(g, x, h / 2 - rulerOuter, x, h / 2 - rulerInner, rulerWidth, touchRadius);
             }
             g.strokeColor = new Color(hc.r, hc.g, hc.b, Math.round(this.gridState.horizontalAlpha * 255));
             for (let i = 0; i < horizontalLines.length; i++) {
@@ -1908,12 +2056,10 @@ export class GameManager extends Component {
                 const after = (i + 1 < horizontalLines.length ? horizontalLines[i + 1] : 1) - p;
                 const thickness = Math.max(MIN_GRID_LINE_WIDTH, Math.min(5, Math.min(Math.min(before, after) * h, w / (verticalLines.length + 1)) / 30));
                 const y = -h / 2 + p * h;
-                g.lineWidth = thickness;
-                g.moveTo(-w / 2, y); g.lineTo(w / 2, y); g.stroke();
-                g.lineWidth = Math.max(3, thickness * 2.2);
-                g.moveTo(-w / 2 + rulerOuter, y); g.lineTo(-w / 2 + rulerInner, y);
-                g.moveTo(w / 2 - rulerOuter, y); g.lineTo(w / 2 - rulerInner, y);
-                g.stroke();
+                this.drawTouchWeightedLine(g, -w / 2, y, w / 2, y, thickness, touchRadius);
+                const rulerWidth = Math.max(3, thickness * 2.2);
+                this.drawTouchWeightedLine(g, -w / 2 + rulerOuter, y, -w / 2 + rulerInner, y, rulerWidth, touchRadius);
+                this.drawTouchWeightedLine(g, w / 2 - rulerOuter, y, w / 2 - rulerInner, y, rulerWidth, touchRadius);
             }
         }
         this.updateGridEdgeLabels(verticalLines, horizontalLines, w, h);
@@ -1923,9 +2069,15 @@ export class GameManager extends Component {
             : this.edgeMode === 'record' ? new Color(245, 55, 65, 255)
                 : this.edgeMode === 'play' ? new Color(60, 220, 110, 255)
                     : new Color(255, 255, 255, 255);
-        g.lineWidth = 1.6; g.strokeColor = edge;
+        g.lineWidth = 1.6 * (1 + this.metronomeGridExtra); g.strokeColor = edge;
         g.roundRect(-w / 2 + .8, -h / 2 + .8, w - 1.6, h - 1.6, SCREEN_EDGE_RADIUS);
         g.stroke();
+        if (this.gridTouchEffects.size) {
+            this.drawTouchWeightedLine(g, -w / 2 + SCREEN_EDGE_RADIUS, -h / 2 + .8, w / 2 - SCREEN_EDGE_RADIUS, -h / 2 + .8, 1.6, touchRadius, false);
+            this.drawTouchWeightedLine(g, -w / 2 + SCREEN_EDGE_RADIUS, h / 2 - .8, w / 2 - SCREEN_EDGE_RADIUS, h / 2 - .8, 1.6, touchRadius, false);
+            this.drawTouchWeightedLine(g, -w / 2 + .8, -h / 2 + SCREEN_EDGE_RADIUS, -w / 2 + .8, h / 2 - SCREEN_EDGE_RADIUS, 1.6, touchRadius, false);
+            this.drawTouchWeightedLine(g, w / 2 - .8, -h / 2 + SCREEN_EDGE_RADIUS, w / 2 - .8, h / 2 - SCREEN_EDGE_RADIUS, 1.6, touchRadius, false);
+        }
     }
 
     private edgeLabel(pool: Node[], index: number, name: string): Node {
@@ -2044,7 +2196,7 @@ export class GameManager extends Component {
             },
             {
                 title: '触摸演奏',
-                content: '一.基本触摸\n1. 按下图片开始发声，抬起手指停止，时长由实际按住时间决定。\n2. 支持多指同时演奏，不同手指可形成和弦或节奏层次。\n3. 从一个位置滑到另一个位置，会连续更新音高和音量，保持声音相位连续。\n\n二.边缘手势\n1. 靠近屏幕边缘的触摸会优先用于调整网格，不会触发音符。\n2. 单指调整局部线条；双指捏合调整全局重复周期。\n3. 完成拖动后，左上角临时显示当前行列数，松手后恢复音色提示。\n\n三.建议\n1. 使用网格量化旋律，用连续滑动完成滑音。\n2. 先用低音量试音，再逐步提高音量，避免突然过响。',
+                content: '一.基本触摸\n1. 按下图片开始发声，抬起手指停止，时长由实际按住时间决定。\n2. 支持多指同时演奏，不同手指可形成和弦或节奏层次。\n3. 从一个位置滑到另一个位置，会连续更新音高和音量，保持声音相位连续。\n\n二.触屏网格反馈\n1. 触摸时，以手指为中心、2.5 cm 为半径的网格与屏幕边框会产生动态反馈。\n2. 触点中心线宽最高为原来的 3 倍，触摸叠加层透明度为 100%，向外逐渐减弱至 0%。\n3. 按下时快速渐强，松开后在一个半拍内缓慢恢复；连续点击不会打断上一触点的恢复动画。\n\n三.边缘手势\n1. 靠近屏幕边缘的触摸会优先用于调整网格，不会触发音符。\n2. 单指调整局部线条；双指捏合调整全局重复周期。\n3. 完成拖动后，左上角临时显示当前行列数，松手后恢复音色提示。',
             },
             {
                 title: '颜色与音色',
@@ -2060,11 +2212,11 @@ export class GameManager extends Component {
             },
             {
                 title: '录音与音频编辑',
-                content: '一.录音与节拍器\n1. 红点开始或结束录音；小喇叭打开音频编辑轨道；单三角播放一次；双三角循环播放。\n2. 倒置三叉戟按钮控制节拍器。可在“设置→节拍器”输入拍号与 BPM，节拍器声音不会录入成品。\n3. 录音时屏幕边框为红色，播放时为绿色，同时录音与播放时为橙色。\n\n二.左侧音频栏\n1. 点击音频栏可向下展开音量、起止裁剪、颜色、导出和删除设置；修改会实时同步到由该音频生成的所有轨道块。\n2. 小按钮依次用于重置、试听和克隆；拖动音频栏可在右侧新建轨道块，也可放入已有轨道。\n3. 底部可清空轨道、导出右侧编排为 WAV 或 MP3、查看目录及撤回操作。\n\n三.轨道编排\n1. 单击轨道头切换静音，沿轨道头上下滑动可连续设置；双击轨道头切换独奏。\n2. 单击音频块选中并显示克隆、左对齐、删除和颜色按钮；再次点击名称可编辑音量、音高、声相、速度及裁剪自动化。\n3. 长按一秒后拖动音频块，双击可单独试听；磁铁按钮控制节拍吸附。\n4. 单指拖动画布，双指横向缩放；点击或拖动时间轴可定位时间戳，播放与停止按钮分别从记录点播放和停在当前位置。\n5. 左下角箭头可收起或展开音频栏。导出只合成右侧当前可听的轨道内容。',
+                content: '一.录音与节拍器\n1. 红点开始或结束录音；小喇叭打开音频编辑轨道；单三角播放一次；双三角循环播放。\n2. 倒置三叉戟控制节拍器；可在“设置→节拍器”设置拍号与 BPM，节拍器声音不会录入成品。\n3. 节拍器开启时，主界面网格和边框会随节拍呼吸：强拍从 3 倍线宽恢复，次强拍从 1.5 倍恢复。\n\n二.音频栏与轨道\n1. 展开音频栏可调音量、裁剪和颜色，也可重置、试听、克隆、重命名、导出或删除。\n2. 将音频拖入右侧建立轨道块；轨道块支持克隆、左对齐、删除、颜色、自动化、长按拖动和双击试听。\n3. 轨道头支持单击静音、上下滑动连续设置及双击独奏；磁铁按钮控制节拍吸附。\n4. 单指拖动画布，双指横向缩放；点击或拖动时间轴可定位播放位置。\n\n三.导出\n1. WAV 与 MP3 导出窗口可自定义名称、起始拍和结束拍。\n2. 导出会合成全部非空轨道，不受静音、独奏或音频启用状态影响。\n3. 导出期间显示全屏幕布进度，成功后文件进入 Neuro_Music，并可在文件管理中试听。',
             },
             {
-                title: '样式管理',
-                content: '一.样式\n1. 点击控制台的横线图标进入样式管理；保存内容包括波表、网格、效果器和节拍器设置，不包含录音片段。\n2. 绿色边框表示样式，蓝色边框表示样式流；点击名称重命名，展开按钮显示预览。\n3. 样式预览按 R、G、B 左中右排列；每栏可导出、载入或删除。导出后可从中央提示直接查看目录。\n\n二.样式流\n1. 新样式流默认有 5 个节点，最多 13 个；每个节点选择一个已有样式并设置切换时间。\n2. 样式流随循环播放运行，切换时屏幕边框会在 1.3 秒内过渡为蓝色再恢复。\n\n三.文件管理\n1. 导入可从设备中选择样式数据包；导出的数据包保存在游戏文件根目录。\n2. “清空样式栏”和“清空数据包”都会连续询问两次，确认后操作不可撤回。',
+                title: '文件管理',
+                content: '一.保存位置\n1. 点击控制台横线图标或全屏轨道左上角按钮进入“文件管理”。\n2. 左上角“保存位置”可选择 Neuro_Save 所在位置；游戏会建立 Neuro_Music、Neuro_Style、Neuro_Style_Flow 和 Neuro_Track。\n3. 将同格式文件放入对应子文件夹后，重新打开文件管理即可读取。\n\n二.四类文件\n1. “样式”可保存当前全部设置、查看目录和清空列表；样式包含波表、网格、效果器与节拍器设置。\n2. “样式流”可新建流程、查看目录和清空列表；每个流程最多 13 个节点。\n3. “轨道”可保存当前全部轨道、查看目录和清空列表；支持重命名、加载和删除。\n4. “音频”仅显示游戏导出的 WAV/MP3；支持重命名、格式互转、删除、拖动进度条试听和已播放时长显示。\n\n三.列表操作\n1. 样式和样式流保留预览、重命名、加载及删除功能；文件已直接保存在对应目录，不再需要额外导出。\n2. 清空操作需要确认且不可撤回，请先在文件管理器中备份需要保留的文件。',
             },
             {
                 title: '菜单与校准',
@@ -2083,7 +2235,7 @@ export class GameManager extends Component {
                 },
                 {
                     title: 'Touch Performance',
-                    content: 'I. Basic Touch\n1. Press the image to start sound and release to stop; duration follows your actual hold.\n2. Multitouch supports chords and layered rhythms.\n3. Dragging continuously updates pitch and volume while preserving phase.\n\nII. Edge Gestures\n1. Touches near an edge adjust the grid instead of triggering notes.\n2. One finger edits local lines; two fingers adjust the global repeat period.\n3. Current rows and columns appear temporarily at the top left while dragging.\n\nIII. Tips\n1. Use quantized cells for melodies and continuous dragging for glides.\n2. Begin at low volume and raise it gradually to avoid sudden loud output.',
+                    content: 'I. Basic Touch\n1. Press the image to start sound and release to stop; duration follows your actual hold.\n2. Multitouch supports chords and layered rhythms. Dragging updates pitch and volume continuously.\n\nII. Touch Grid Feedback\n1. Grid lines and the screen border react within a physical 2.5 cm radius around each finger.\n2. At the center, lines reach 3x width and the touch overlay reaches 100% opacity; both fade continuously to a 0% overlay at the edge.\n3. The effect rises quickly and restores over one and a half beats after release. A new touch does not interrupt an older release animation.\n\nIII. Edge Gestures\n1. Touches near an edge adjust the grid instead of triggering notes.\n2. One finger edits local lines; two fingers adjust the global repeat period.\n3. Current rows and columns appear temporarily at the top left while dragging.',
                 },
                 {
                     title: 'Color & Timbre',
@@ -2099,11 +2251,11 @@ export class GameManager extends Component {
                 },
                 {
                     title: 'Recording & Audio Editing',
-                    content: 'I. Recording & Metronome\n1. The red dot starts or stops recording; the speaker opens Audio Edit Tracks; the single triangle plays once; the double triangle loops.\n2. The inverted trident toggles the metronome. Set its time signature and BPM in Settings → Metronome; its clicks are excluded from recordings.\n3. The border is red while recording, green while playing, and orange when both are active.\n\nII. Source Pane\n1. Tap a source row to expand volume, trim, color, export and delete controls. Changes update every track block made from that source.\n2. The small buttons reset, preview and clone. Drag a source into the track area to create a block or add it to an existing track.\n3. Footer controls clear tracks, export the arrangement as WAV or MP3, open the folder and undo.\n\nIII. Track Arrangement\n1. Tap a track head to mute it, slide vertically across heads for continuous selection, or double-tap for solo.\n2. Select a block for Clone, Align Left, Delete and Color. Tap its name again to edit volume, pitch, pan, speed and trim automation.\n3. Hold for one second to drag a block, double-tap to preview it, and use the magnet for beat snapping.\n4. Drag the canvas with one finger and zoom horizontally with two. Tap or drag the ruler to seek; Play returns to its recorded start point while Stop holds the current position.\n5. The lower-left arrow collapses or restores the source pane. Export renders only currently audible arranged tracks.',
+                    content: 'I. Recording & Metronome\n1. The red dot records; the speaker opens Audio Edit Tracks; the single triangle plays once and the double triangle loops.\n2. The inverted trident toggles the metronome. Set time signature and BPM in Settings; clicks are excluded from recordings.\n3. While enabled, the main grid and border breathe with the beat: 3x width on strong beats and 1.5x on secondary accents, returning over one beat.\n\nII. Sources & Tracks\n1. Expand a source to edit volume, trim and color, or reset, preview, clone, rename, export and delete it.\n2. Drag sources into the timeline. Blocks support clone, align, delete, color, automation, hold-drag and double-tap preview.\n3. Track heads support mute, vertical mute painting and double-tap solo. The magnet controls beat snapping.\n4. Drag the canvas with one finger, zoom horizontally with two, and tap or drag the ruler to seek.\n\nIII. Export\n1. WAV and MP3 dialogs accept a file name plus start and end beats.\n2. Every non-empty track is rendered regardless of mute, solo or source-enabled state.\n3. A full-screen curtain shows progress; completed files appear in Neuro_Music and can be previewed in File Manager.',
                 },
                 {
-                    title: 'Style Manager',
-                    content: 'I. Styles\n1. Open Style Manager with the console lines icon. A style stores wavetable, grid, effect and metronome settings, but not recorded clips.\n2. Green borders identify styles and blue borders identify flows. Tap names to rename and expand rows for previews.\n3. RGB previews run left, center and right. Each row can export, load or delete; after export, View Folder opens the package directory.\n\nII. Style Flows\n1. A new flow starts with five nodes and supports up to 13. Each node selects an owned style and a switch delay.\n2. Flows run with loop playback. A style switch flashes the border blue and restores it within 1.3 seconds.\n\nIII. Files\n1. Import selects a style package from the device. Exported packages are stored in the game file root.\n2. Clear Style List and Clear Packages both require two confirmations and cannot be undone.',
+                    title: 'File Manager',
+                    content: 'I. Save Location\n1. Open File Manager from the console lines icon or the top-left button in full-screen Tracks.\n2. Save Location chooses where Neuro_Save lives. The game creates Neuro_Music, Neuro_Style, Neuro_Style_Flow and Neuro_Track inside it.\n3. Compatible files placed in those folders are discovered when File Manager is reopened.\n\nII. Categories\n1. Styles save the current wavetable, grid, effects and metronome settings; rows support preview, rename, load and delete.\n2. Style Flows contain up to 13 timed style nodes and support preview, rename, load and delete.\n3. Tracks save the complete arrangement and support rename, load and delete without a preview.\n4. Audio lists game-exported WAV/MP3 files only, with rename, format conversion, delete, seekable preview and elapsed time.\n\nIII. Folder Actions\n1. Each category can open its directory or clear its list; Styles, Flows and Tracks also provide their matching create/save command.\n2. Files already live in their category folder, so no separate export step is needed. Back up important files before clearing a category.',
                 },
                 {
                     title: 'Menu & Calibration',
@@ -2890,7 +3042,7 @@ export class GameManager extends Component {
         this.redrawMixerTimeline();
     }
 
-    private timelineBlocks(includeSilentTracks = false) {
+    private timelineBlocks(includeSilentTracks = false, includeDisabledClips = false) {
         const solo = this.mixerTracks.some(track => track.solo);
         const result: Array<AudioClipMeta & { startBeat: number; bpm: number; speed: number; trackId: string; trackAudible: boolean; volumeAutomation?: number[]; pitchAutomation?: number[]; panAutomation?: number[] }> = [];
         for (const track of this.mixerTracks) {
@@ -2898,7 +3050,7 @@ export class GameManager extends Component {
             if (!trackAudible && !includeSilentTracks) continue;
             for (const block of track.blocks) {
                 const clip = this.recordedClips.find(item => item.id === block.clipId);
-                if (clip?.path && clip.enabled !== false) {
+                if (clip?.path && (includeDisabledClips || clip.enabled !== false)) {
                     const volumeAutomation = block.volumeAutomation?.length ? block.volumeAutomation : [1];
                     const speed = Math.max(.25, Math.min(4, block.speed ?? 1));
                     let elapsedSeconds = 0;
@@ -2914,6 +3066,7 @@ export class GameManager extends Component {
 
     private openAudioPanel() {
         if (this.stylePanelOpen) this.closeStylePanel();
+        this.ensureLandscapePanelOrientation();
         const created = !this.audioPanel;
         if (created) this.buildAudioPanel();
         this.audioPanel!.active = true;
@@ -2933,7 +3086,7 @@ export class GameManager extends Component {
         const clear = this.makePanelButton(sourcePane, t('清空轨道', 'Clear Tracks'), 0, 0, 170, 42, () => this.clearAudioTracks(), new Color(105, 45, 55, 255)); clear.name = 'AudioClearTracks';
         const wav = this.makePanelButton(sourcePane, t('导出为 WAV 音频', 'Export WAV'), 0, 0, 220, 42, () => this.exportEnabledMix('wav'), new Color(36, 92, 78, 255)); wav.name = 'AudioExportWav';
         const mp3 = this.makePanelButton(sourcePane, t('导出为 MP3 音频', 'Export MP3'), 0, 0, 220, 42, () => this.exportEnabledMix('mp3'), new Color(42, 72, 115, 255)); mp3.name = 'AudioExportMp3';
-        const folder = this.makePanelButton(sourcePane, t('查看目录', 'View Folder'), 0, 0, 150, 42, () => NativeBridge.openExportDirectory(), new Color(55, 62, 82, 255)); folder.name = 'AudioViewFolder';
+        const folder = this.makePanelButton(sourcePane, t('查看目录', 'View Folder'), 0, 0, 150, 42, () => NativeBridge.openManagedDirectory('audio'), new Color(55, 62, 82, 255)); folder.name = 'AudioViewFolder';
         const undo = this.makePanelButton(sourcePane, t('撤回', 'Undo'), 0, 0, 100, 42, () => this.undoMixer(), new Color(45, 58, 88, 255)); undo.name = 'AudioUndo';
         for (const footerButton of [clear, wav, mp3, folder, undo]) this.setPanelButtonBlackFill(footerButton);
         const follow = this.makePanelButton(panel, '→', 0, 0, 44, 44, () => this.toggleMixerPlayheadFollow(), new Color(8, 10, 15, 255)); follow.name = 'AudioTimelineFollow';
@@ -2944,12 +3097,13 @@ export class GameManager extends Component {
         const collapse = new Node('AudioSourceCollapse'); collapse.layer = Layers.Enum.UI_2D; collapse.addComponent(UITransform).setContentSize(64, 64); const collapseDisc = this.makeLabel('AudioSourceCollapseDisc', '●', 64, 68, new Color(0, 0, 0, 255), 68, 68); collapse.addChild(collapseDisc); const collapseLabel = this.makeLabel('Arrow', '←', 25, 36, new Color(255, 255, 255, 255), 34, 34); collapse.addChild(collapseLabel); collapse.addComponent(Button).transition = Button.Transition.SCALE; collapse.on(Button.EventType.CLICK, () => this.toggleMixerSourcePane(), this);
         const collapsedUndo = new Node('AudioCollapsedUndo'); collapsedUndo.layer = Layers.Enum.UI_2D; collapsedUndo.addComponent(UITransform).setContentSize(64, 64); const undoDisc = this.makeLabel('AudioCollapsedUndoDisc', '●', 64, 68, new Color(0, 0, 0, 255), 68, 68); collapsedUndo.addChild(undoDisc); const undoIcon = this.makeLabel('UndoIcon', '↶', 27, 38, new Color(255, 255, 255, 255), 38, 38); collapsedUndo.addChild(undoIcon); collapsedUndo.addComponent(Button).transition = Button.Transition.SCALE; collapsedUndo.on(Button.EventType.CLICK, () => this.undoMixer(), this); collapsedUndo.active = false;
         const multiSelect = new Node('AudioMultiSelect'); multiSelect.layer = Layers.Enum.UI_2D; multiSelect.addComponent(UITransform).setContentSize(44, 44); multiSelect.addComponent(Graphics); multiSelect.addComponent(Button).transition = Button.Transition.NONE; multiSelect.on(Button.EventType.CLICK, () => this.toggleMixerMultiSelectMode(), this); multiSelect.active = false;
+        const fileManager = new Node('AudioFileManager'); fileManager.layer = Layers.Enum.UI_2D; fileManager.addComponent(UITransform).setContentSize(44, 44); const fileGfx = fileManager.addComponent(Graphics); fileGfx.roundRect(-13, -9, 26, 20, 2); fileGfx.strokeColor = new Color(255, 255, 255, 255); fileGfx.lineWidth = 2; fileGfx.stroke(); fileGfx.moveTo(-10, 5); fileGfx.lineTo(10, 5); fileGfx.moveTo(-10, 0); fileGfx.lineTo(10, 0); fileGfx.moveTo(-10, -5); fileGfx.lineTo(5, -5); fileGfx.stroke(); fileManager.addComponent(Button).transition = Button.Transition.SCALE; fileManager.on(Button.EventType.CLICK, () => this.openStylePanel(), this); fileManager.active = false;
         const viewport = new Node('AudioTimelineViewport'); viewport.layer = Layers.Enum.UI_2D; viewport.addComponent(UITransform).setContentSize(1000, 700); (viewport.addComponent(Mask) as any).type = 0; panel.addChild(viewport); this.mixerViewport = viewport;
         const timeline = new Node('AudioTimeline'); timeline.layer = Layers.Enum.UI_2D; timeline.addComponent(UITransform).setContentSize(6000, 1200); viewport.addChild(timeline); this.mixerTimeline = timeline;
         this.attachMixerViewportGestures(viewport);
         viewport.setSiblingIndex(0);
         const connections = new Node('MixerConnections'); connections.layer = Layers.Enum.UI_2D; connections.addComponent(UITransform).setContentSize(1400, 860); connections.addComponent(Graphics); panel.addChild(connections); connections.setSiblingIndex(sourcePane.getSiblingIndex() + 1); this.mixerConnectionLayer = connections;
-        const frame = new Node('AudioPanelTopBorder'); frame.layer = Layers.Enum.UI_2D; frame.addComponent(UITransform).setContentSize(1400, 860); frame.addComponent(Graphics); frame.addChild(collapse); frame.addChild(collapsedUndo); frame.addChild(multiSelect); panel.addChild(frame);
+        const frame = new Node('AudioPanelTopBorder'); frame.layer = Layers.Enum.UI_2D; frame.addComponent(UITransform).setContentSize(1400, 860); frame.addComponent(Graphics); frame.addChild(collapse); frame.addChild(collapsedUndo); frame.addChild(multiSelect); frame.addChild(fileManager); panel.addChild(frame);
         const swallow = (e: EventTouch) => { if (e.target === panel) e.propagationStopped = true; };
         panel.on(Node.EventType.TOUCH_START, swallow, this); panel.on(Node.EventType.TOUCH_MOVE, swallow, this); panel.on(Node.EventType.TOUCH_END, swallow, this);
         this.uiRoot.addChild(panel); panel.active = false;
@@ -3012,6 +3166,9 @@ export class GameManager extends Component {
         const multiSelect = frame?.getChildByName('AudioMultiSelect');
         multiSelect?.setPosition(-view.w / 2 + collapsedWidth / 2, view.h / 2 - collapsedWidth / 2 - 2, 0);
         if (multiSelect) multiSelect.active = this.mixerSourcePanelCollapsed && !this.mixerSourcePaneAnimating;
+        const fileManager = frame?.getChildByName('AudioFileManager');
+        fileManager?.setPosition(-view.w / 2 + collapsedWidth + 10, view.h / 2 - collapsedWidth / 2 - 2, 0);
+        if (fileManager) fileManager.active = this.mixerSourcePanelCollapsed && !this.mixerSourcePaneAnimating;
         this.paintMixerMultiSelectButton(); this.setMixerMultiSelectChrome(this.mixerMultiSelectMode);
         this.redrawPanelButtons(panel);
         this.queueMixerRedraw();
@@ -3051,6 +3208,8 @@ export class GameManager extends Component {
             multiSelect.active = this.mixerSourcePanelCollapsed && !this.mixerSourcePaneAnimating;
             if (multiSelect.active) multiSelect.setSiblingIndex(frame.children.length - 1);
         }
+        const fileManager = frame.getChildByName('AudioFileManager');
+        if (fileManager) fileManager.active = this.mixerSourcePanelCollapsed && !this.mixerSourcePaneAnimating;
         const playhead = this.mixerTimeline?.getChildByName('MixerPlayhead');
         if (playhead) {
             playhead.active = !enabled;
@@ -3401,6 +3560,7 @@ export class GameManager extends Component {
             // timeline is redrawn into the correct area for the entire transition.
             this.setMixerMultiSelectMode(false, false);
             const multiSelect = this.audioPanel.getChildByName('AudioPanelTopBorder')?.getChildByName('AudioMultiSelect'); if (multiSelect) multiSelect.active = false;
+            const fileManager = this.audioPanel.getChildByName('AudioPanelTopBorder')?.getChildByName('AudioFileManager'); if (fileManager) fileManager.active = false;
             const collapsedUndo = this.audioPanel.getChildByName('AudioPanelTopBorder')?.getChildByName('AudioCollapsedUndo'); if (collapsedUndo) collapsedUndo.active = false;
             this.mixerSourcePanelCollapsed = false; this.mixerCollapsedContentInsetExtra = 0;
             const viewportTransform = viewport.getComponent(UITransform)!;
@@ -3479,23 +3639,108 @@ export class GameManager extends Component {
 
     private exportEnabledMix(format: 'wav' | 'mp3') {
         const enabled = this.audioPanel
-            ? this.timelineBlocks()
-            : this.recordedClips.filter(clip => clip.enabled && !!clip.path).map(clip => ({ ...clip, startBeat: 0, bpm: this.metronomeBpm }));
+            ? this.timelineBlocks(true, true)
+            : this.recordedClips.filter(clip => !!clip.path).map(clip => ({ ...clip, enabled: true, startBeat: 0, bpm: this.metronomeBpm, speed: 1 }));
         if (!enabled.length) {
-            this.setInfo(t('没有点亮绿点的轨道', 'No green-dot tracks are enabled.'), new Color(255, 190, 120, 255));
+            this.setInfo(t('没有可导出的非空轨道', 'There are no non-empty tracks to export.'), new Color(255, 190, 120, 255));
             return;
         }
         if (!NativeBridge.isAndroidNative) {
             this.setInfo(t('浏览器预览不支持导出混音', 'Mix export is unavailable in browser preview.'), new Color(255, 190, 120, 255));
             return;
         }
-        this.setInfo(t('正在合成并导出音频…', 'Rendering and exporting audio…'), new Color(220, 225, 235, 255));
-        const name = `ColorMusic_Mix_${Date.now()}`;
-        NativeBridge.mixAndExportAudioAsync(enabled, name, format, path => {
-            const failed = !path || path.startsWith('ERROR:');
-            if (failed) this.setInfo(path.replace(/^ERROR:/, '') || t('混音导出失败', 'Mix export failed.'), new Color(255, 150, 150, 255));
-            else { this.setInfo(t('混音导出成功', 'Mix exported successfully.'), new Color(200, 235, 205, 255)); NativeBridge.showAudioExportResult(path); }
+        const lastBeat = Math.max(1, Math.ceil(this.mixerTimelineEndBeat(enabled as any)));
+        this.openTrackExportDialog(format, 1, lastBeat, request => {
+            if (!request) return; const startBeat = Math.max(1, request.start); const endBeat = Math.max(startBeat, request.end);
+            const rangeStart = startBeat - 1, rangeEnd = endBeat; const ranged = enabled.flatMap(block => {
+                const bpm = Math.max(1, block.bpm || this.metronomeBpm); const speed = Math.max(.25, Math.min(4, block.speed || 1)); const sourceEnd = block.trimEnd > block.trimStart ? block.trimEnd : block.duration;
+                const blockEnd = block.startBeat + Math.max(.05, sourceEnd - block.trimStart) * bpm / 60 / speed; const overlapStart = Math.max(rangeStart, block.startBeat), overlapEnd = Math.min(rangeEnd, blockEnd); if (overlapEnd <= overlapStart) return [];
+                const trimBefore = (overlapStart - block.startBeat) * 60 / bpm * speed; const trimAfter = (blockEnd - overlapEnd) * 60 / bpm * speed;
+                return [{ ...block, startBeat: overlapStart - rangeStart, trimStart: block.trimStart + trimBefore, trimEnd: Math.max(block.trimStart + trimBefore, sourceEnd - trimAfter) }];
+            });
+            if (!ranged.length) { this.setInfo(t('所选拍区间内没有轨道内容', 'No track content exists in the selected beat range.'), new Color(255, 190, 120, 255)); return; }
+            this.setInfo(t('正在合成并导出音频…', 'Rendering and exporting audio…'), new Color(220, 225, 235, 255));
+            this.startExportProgress();
+            NativeBridge.mixAndExportAudioAsync(ranged, request.name.trim() || t('新音频', 'New Audio'), format, path => {
+                const failed = !path || path.startsWith('ERROR:');
+                this.finishExportProgress();
+                if (failed) this.setInfo(path?.replace(/^ERROR:/, '') || t('混音导出失败', 'Mix export failed.'), new Color(255, 150, 150, 255));
+                else { this.refreshManagedLibrary(false); this.refreshSynthStatus(); this.showSuccessToast(t('音频导出成功', 'Audio exported')); }
+            });
         });
+    }
+
+    private openTrackExportDialog(format: 'wav' | 'mp3', initialStart: number, initialEnd: number, done: (request: { name: string; start: number; end: number } | null) => void) {
+        this.trackExportPanel?.destroy();
+        const view = this.userViewport(false); const width = Math.min(760, view.w - 80); const height = 470;
+        const panel = new Node('TrackExportPanel'); panel.layer = Layers.Enum.UI_2D; panel.addComponent(UITransform).setContentSize(width, height); panel.setPosition(0, 0);
+        const bg = panel.addComponent(Graphics); bg.roundRect(-width / 2, -height / 2, width, height, 8); bg.fillColor = new Color(12, 19, 32, 250); bg.fill(); bg.lineWidth = 3; bg.strokeColor = new Color(78, 125, 174, 255); bg.stroke();
+        const title = this.makeLabel('Title', `${t('导出', 'Export')} ${format.toUpperCase()} ${t('音频', 'Audio')}`, 28, 36, new Color(240, 244, 252, 255), width - 48, 44); title.setPosition(0, height / 2 - 42); panel.addChild(title);
+        const fields: Array<{ hint: string; value: string; numeric: boolean }> = [
+            { hint: t('音频名称', 'Audio name'), value: t('新音频', 'New Audio'), numeric: false },
+            { hint: t('起始拍', 'Start beat'), value: String(initialStart), numeric: true },
+            { hint: t('结束拍', 'End beat'), value: String(initialEnd), numeric: true },
+        ];
+        const edits: EditBox[] = [];
+        fields.forEach((field, index) => {
+            const y = 92 - index * 84;
+            const hint = this.makeLabel(`Hint${index}`, field.hint, 20, 28, new Color(190, 204, 224, 255), 160, 48); hint.setPosition(-width / 2 + 105, y); panel.addChild(hint);
+            const inputNode = new Node(`Input${index}`); inputNode.layer = Layers.Enum.UI_2D; inputNode.addComponent(UITransform).setContentSize(430, 52); inputNode.setPosition(115, y); panel.addChild(inputNode);
+            const inputBg = new Node('Bg'); inputBg.layer = Layers.Enum.UI_2D; inputBg.addComponent(UITransform).setContentSize(430, 52); inputNode.addChild(inputBg);
+            const inputG = inputBg.addComponent(Graphics); inputG.roundRect(-215, -26, 430, 52, 7); inputG.fillColor = new Color(25, 35, 56, 255); inputG.fill(); inputG.lineWidth = 1.5; inputG.strokeColor = new Color(110, 140, 184, 255); inputG.stroke();
+            const textNode = this.makeLabel('Text', field.value, 21, 28, new Color(242, 246, 252, 255), 410, 48); textNode.setPosition(0, 0); inputNode.addChild(textNode);
+            const placeholderNode = this.makeLabel('Placeholder', field.hint, 20, 28, new Color(125, 143, 170, 255), 410, 48); placeholderNode.setPosition(0, 0); inputNode.addChild(placeholderNode);
+            const eb = inputNode.addComponent(EditBox); eb.textLabel = textNode.getComponent(Label)!; eb.placeholderLabel = placeholderNode.getComponent(Label)!; eb.string = field.value; eb.inputMode = field.numeric ? EditBox.InputMode.NUMERIC : EditBox.InputMode.DEFAULT; eb.returnType = EditBox.KeyboardReturnType.DONE; edits.push(eb);
+            for (const valueLabel of [eb.textLabel, eb.placeholderLabel]) {
+                if (!valueLabel) continue; const ut = valueLabel.node.getComponent(UITransform)!; ut.setAnchorPoint(0, 1); ut.setContentSize(410, 52); valueLabel.node.setPosition(-205, 26); valueLabel.horizontalAlign = Label.HorizontalAlign.CENTER; valueLabel.verticalAlign = Label.VerticalAlign.CENTER; valueLabel.overflow = Label.Overflow.CLAMP; valueLabel.enableWrapText = false;
+            }
+        });
+        const close = () => { if (panel.isValid) panel.destroy(); if (this.trackExportPanel === panel) this.trackExportPanel = null; };
+        this.makePanelButton(panel, t('取消', 'Cancel'), -125, -height / 2 + 52, 180, 48, () => { close(); done(null); }, new Color(62, 72, 92, 255));
+        this.makePanelButton(panel, t('开始导出', 'Export'), 125, -height / 2 + 52, 220, 48, () => {
+            const name = edits[0].string.trim(); const start = Number(edits[1].string); const end = Number(edits[2].string);
+            if (!name || !Number.isFinite(start) || !Number.isFinite(end) || start < 1 || end < start) { this.setInfo(t('请输入有效的音频名称和拍数', 'Enter a valid name and beat range.'), new Color(255, 190, 120, 255)); return; }
+            close(); done({ name, start, end });
+        }, new Color(42, 105, 72, 255));
+        this.uiRoot.addChild(panel); panel.setSiblingIndex(this.uiRoot.children.length - 1); this.trackExportPanel = panel;
+    }
+
+    private startExportProgress() {
+        this.finishExportProgress(true);
+        const view = this.userViewport(false); const panel = new Node('ExportProgress'); panel.layer = Layers.Enum.UI_2D; panel.addComponent(UITransform).setContentSize(4000, 4000); panel.setPosition(0, 0);
+        const bg = panel.addComponent(Graphics); bg.rect(-2000, -2000, 4000, 4000); bg.fillColor = new Color(0, 0, 0, 255); bg.fill();
+        const inverseMask = new Node('InverseProgressMask'); inverseMask.layer = Layers.Enum.UI_2D; const inverseMaskTransform = inverseMask.addComponent(UITransform); inverseMaskTransform.setContentSize(1, 4000); inverseMask.setPosition(-view.w / 2 + .5, 0); inverseMask.addComponent(Mask).type = Mask.Type.RECT; panel.addChild(inverseMask);
+        const inverseBg = new Node('InverseBackground'); inverseBg.layer = Layers.Enum.UI_2D; inverseBg.addComponent(UITransform).setContentSize(4000, 4000); const inverseBgGraphics = inverseBg.addComponent(Graphics); inverseBgGraphics.rect(-2000, -2000, 4000, 4000); inverseBgGraphics.fillColor = new Color(255, 255, 255, 255); inverseBgGraphics.fill(); inverseMask.addChild(inverseBg);
+        let invertedLogo: Node | null = null;
+        const splashPath = NativeBridge.saveSplashImage(SPLASH_B64);
+        if (splashPath) assetManager.loadRemote('file://' + splashPath, { ext: '.jpg' }, (err, asset) => {
+            if (err || !this.exportProgressPanel?.isValid) return;
+            try {
+                const image = asset as ImageAsset; const tex = new Texture2D(); tex.image = image; const sf = new SpriteFrame(); sf.texture = tex;
+                const maxW = Math.min(view.w * .7, 900), maxH = Math.min(view.h * .7, 900); const scale = Math.min(maxW / Math.max(1, image.width), maxH / Math.max(1, image.height));
+                const logo = new Node('CurtainImage'); logo.layer = Layers.Enum.UI_2D; logo.addComponent(UITransform).setContentSize(image.width * scale, image.height * scale); const sprite = logo.addComponent(Sprite); sprite.sizeMode = Sprite.SizeMode.CUSTOM; sprite.spriteFrame = sf; panel.addChild(logo); logo.setSiblingIndex(0); inverseMask.setSiblingIndex(1);
+            } catch (error) { console.warn('[CM] export curtain image failed', error); }
+        });
+        const invertedPath = NativeBridge.saveInvertedSplashImage(SPLASH_B64);
+        if (invertedPath) assetManager.loadRemote('file://' + invertedPath, { ext: '.jpg' }, (err, asset) => {
+            if (err || !this.exportProgressPanel?.isValid || !inverseMask.isValid) return;
+            try {
+                const image = asset as ImageAsset; const tex = new Texture2D(); tex.image = image; const sf = new SpriteFrame(); sf.texture = tex;
+                const maxW = Math.min(view.w * .7, 900), maxH = Math.min(view.h * .7, 900); const scale = Math.min(maxW / Math.max(1, image.width), maxH / Math.max(1, image.height));
+                invertedLogo = new Node('InvertedCurtainImage'); invertedLogo.layer = Layers.Enum.UI_2D; invertedLogo.addComponent(UITransform).setContentSize(image.width * scale, image.height * scale); const sprite = invertedLogo.addComponent(Sprite); sprite.sizeMode = Sprite.SizeMode.CUSTOM; sprite.spriteFrame = sf; inverseMask.addChild(invertedLogo); invertedLogo.setPosition(view.w / 2 - .5, 0);
+            } catch (error) { console.warn('[CM] inverted export curtain failed', error); }
+        });
+        this.uiRoot.addChild(panel); panel.setSiblingIndex(this.uiRoot.children.length - 1); this.exportProgressPanel = panel; this.exportProgressValue = 0;
+        this.exportProgressRender = (value: number) => { const maskWidth = Math.max(1, view.w * value); inverseMaskTransform.setContentSize(maskWidth, 4000); inverseMask.setPosition(-view.w / 2 + maskWidth / 2, 0); invertedLogo?.setPosition(view.w / 2 - maskWidth / 2, 0); inverseBg.setPosition(view.w / 2 - maskWidth / 2, 0); };
+        const tick = () => { if (!this.exportProgressPanel?.isValid) { this.exportProgressFrame = null; return; } this.exportProgressValue = Math.min(.9, this.exportProgressValue + .003); this.exportProgressRender?.(this.exportProgressValue); this.exportProgressFrame = requestAnimationFrame(tick); };
+        this.exportProgressFrame = requestAnimationFrame(tick);
+    }
+
+    private finishExportProgress(immediate = false) {
+        if (this.exportProgressFrame !== null) cancelAnimationFrame(this.exportProgressFrame); this.exportProgressFrame = null;
+        const panel = this.exportProgressPanel; if (!panel?.isValid) { this.exportProgressPanel = null; this.exportProgressRender = null; return; }
+        if (immediate) { panel.destroy(); this.exportProgressPanel = null; this.exportProgressRender = null; return; }
+        this.exportProgressValue = 1; this.exportProgressRender?.(1); tween(panel.getComponent(UIOpacity) ?? panel.addComponent(UIOpacity)).delay(.18).to(.22, { opacity: 0 }).call(() => { if (panel.isValid) panel.destroy(); if (this.exportProgressPanel === panel) this.exportProgressPanel = null; this.exportProgressRender = null; }).start();
     }
 
     private rebuildAudioRows() {
@@ -3995,7 +4240,14 @@ export class GameManager extends Component {
         const blockIndex = firstTrackHead >= 0 ? firstTrackHead : (rulerIndex >= 0 ? rulerIndex : parent.children.length - 1);
         node.setSiblingIndex(Math.max(1, blockIndex));
         if (selected && !this.mixerMultiSelectMode) this.promoteMixerSelectedBlock(node);
-        const from = this.mixerAnimateFrom.get(block.id); if (from) { node.setPosition(from); tween(node).to(1, { position: target }, { easing: 'quadInOut' }).start(); this.mixerAnimateFrom.delete(block.id); }
+        const from = this.mixerAnimateFrom.get(block.id); if (from) {
+            node.setPosition(from);
+            tween(node).to(1, { position: target }, {
+                easing: 'quadInOut',
+                onUpdate: () => this.updateMixerConnections(),
+            }).call(() => this.updateMixerConnections()).start();
+            this.mixerAnimateFrom.delete(block.id);
+        }
     }
 
     /** Keep the selected block above every other block, while track heads and the ruler remain above it. */
@@ -4262,8 +4514,18 @@ export class GameManager extends Component {
             this.mixerAnimateFrom.delete(blockId); this.settleMixerBlockNode(found.block, trackIndex);
             this.mixerTimelineCacheSignature = this.mixerTimelineSignature(); this.updateMixerConnections();
         } else {
-            if (from) this.mixerAnimateFrom.set(blockId, from);
-            this.queueMixerRedraw();
+            const node = this.mixerTimeline?.getChildByName(`MixerBlock${blockId}`), target = this.mixerBlockPosition(found.block, trackIndex);
+            if (from && node && target) {
+                this.mixerTimelineCacheSignature = this.mixerTimelineSignature();
+                Tween.stopAllByTarget(node); node.setPosition(from); node.setScale(Vec3.ONE);
+                tween(node).to(.45, { position: target }, {
+                    easing: 'quadInOut',
+                    onUpdate: () => this.updateMixerConnections(),
+                }).call(() => { this.settleMixerBlockNode(found.block, trackIndex); this.updateMixerConnections(); }).start();
+            } else {
+                if (from) this.mixerAnimateFrom.set(blockId, from);
+                this.queueMixerRedraw();
+            }
         }
     }
 
@@ -5029,7 +5291,7 @@ export class GameManager extends Component {
                 const path = NativeBridge.exportAudio(clip.path, clip.name, format);
                 const failed = !path || path.startsWith('ERROR:');
                 if (failed) this.setInfo(path.replace(/^ERROR:/, '') || '音频导出失败', new Color(255, 150, 150, 255));
-                else NativeBridge.showAudioExportResult(path);
+                else { this.refreshManagedLibrary(false); this.showSuccessToast(t('音频导出成功', 'Audio exported')); }
             });
             return;
         }
@@ -5062,8 +5324,10 @@ export class GameManager extends Component {
 
     private openStylePanel() {
         if (this.audioPanelOpen) this.closeAudioPanel();
+        this.ensureLandscapePanelOrientation();
         const created = !this.stylePanel;
         if (created) this.buildStylePanel();
+        this.refreshManagedLibrary();
         this.stylePanel!.active = true;
         this.stylePanelOpen = true;
         this.stylePanel!.setSiblingIndex(this.uiRoot.children.length - 1);
@@ -5076,14 +5340,26 @@ export class GameManager extends Component {
         const panel = new Node('StyleManagerPanel'); panel.layer = Layers.Enum.UI_2D;
         panel.addComponent(UITransform).setContentSize(1400, 860);
         const initialBg = panel.addComponent(Graphics); initialBg.rect(-700, -430, 1400, 860); initialBg.fillColor = new Color(8, 12, 24, 255); initialBg.fill();
-        const title = this.makeLabel('StyleTitle', isEnglish() ? 'Style Manager' : '样式管理', 30, 38, new Color(240, 244, 252, 255), 700, 50); panel.addChild(title);
-        const save = this.makePanelButton(panel, isEnglish() ? 'Save current as new style' : '保存当前所有为新样式', 0, 0, 300, 52, () => { this.saveCurrentStyle(); this.rebuildStyleRows(); }, new Color(38, 72, 106, 255)); save.name = 'StyleSave';
-        const flow = this.makePanelButton(panel, isEnglish() ? 'New style flow' : '新建样式流', 0, 0, 300, 52, () => this.openStyleFlowEditor(), new Color(38, 72, 106, 255)); flow.name = 'StyleFlow';
-        const imp = this.makePanelButton(panel, isEnglish() ? 'Import' : '导入', 0, 0, 300, 52, () => this.importStyleJson(), new Color(38, 72, 106, 255)); imp.name = 'StyleImport';
-        const clearList = this.makePanelButton(panel, isEnglish() ? 'Clear style list' : '清空样式栏', 0, 0, 300, 52, () => this.confirmClearStyles(), new Color(92, 54, 64, 255)); clearList.name = 'StyleClearList';
-        const clearPackages = this.makePanelButton(panel, isEnglish() ? 'Clear packages' : '清空数据包', 0, 0, 300, 52, () => this.confirmClearPackages(), new Color(92, 54, 64, 255)); clearPackages.name = 'StyleClearPackages';
-        for (const leftButton of [save, flow, imp, clearList, clearPackages]) this.setPanelButtonBlackFill(leftButton);
+        const title = this.makeLabel('StyleTitle', isEnglish() ? 'File Manager' : '文件管理', 30, 38, new Color(240, 244, 252, 255), 700, 50); panel.addChild(title);
+        const location = this.makePanelButton(panel, isEnglish() ? 'Save Location' : '保存位置', 0, 0, 500, 42, () => NativeBridge.chooseSaveRoot(path => {
+            if (!path) return;
+            for (const style of this.styles) this.persistManagedSnapshot(style.kind, style.name, style);
+            for (const track of this.trackSnapshots) this.persistManagedSnapshot('track', track.name, track);
+            const label = this.stylePanel?.getChildByName('FileSaveLocation')?.getChildByName('Text')?.getComponent(Label);
+            if (label) label.string = this.saveLocationButtonText();
+            this.refreshManagedLibrary(false); this.layoutStylePanel(); this.rebuildStyleRows();
+            this.showSuccessToast(t('保存位置已更新', 'Save location updated'));
+        }), new Color(0, 0, 0, 255)); location.name = 'FileSaveLocation';
+        const initialPathLabel = location.getChildByName('Text')?.getComponent(Label); if (initialPathLabel) { initialPathLabel.string = this.saveLocationButtonText(); initialPathLabel.fontSize = 14; initialPathLabel.horizontalAlign = Label.HorizontalAlign.CENTER; }
         const close = this.makePanelButton(panel, isEnglish() ? 'Close' : '关闭', 0, 0, 110, 42, () => this.closeStylePanel(), new Color(45, 58, 88, 255)); close.name = 'StyleClose';
+        const nav: Array<{ id: 'style' | 'flow' | 'track' | 'audio'; zh: string; en: string }> = [
+            { id: 'style', zh: '样式', en: 'Styles' }, { id: 'flow', zh: '样式流', en: 'Style Flows' },
+            { id: 'track', zh: '轨道', en: 'Tracks' }, { id: 'audio', zh: '音频', en: 'Audio' },
+        ];
+        this.fileNavButtons = nav.map(item => {
+            const button = this.makePanelButton(panel, isEnglish() ? item.en : item.zh, 0, 0, 145, 48, () => this.setFileCategory(item.id), new Color(34, 48, 72, 255));
+            button.name = `FileNav-${item.id}`; return button;
+        });
         const swallow = (e: EventTouch) => { e.propagationStopped = true; };
         panel.on(Node.EventType.TOUCH_START, swallow, this); panel.on(Node.EventType.TOUCH_MOVE, swallow, this); panel.on(Node.EventType.TOUCH_END, swallow, this);
         this.uiRoot.addChild(panel); panel.active = false;
@@ -5094,50 +5370,143 @@ export class GameManager extends Component {
     private layoutStylePanel() {
         if (!this.stylePanel) return;
         const panel = this.stylePanel; const view = this.userViewport(false);
-        const leftW = Math.max(300, Math.min(350, view.w * .25)); const dividerX = -view.w / 2 + leftW;
+        const leftW = Math.max(170, Math.min(210, view.w * .14)); const middleW = Math.max(285, Math.min(350, view.w * .23));
+        const dividerLeft = -view.w / 2 + leftW, dividerMiddle = dividerLeft + middleW;
         panel.getComponent(UITransform)!.setContentSize(view.w, view.h);
         const g = panel.getComponent(Graphics)!; g.clear();
         g.rect(-view.w / 2, -view.h / 2, view.w, view.h); g.fillColor = new Color(8, 12, 24, 255); g.fill();
         g.lineWidth = 1.5; g.strokeColor = new Color(95, 125, 165, 255); g.rect(-view.w / 2 + 1, -view.h / 2 + 1, view.w - 2, view.h - 2); g.stroke();
-        g.strokeColor = new Color(225, 232, 244, 210); g.moveTo(dividerX, -view.h / 2 + 18); g.lineTo(dividerX, view.h / 2 - 70); g.stroke();
+        g.strokeColor = new Color(225, 232, 244, 210);
+        for (const x of [dividerLeft, dividerMiddle]) { g.moveTo(x, -view.h / 2 + 18); g.lineTo(x, view.h / 2 - 70); g.stroke(); }
         panel.getChildByName('StyleTitle')?.setPosition(0, view.h / 2 - 34);
         panel.getChildByName('StyleClose')?.setPosition(view.w / 2 - 68, view.h / 2 - 34);
+        panel.getChildByName('FileSaveLocation')?.setPosition(-view.w / 2 + 270, view.h / 2 - 34);
         const leftCenter = -view.w / 2 + leftW / 2;
-        panel.getChildByName('StyleSave')?.setPosition(leftCenter, view.h / 2 - 125);
-        panel.getChildByName('StyleFlow')?.setPosition(leftCenter, view.h / 2 - 194);
-        panel.getChildByName('StyleImport')?.setPosition(leftCenter, view.h / 2 - 263);
-        panel.getChildByName('StyleClearList')?.setPosition(leftCenter, view.h / 2 - 332);
-        panel.getChildByName('StyleClearPackages')?.setPosition(leftCenter, view.h / 2 - 401);
+        this.fileNavButtons.forEach((button, i) => button.setPosition(leftCenter, view.h / 2 - 120 - i * 64));
+        this.rebuildFileActions(view, leftW, middleW);
         this.redrawPanelButtons(panel);
     }
 
     private rebuildStyleRows() {
         if (!this.stylePanel) return;
         for (const row of this.styleRows) row.destroy(); this.styleRows = [];
-        const view = this.userViewport(false); const leftW = Math.max(300, Math.min(350, view.w * .25));
-        const rightLeft = -view.w / 2 + leftW + 16; const rowW = view.w - leftW - 32; let cursor = view.h / 2 - 80;
-        this.styles.forEach((style, i) => {
+        this.managedAudioProgressDraw = null;
+        const view = this.userViewport(false); const leftW = Math.max(170, Math.min(210, view.w * .14)); const middleW = Math.max(285, Math.min(350, view.w * .23));
+        const rightLeft = -view.w / 2 + leftW + middleW + 16; const rowW = view.w - leftW - middleW - 32; let cursor = view.h / 2 - 82;
+        const visibleStyles = this.styles.filter(style => style.kind === this.fileCategory);
+        if (this.fileCategory === 'style' || this.fileCategory === 'flow') visibleStyles.forEach((style) => {
             const expanded = this.expandedStyleId === style.id; const totalH = expanded ? 150 : 62; const barY = totalH / 2 - 31;
             const row = new Node(`StyleRow${style.id}`); row.layer = Layers.Enum.UI_2D; row.addComponent(UITransform).setContentSize(rowW, totalH); row.setPosition(rightLeft + rowW / 2, cursor - totalH / 2);
             const g = row.addComponent(Graphics); g.roundRect(-rowW / 2, barY - 28, rowW, 56, 6); g.fillColor = new Color(22, 30, 48, 255); g.fill(); g.lineWidth = 2; g.strokeColor = style.kind === 'flow' ? new Color(75, 125, 240, 255) : new Color(60, 190, 110, 255); g.stroke();
             const right = rowW / 2;
             this.makePanelButton(row, style.name, -rowW / 2 + Math.min(185, rowW * .22), barY, Math.min(330, rowW * .43), 38, () => this.renameStyle(style), new Color(30, 40, 62, 255));
-            this.makePanelButton(row, expanded ? '▲' : '▼', right - 190, barY, 42, 38, () => { this.expandedStyleId = expanded ? '' : style.id; this.rebuildStyleRows(); }, style.kind === 'flow' ? new Color(42, 72, 130, 255) : new Color(42, 105, 72, 255));
-            this.makePanelButton(row, '→', right - 136, barY, 42, 38, () => this.exportStyleJson(style), new Color(42, 72, 115, 255));
+            this.makePanelButton(row, expanded ? '▲' : '▼', right - 136, barY, 42, 38, () => { this.expandedStyleId = expanded ? '' : style.id; this.rebuildStyleRows(); }, style.kind === 'flow' ? new Color(42, 72, 130, 255) : new Color(42, 105, 72, 255));
             this.makePanelButton(row, '↓', right - 82, barY, 42, 38, () => this.applyStyle(style), new Color(42, 72, 115, 255));
             this.makePanelButton(row, '×', right - 28, barY, 42, 38, () => this.deleteStyle(style), new Color(115, 45, 58, 255));
             if (expanded) this.drawStylePreview(row, style, rowW, barY - 68);
             this.stylePanel!.addChild(row); this.styleRows.push(row); cursor -= totalH + 10;
             row.setScale(.98, .98, 1); tween(row).to(.18, { scale: new Vec3(1, 1, 1) }, { easing: 'quadOut' }).start();
         });
+        if (this.fileCategory === 'track') this.trackSnapshots.forEach(track => {
+            const totalH = 62, barY = 0; const row = this.makeManagedRow(`TrackRow${track.id}`, rowW, totalH, rightLeft, cursor);
+            const right = rowW / 2; this.paintManagedRow(row, rowW, new Color(218, 174, 72, 255));
+            this.makePanelButton(row, track.name, -rowW / 2 + Math.min(185, rowW * .22), barY, Math.min(330, rowW * .43), 38, () => this.renameTrackSnapshot(track), new Color(30, 40, 62, 255));
+            this.makePanelButton(row, '↓', right - 82, barY, 42, 38, () => this.loadTrackSnapshot(track), new Color(42, 72, 115, 255));
+            this.makePanelButton(row, '×', right - 28, barY, 42, 38, () => this.deleteTrackSnapshot(track), new Color(115, 45, 58, 255));
+            this.stylePanel!.addChild(row); this.styleRows.push(row); cursor -= totalH + 10;
+        });
+        if (this.fileCategory === 'audio') this.managedAudioEntries.forEach(audio => {
+            const expanded = this.expandedManagedAudioKey === audio.key; const totalH = expanded ? 132 : 62; const row = this.makeManagedRow(`ManagedAudio${audio.key}`, rowW, totalH, rightLeft, cursor); const barY = totalH / 2 - 31;
+            const right = rowW / 2; this.paintManagedRow(row, rowW, new Color(72, 176, 205, 255), barY);
+            this.makePanelButton(row, `${audio.name}.${audio.format}`, -rowW / 2 + Math.min(205, rowW * .25), barY, Math.min(370, rowW * .5), 38, () => this.renameManagedAudio(audio), new Color(30, 40, 62, 255));
+            this.makePanelButton(row, expanded ? '▲' : '▼', right - 190, barY, 42, 38, () => { this.expandedManagedAudioKey = expanded ? '' : audio.key; this.rebuildStyleRows(); }, new Color(36, 83, 102, 255));
+            this.makePanelButton(row, audio.format === 'wav' ? 'MP3' : 'WAV', right - 136, barY, 50, 38, () => this.convertManagedAudioEntry(audio), new Color(42, 72, 115, 255));
+            this.makePanelButton(row, this.managedAudioPlayingKey === audio.key ? '■' : '▶', right - 80, barY, 42, 38, () => this.toggleManagedAudio(audio), new Color(42, 105, 72, 255));
+            this.makePanelButton(row, '×', right - 25, barY, 42, 38, () => this.deleteManagedAudio(audio), new Color(115, 45, 58, 255));
+            if (expanded) this.drawManagedAudioPreview(row, audio, rowW, barY - 58);
+            this.stylePanel!.addChild(row); this.styleRows.push(row); cursor -= totalH + 10;
+        });
+        if (!this.styleRows.length) {
+            const empty = this.makeLabel('FileListEmpty', t('此分类暂无文件', 'No files in this category'), 20, 30, new Color(145, 158, 180, 255), rowW, 50);
+            empty.setPosition(rightLeft + rowW / 2, view.h / 2 - 130); this.stylePanel.addChild(empty); this.styleRows.push(empty);
+        }
+        this.redrawPanelButtons(this.stylePanel);
     }
 
-    private renameStyle(style: StyleSnapshot) { NativeBridge.promptText(t('重命名样式', 'Rename Style'), style.name, (value) => { if (value.trim()) style.name = value.trim(); this.saveStyles(); this.rebuildStyleRows(); }); }
+    private setFileCategory(category: 'style' | 'flow' | 'track' | 'audio') {
+        if (this.fileCategory === category) return;
+        this.fileCategory = category; this.expandedStyleId = ''; this.expandedManagedAudioKey = '';
+        this.layoutStylePanel(); this.rebuildStyleRows();
+    }
+
+    private saveLocationButtonText() {
+        const title = isEnglish() ? 'Save Location' : '保存位置'; const rawPath = NativeBridge.getSaveRootLabel(); let path = rawPath;
+        try { path = decodeURIComponent(rawPath).replace(/^content:\/\//, ''); } catch (e) { /* keep URI when provider uses non-standard escaping */ }
+        const compact = path.length > 40 ? `…${path.slice(-39)}` : path; return `${title}  ${compact}`;
+    }
+
+    private rebuildFileActions(view: { w: number; h: number }, leftW: number, middleW: number) {
+        if (!this.stylePanel) return;
+        for (const node of this.fileActionNodes) node.destroy(); this.fileActionNodes = [];
+        const x = -view.w / 2 + leftW + middleW / 2; const actions: Array<{ text: string; run: () => void; danger?: boolean }> = [];
+        if (this.fileCategory === 'style') actions.push(
+            { text: t('保存当前所有为新样式', 'Save Current as New Style'), run: () => this.saveCurrentStyle() },
+            { text: t('查看文件夹目录', 'View Folder'), run: () => NativeBridge.openManagedDirectory('style') },
+            { text: t('清空样式栏', 'Clear Styles'), run: () => this.confirmClearManagedCategory('style'), danger: true });
+        else if (this.fileCategory === 'flow') actions.push(
+            { text: t('新建样式流', 'New Style Flow'), run: () => this.openStyleFlowEditor() },
+            { text: t('查看文件夹目录', 'View Folder'), run: () => NativeBridge.openManagedDirectory('flow') },
+            { text: t('清空样式流', 'Clear Style Flows'), run: () => this.confirmClearManagedCategory('flow'), danger: true });
+        else if (this.fileCategory === 'track') actions.push(
+            { text: t('保存当前所有轨道', 'Save All Current Tracks'), run: () => this.saveCurrentTracks() },
+            { text: t('查看文件夹目录', 'View Folder'), run: () => NativeBridge.openManagedDirectory('track') },
+            { text: t('清空轨道栏', 'Clear Track Library'), run: () => this.confirmClearManagedCategory('track'), danger: true });
+        else actions.push(
+            { text: t('查看目录', 'View Folder'), run: () => NativeBridge.openManagedDirectory('audio') },
+            { text: t('清空音频栏', 'Clear Audio Library'), run: () => this.confirmClearManagedCategory('audio'), danger: true });
+        actions.forEach((action, i) => {
+            const button = this.makePanelButton(this.stylePanel!, action.text, x, view.h / 2 - 125 - i * 62, middleW - 28, 46, action.run, action.danger ? new Color(105, 45, 55, 255) : new Color(38, 58, 88, 255));
+            this.fileActionNodes.push(button);
+        });
+        this.fileNavButtons.forEach(button => {
+            const selected = button.name === `FileNav-${this.fileCategory}`; const style = (button as any).__panelButtonStyle; if (style) style.color = selected ? new Color(45, 92, 130, 255) : new Color(34, 48, 72, 255);
+        });
+    }
+
+    private refreshManagedLibrary(migrateLegacy = true) {
+        if (!NativeBridge.isAndroidNative) return;
+        let styleEntries = NativeBridge.listManagedEntries('style'); let flowEntries = NativeBridge.listManagedEntries('flow');
+        if (migrateLegacy && !styleEntries.length && !flowEntries.length && this.styles.length) {
+            for (const style of this.styles) this.persistManagedSnapshot(style.kind, style.name, style);
+            styleEntries = NativeBridge.listManagedEntries('style'); flowEntries = NativeBridge.listManagedEntries('flow');
+        }
+        const parsedStyles: StyleSnapshot[] = [];
+        for (const entry of [...styleEntries, ...flowEntries]) try { const value = JSON.parse(String(entry.json ?? '')); if (value?.waves && value?.grid) parsedStyles.push({ ...value, fileKey: String(entry.key) }); } catch (e) { console.warn('[ColorMusic] 忽略无效样式文件', entry?.name); }
+        this.styles = parsedStyles; this.saveStyles();
+        this.trackSnapshots = NativeBridge.listManagedEntries('track').flatMap(entry => { try { const value = JSON.parse(String(entry.json ?? '')); return value?.tracks && value?.clips ? [{ ...value, fileKey: String(entry.key) } as TrackSnapshot] : []; } catch (e) { return []; } });
+        this.managedAudioEntries = NativeBridge.listManagedEntries('audio').filter(entry => entry?.key && (entry.format === 'wav' || entry.format === 'mp3')).map(entry => ({ key: String(entry.key), name: String(entry.name ?? t('新音频', 'New Audio')), format: entry.format, path: String(entry.path ?? ''), duration: Math.max(0, Number(entry.duration) || 0) }));
+    }
+
+    private persistManagedSnapshot(category: 'style' | 'flow' | 'track', name: string, value: StyleSnapshot | TrackSnapshot) {
+        const copy: any = JSON.parse(JSON.stringify(value)); delete copy.fileKey;
+        return NativeBridge.saveManagedJson(category, name, JSON.stringify(copy));
+    }
+
+    private makeManagedRow(name: string, width: number, height: number, left: number, cursor: number) {
+        const row = new Node(name); row.layer = Layers.Enum.UI_2D; row.addComponent(UITransform).setContentSize(width, height); row.setPosition(left + width / 2, cursor - height / 2); row.addComponent(Graphics); return row;
+    }
+
+    private paintManagedRow(row: Node, width: number, border: Color, centerY = 0) {
+        const g = row.getComponent(Graphics)!; g.roundRect(-width / 2, centerY - 28, width, 56, 6); g.fillColor = new Color(22, 30, 48, 255); g.fill(); g.lineWidth = 2; g.strokeColor = border; g.stroke();
+    }
+
+    private renameStyle(style: StyleSnapshot) { NativeBridge.promptText(t('重命名样式', 'Rename Style'), style.name, (value) => { const name = value.trim(); if (!name) return; const key = style.fileKey ? NativeBridge.renameManagedEntry(style.fileKey, name) : ''; style.name = name; if (key) style.fileKey = key; if (style.fileKey) NativeBridge.updateManagedJson(style.fileKey, JSON.stringify({ ...style, fileKey: undefined })); this.saveStyles(); this.rebuildStyleRows(); }); }
 
     private deleteStyle(style: StyleSnapshot) {
         NativeBridge.confirm('删除样式', `确定删除“${style.name}”吗？`, (confirmed) => {
             if (!confirmed) return;
             this.styles = this.styles.filter((item) => item.id !== style.id);
+            if (style.fileKey) NativeBridge.deleteManagedEntry(style.fileKey);
             if (this.activeStyleFlow?.id === style.id) this.activeStyleFlow = null;
             if (this.expandedStyleId === style.id) this.expandedStyleId = '';
             this.saveStyles(); this.rebuildStyleRows();
@@ -5152,10 +5521,7 @@ export class GameManager extends Component {
     }
 
     private confirmClearStyles() {
-        this.confirmTwice('清空样式栏中的所有样式和样式流', () => {
-            this.styles = []; this.activeStyleFlow = null; this.expandedStyleId = ''; this.saveStyles(); this.rebuildStyleRows();
-            this.setInfo('样式栏已清空', new Color(220, 225, 235, 255));
-        });
+        this.confirmClearManagedCategory('style');
     }
 
     private confirmClearPackages() {
@@ -5164,6 +5530,102 @@ export class GameManager extends Component {
             this.setInfo(removed >= 0 ? `已清空数据包（${removed} 个）` : '清空数据包失败', removed >= 0 ? new Color(220, 225, 235, 255) : new Color(255, 150, 150, 255));
         });
     }
+
+    private confirmClearManagedCategory(category: 'style' | 'flow' | 'track' | 'audio') {
+        const names = { style: t('样式栏', 'style library'), flow: t('样式流', 'style flow library'), track: t('轨道栏', 'track library'), audio: t('音频栏', 'audio library') };
+        this.confirmTwice(`${t('清空', 'clear ')}${names[category]}`, () => {
+            const removed = NativeBridge.clearManagedCategory(category); if (removed < 0) { this.setInfo(t('清空失败', 'Clear failed'), new Color(255, 150, 150, 255)); return; }
+            if (category === 'style' || category === 'flow') { this.styles = this.styles.filter(style => style.kind !== category); if (category === 'flow') this.activeStyleFlow = null; this.saveStyles(); }
+            else if (category === 'track') this.trackSnapshots = [];
+            else { NativeBridge.stopManagedAudio(); this.managedAudioEntries = []; this.managedAudioPlayingKey = ''; }
+            this.expandedStyleId = ''; this.expandedManagedAudioKey = ''; this.rebuildStyleRows(); this.showSuccessToast(`${names[category]}${t('已清空', ' cleared')}`);
+        });
+    }
+
+    private saveCurrentTracks() {
+        NativeBridge.promptText(t('保存轨道', 'Save Tracks'), t('新轨道', 'New Tracks'), value => {
+            const name = value.trim(); if (!name) return;
+            const snapshot: TrackSnapshot = { id: `track_style_${Date.now()}`, name, createdAt: Date.now(), bpm: this.metronomeBpm, tracks: JSON.parse(JSON.stringify(this.mixerTracks)), clips: JSON.parse(JSON.stringify(this.recordedClips)) };
+            const key = this.persistManagedSnapshot('track', name, snapshot);
+            if (NativeBridge.isAndroidNative && !key) { this.setInfo(t('轨道保存失败', 'Failed to save tracks'), new Color(255, 150, 150, 255)); return; }
+            snapshot.fileKey = key; this.trackSnapshots.unshift(snapshot); this.rebuildStyleRows(); this.showSuccessToast(t('轨道已保存', 'Tracks saved'));
+        });
+    }
+
+    private renameTrackSnapshot(track: TrackSnapshot) {
+        NativeBridge.promptText(t('重命名轨道', 'Rename Tracks'), track.name, value => {
+            const name = value.trim(); if (!name) return; const key = track.fileKey ? NativeBridge.renameManagedEntry(track.fileKey, name) : '';
+            track.name = name; if (key) track.fileKey = key; if (track.fileKey) NativeBridge.updateManagedJson(track.fileKey, JSON.stringify({ ...track, fileKey: undefined })); this.rebuildStyleRows();
+        });
+    }
+
+    private loadTrackSnapshot(track: TrackSnapshot) {
+        this.stopMixerTimelinePlayback(false); this.mixerTracks = JSON.parse(JSON.stringify(track.tracks)); this.recordedClips = JSON.parse(JSON.stringify(track.clips)); this.metronomeBpm = Math.max(20, Math.min(320, Math.round(track.bpm || this.metronomeBpm)));
+        this.ensureMixerTrack(12); this.mixerSelectedBlockId = ''; this.mixerConnectionSourceId = ''; this.mixerConnectionBlockId = ''; this.saveAudioClips(); this.saveMixerTracks(); saveStr('cm_metronome_bpm', String(this.metronomeBpm)); NativeBridge.setMetronome(this.metronomeEnabled, this.metronomeBeatsPerBar, this.metronomeBeatUnit, this.metronomeBpm); this.resetMetronomeGridAnimation();
+        if (this.audioPanel) { this.rebuildAudioRows(); this.redrawMixerTimeline(); } this.showSuccessToast(t('轨道已加载', 'Tracks loaded'));
+    }
+
+    private deleteTrackSnapshot(track: TrackSnapshot) {
+        NativeBridge.confirm(t('删除轨道', 'Delete Tracks'), `${t('确定删除', 'Delete')}“${track.name}”？`, confirmed => {
+            if (!confirmed) return; if (track.fileKey) NativeBridge.deleteManagedEntry(track.fileKey); this.trackSnapshots = this.trackSnapshots.filter(item => item.id !== track.id); this.rebuildStyleRows();
+        });
+    }
+
+    private renameManagedAudio(audio: ManagedAudioEntry) {
+        NativeBridge.promptText(t('重命名音频', 'Rename Audio'), audio.name, value => {
+            const name = value.trim(); if (!name) return; const key = NativeBridge.renameManagedEntry(audio.key, `${name}.${audio.format}`); if (!key) return;
+            audio.name = name; audio.key = key; this.refreshManagedLibrary(false); this.rebuildStyleRows();
+        });
+    }
+
+    private convertManagedAudioEntry(audio: ManagedAudioEntry) {
+        const target: 'wav' | 'mp3' = audio.format === 'wav' ? 'mp3' : 'wav';
+        NativeBridge.promptText(t('转换音频', 'Convert Audio'), audio.name, value => {
+            const name = value.trim(); if (!name) return; const result = NativeBridge.convertManagedAudio(audio.path, name, target);
+            if (!result || result.startsWith('ERROR:')) { this.setInfo(result.replace(/^ERROR:/, '') || t('音频转换失败', 'Audio conversion failed'), new Color(255, 150, 150, 255)); return; }
+            this.refreshManagedLibrary(false); this.rebuildStyleRows(); this.showSuccessToast(t('音频格式转换成功', 'Audio converted'));
+        });
+    }
+
+    private deleteManagedAudio(audio: ManagedAudioEntry) {
+        NativeBridge.confirm(t('删除音频', 'Delete Audio'), `${t('确定删除', 'Delete')}“${audio.name}.${audio.format}”？`, confirmed => {
+            if (!confirmed) return;
+            if (this.managedAudioPlayingKey === audio.key) { NativeBridge.stopManagedAudio(); this.managedAudioPlayingKey = ''; }
+            if (!NativeBridge.deleteManagedEntry(audio.key)) { this.setInfo(t('音频删除失败', 'Audio delete failed'), new Color(255, 150, 150, 255)); return; }
+            this.expandedManagedAudioKey = ''; this.refreshManagedLibrary(false); this.rebuildStyleRows(); this.showSuccessToast(t('音频已删除', 'Audio deleted'));
+        });
+    }
+
+    private toggleManagedAudio(audio: ManagedAudioEntry) {
+        if (this.managedAudioPlayingKey === audio.key) { NativeBridge.stopManagedAudio(); this.managedAudioPlayingKey = ''; this.managedAudioProgressDraw?.(); this.rebuildStyleRows(); return; }
+        this.playManagedAudioAt(audio, 0);
+    }
+
+    private playManagedAudioAt(audio: ManagedAudioEntry, seconds: number) {
+        NativeBridge.stopManagedAudio(); this.managedAudioPlayingKey = audio.key; this.managedAudioStartSeconds = Math.max(0, Math.min(audio.duration, seconds)); this.managedAudioStartedAt = Date.now(); NativeBridge.playManagedAudio(audio.path, this.managedAudioStartSeconds);
+        if (this.managedAudioProgressFrame !== null) cancelAnimationFrame(this.managedAudioProgressFrame);
+        const tick = () => {
+            if (this.managedAudioPlayingKey !== audio.key) { this.managedAudioProgressFrame = null; return; }
+            const position = this.managedAudioStartSeconds + (Date.now() - this.managedAudioStartedAt) / 1000;
+            if (audio.duration > 0 && position >= audio.duration) { this.managedAudioPlayingKey = ''; this.managedAudioProgressFrame = null; this.rebuildStyleRows(); return; }
+            this.managedAudioProgressDraw?.(); this.managedAudioProgressFrame = requestAnimationFrame(tick);
+        };
+        this.rebuildStyleRows(); this.managedAudioProgressFrame = requestAnimationFrame(tick);
+    }
+
+    private drawManagedAudioPreview(row: Node, audio: ManagedAudioEntry, width: number, centerY: number) {
+        const bar = new Node('AudioSeekBar'); bar.layer = Layers.Enum.UI_2D; const barW = Math.max(120, width - 70); bar.addComponent(UITransform).setContentSize(barW, 42); bar.setPosition(0, centerY); const graphics = bar.addComponent(Graphics); row.addChild(bar);
+        const time = this.makeLabel('AudioDuration', '', 13, 18, new Color(190, 204, 222, 255), barW, 20); time.setPosition(0, -18); bar.addChild(time);
+        const draw = () => {
+            if (!graphics.isValid) return; const active = this.managedAudioPlayingKey === audio.key; const elapsed = active ? this.managedAudioStartSeconds + (Date.now() - this.managedAudioStartedAt) / 1000 : this.managedAudioStartSeconds; const ratio = audio.duration > 0 ? Math.max(0, Math.min(1, elapsed / audio.duration)) : 0;
+            graphics.clear(); graphics.roundRect(-barW / 2, -7, barW, 14, 4); graphics.fillColor = new Color(35, 48, 68, 255); graphics.fill(); graphics.roundRect(-barW / 2, -7, barW * ratio, 14, 4); graphics.fillColor = new Color(72, 196, 130, 255); graphics.fill(); graphics.circle(-barW / 2 + barW * ratio, 0, 8); graphics.fillColor = new Color(238, 246, 242, 255); graphics.fill();
+            time.getComponent(Label)!.string = `${t('已播放', 'Played')} ${this.formatAudioTime(elapsed)} / ${this.formatAudioTime(audio.duration)}`;
+        };
+        const seek = (event: EventTouch) => { const world = event.getUILocation(); const local = bar.getComponent(UITransform)!.convertToNodeSpaceAR(new Vec3(world.x, world.y)); const ratio = Math.max(0, Math.min(1, (local.x + barW / 2) / barW)); this.playManagedAudioAt(audio, ratio * audio.duration); event.propagationStopped = true; };
+        bar.on(Node.EventType.TOUCH_START, seek, this); bar.on(Node.EventType.TOUCH_MOVE, seek, this); bar.on(Node.EventType.TOUCH_END, seek, this); this.managedAudioProgressDraw = draw; draw();
+    }
+
+    private formatAudioTime(seconds: number) { const total = Math.max(0, Math.floor(seconds)); return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`; }
 
     private drawStylePreview(row: Node, style: StyleSnapshot, width: number, centerY: number) {
         const preview = new Node('Preview'); preview.layer = Layers.Enum.UI_2D; preview.addComponent(UITransform).setContentSize(width - 20, 78); preview.setPosition(0, centerY); row.addChild(preview);
@@ -5202,7 +5664,11 @@ export class GameManager extends Component {
         };
     }
 
-    private saveCurrentStyle() { this.styles.push(this.captureStyle('style', t('新样式', 'New Style'))); this.saveStyles(); this.setInfo(t('已保存新样式', 'New style saved'), new Color(220, 225, 235, 255)); }
+    private saveCurrentStyle() {
+        const style = this.captureStyle('style', t('新样式', 'New Style')); const key = this.persistManagedSnapshot('style', style.name, style);
+        if (NativeBridge.isAndroidNative && !key) { this.setInfo(t('样式保存失败', 'Failed to save style'), new Color(255, 150, 150, 255)); return; }
+        style.fileKey = key; this.styles.unshift(style); this.saveStyles(); this.rebuildStyleRows(); this.showSuccessToast(t('已保存新样式', 'New style saved'));
+    }
 
     private openStyleFlowEditor() {
         const styleChoices = this.styles.filter((s) => s.kind === 'style');
@@ -5251,7 +5717,9 @@ export class GameManager extends Component {
     private closeStyleFlowEditor() { if (this.flowEditorPanel) this.flowEditorPanel.active = false; if (this.stylePanel) { this.stylePanel.active = true; this.layoutStylePanel(); this.rebuildStyleRows(); } }
 
     private saveStyleFlow() {
-        const flow = this.captureStyle('flow', t('新样式流', 'New Style Flow')); flow.flowNodes = this.flowEditorNodes.map((n) => ({ ...n })); this.styles.push(flow); this.saveStyles(); this.closeStyleFlowEditor(); this.setInfo(t('已保存新样式流', 'New style flow saved'), new Color(220, 225, 235, 255));
+        const flow = this.captureStyle('flow', t('新样式流', 'New Style Flow')); flow.flowNodes = this.flowEditorNodes.map((n) => ({ ...n })); const key = this.persistManagedSnapshot('flow', flow.name, flow);
+        if (NativeBridge.isAndroidNative && !key) { this.setInfo(t('样式流保存失败', 'Failed to save style flow'), new Color(255, 150, 150, 255)); return; }
+        flow.fileKey = key; this.styles.unshift(flow); this.saveStyles(); this.closeStyleFlowEditor(); this.showSuccessToast(t('已保存新样式流', 'New style flow saved'));
     }
     private loadStyles(): StyleSnapshot[] { try { const raw = sys.localStorage.getItem('cm_styles'); const value = raw ? JSON.parse(raw) : []; return Array.isArray(value) ? value.map((style) => ({ ...style, name: localizeMutableDefaultName(String(style.name ?? (style.kind === 'flow' ? t('新样式流', 'New Style Flow') : t('新样式', 'New Style')))) })) : []; } catch (e) { return []; } }
     private saveStyles() { try { sys.localStorage.setItem('cm_styles', JSON.stringify(this.styles)); } catch (e) { /* ignore */ } }
@@ -5262,6 +5730,7 @@ export class GameManager extends Component {
             const first = this.styles.find((s) => s.kind === 'style' && s.id === style.flowNodes?.[0]?.styleId);
             if (first) this.applyStyleSnapshot(first, true);
             this.setInfo('样式流已载入，将在循环播放时运行', new Color(180, 205, 255, 255));
+            this.showSuccessToast(t('样式流已加载', 'Style flow loaded'));
             return;
         }
         this.applyStyleSnapshot(style, false);
@@ -5294,8 +5763,10 @@ export class GameManager extends Component {
             this.metronomeBpm = Math.max(20, Math.min(320, Math.round(style.metronome.bpm || 120)));
             saveStr('cm_metronome_beats', String(this.metronomeBeatsPerBar)); saveStr('cm_metronome_unit', String(this.metronomeBeatUnit)); saveStr('cm_metronome_bpm', String(this.metronomeBpm));
             NativeBridge.setMetronome(this.metronomeEnabled, this.metronomeBeatsPerBar, this.metronomeBeatUnit, this.metronomeBpm);
+            this.resetMetronomeGridAnimation();
             this.redrawMetronomeButton();
         }
+        if (!preserveFlow) this.showSuccessToast(t('样式已加载', 'Style loaded'));
     }
 
     private startStyleFlow() {
@@ -5367,6 +5838,7 @@ export class GameManager extends Component {
             this.setInfo(isEnglish()
                 ? `Image loaded  ${imgAsset.width}×${imgAsset.height}  Hold / drag / tap to play`
                 : `图片已加载  ${imgAsset.width}×${imgAsset.height}  按住/滑动/点按发声`, new Color(220, 225, 235, 255));
+            this.showSuccessToast(t('图片加载成功', 'Image loaded'));
         });
     }
 
@@ -5446,6 +5918,7 @@ export class GameManager extends Component {
     private onGlobalTouchEnd(event: EventTouch) {
         const id = event.getID();
         if (!this.activeTouches.has(id)) return;
+        this.releaseGridTouchEffect(id);
         this.activeTouches.delete(id);
         this.touchAudioUpdateMs.delete(id);
         this.touchVisualUpdateMs.delete(id);
@@ -5459,6 +5932,8 @@ export class GameManager extends Component {
         this.activeTouches.clear();
         this.touchAudioUpdateMs.clear();
         this.touchVisualUpdateMs.clear();
+        for (const effect of this.gridTouchEffects.values()) effect.releasing = true;
+        this.gridTouchPointerEffects.clear();
         this.clearTouchRipples();
     }
 
@@ -5584,6 +6059,7 @@ export class GameManager extends Component {
         const id = event.getID();
         this.activeTouches.set(id, null as any);
         this.touchAudioUpdateMs.set(id, Date.now());
+        this.updateGridTouchEffect(event, true);
         this.playSustain(event);
     }
 
@@ -5622,6 +6098,7 @@ export class GameManager extends Component {
             return;
         }
         if (!this.activeTouches.has(id)) return;
+        this.updateGridTouchEffect(event, false);
         if (!this.store.ready) return;
         const now = Date.now();
         if (now - (this.touchAudioUpdateMs.get(id) ?? 0) < TOUCH_AUDIO_INTERVAL_MS) return;
@@ -5663,6 +6140,7 @@ export class GameManager extends Component {
             return;
         }
         if (!this.activeTouches.has(id)) return;
+        this.releaseGridTouchEffect(id);
         this.activeTouches.delete(id);
         this.touchAudioUpdateMs.delete(id);
         this.touchVisualUpdateMs.delete(id);
@@ -5693,6 +6171,31 @@ export class GameManager extends Component {
             u: Math.max(0, Math.min(1, (local.x + cs.width / 2) / cs.width)),
             v: Math.max(0, Math.min(1, (local.y + cs.height / 2) / cs.height)),
         };
+    }
+
+    private updateGridTouchEffect(event: EventTouch, create: boolean) {
+        const id = event.getID(), uv = this.screenUv(event), size = this.gridTransform.contentSize;
+        let effectId = this.gridTouchPointerEffects.get(id);
+        let effect = effectId === undefined ? undefined : this.gridTouchEffects.get(effectId);
+        if (create) {
+            if (effect) effect.releasing = true;
+            effectId = ++this.gridTouchEffectSerial;
+            effect = { x: 0, y: 0, strength: 0, releasing: false };
+            this.gridTouchEffects.set(effectId, effect);
+            this.gridTouchPointerEffects.set(id, effectId);
+        }
+        if (!effect) return;
+        effect.x = -size.width / 2 + uv.u * size.width;
+        effect.y = -size.height / 2 + uv.v * size.height;
+        effect.releasing = false;
+    }
+
+    private releaseGridTouchEffect(id: number) {
+        const effectId = this.gridTouchPointerEffects.get(id);
+        if (effectId === undefined) return;
+        this.gridTouchPointerEffects.delete(id);
+        const effect = this.gridTouchEffects.get(effectId);
+        if (effect) effect.releasing = true;
     }
 
     /**
@@ -5816,7 +6319,7 @@ export class GameManager extends Component {
      * 读取物理方向角（度）：用重力在屏幕面内的分量计算绝对朝向。
      * 设备坐标系横/竖持机为干净的 0/±90°；近水平（重力主要在 z）时方向不可靠，保持当前朝向。
      */
-    private readDeviceAngle(event: EventAcceleration): number {
+    private readDeviceAngle(event: EventAcceleration): number | null {
         const g = globalThis as any;
         try {
             if (g.jsb?.device?.getDeviceMotionValue) {
@@ -5830,16 +6333,16 @@ export class GameManager extends Component {
             }
         } catch (e) { /* 忽略 */ }
         const a = event.acc;
-        if (!a) return this.deviceAngleSmoothed;
+        if (!a) return null;
         return this.angleFromGravity(a.x, a.y, 0);
     }
 
-    /** 由重力三分量算方向角；近水平（方向不可靠）时返回当前朝向（保持不动）。 */
-    private angleFromGravity(gx: number, gy: number, gz: number): number {
+    /** 由重力三分量算方向角；设备近乎平放时不产生方向样本。 */
+    private angleFromGravity(gx: number, gy: number, gz: number): number | null {
         const inPlane = Math.sqrt(gx * gx + gy * gy);
         const mag = Math.sqrt(gx * gx + gy * gy + gz * gz);
-        // 重力几乎不在屏面内 → 手机近乎平放，方向角不可靠，保持现状
-        if (mag > 0.5 && inPlane / mag < 0.35) return this.deviceAngleSmoothed;
+        // 重力几乎不在屏面内时方向不可靠，不能拿来完成启动校准。
+        if (mag <= 0.5 || inPlane / mag < 0.35) return null;
         return Math.atan2(gx, gy) * 180 / Math.PI;
     }
 
@@ -5863,23 +6366,24 @@ export class GameManager extends Component {
 
     private onDeviceMotion(event: EventAcceleration) {
         const angle = this.readDeviceAngle(event);
-        // 低通平滑（强平滑，抗抖动）
-        this.deviceAngleSmoothed = this.deviceAngleSmoothed * 0.9 + angle * 0.1;
-        // 首次启动以当前握持姿态作为横屏基准，避免系统横屏窗口内的 UI 又被传感器旋成竖向。
+        if (angle === null) return;
+        if (!this.hasDeviceAngleSample) {
+            this.deviceAngleSmoothed = angle;
+            this.hasDeviceAngleSample = true;
+        } else {
+            // 沿最短角距离低通平滑，避免 +180/-180 交界处错误穿过 0°。
+            const delta = ((angle - this.deviceAngleSmoothed + 540) % 360) - 180;
+            this.deviceAngleSmoothed += delta * 0.1;
+        }
         if (!this.calibrated) {
             this.calibrationCount++;
             if (this.calibrationCount >= 12) {
                 this.calibrated = true;
-                if (this.startupLandscapePending) {
-                    this.calibOffset = this.deviceAngleSmoothed - GameManager.LANDSCAPE_ABS;
-                    this.currentSnapped = 0;
-                    this.startupLandscapePending = false;
-                } else {
-                    this.calibOffset = 0;
-                    this.currentSnapped = this.absSnapped();
-                }
+                this.calibOffset = 0;
+                const snapped = this.absSnapped();
+                if (this.canFollowOrientation(snapped)) this.currentSnapped = snapped;
                 const tgt = this.targetForSnapped(this.currentSnapped);
-                this.applyRotation(tgt, false);
+                if (this.canFollowOrientation(this.currentSnapped)) this.applyRotation(tgt, false);
                 console.warn('[CM] 校零完成 snapped=', this.currentSnapped, 'target=', tgt);
             }
             return;
@@ -5903,6 +6407,8 @@ export class GameManager extends Component {
 
     /** 应用旋转：根容器随设备旋转；子节点按用户视角的横/竖屏安全区重排。 */
     private applyRotation(target: number, animate: boolean) {
+        const portrait = target === 90 || target === -90;
+        if (portrait && (this.audioPanelOpen || this.stylePanelOpen)) return;
         const from = this.currentTarget;
         this.currentTarget = target;
         console.warn('[CM] applyRotation target=', target, 'from=', from, 'animate=', animate);
@@ -5912,19 +6418,15 @@ export class GameManager extends Component {
          * 2000×900，竖屏为 900×2000。直接在此坐标系布局，可让 ±90° 和
          * 180° 都得到一致结果，也避免旋转后的控件宽度越过屏幕边缘。
         */
-        const portrait = target === 90 || target === -90;
-        if (portrait) {
-            if (this.audioPanelOpen) this.closeAudioPanel();
-            if (this.stylePanelOpen) this.closeStylePanel();
-        }
         const targetScale = this.rootScaleFor(portrait);
         const view = this.userViewport(portrait);
         const mainScale = this.mainUiControlScale();
+        const menuListScale = mainScale * 1.5;
         const cornerInset = MAIN_MENU_BUTTON_SIZE / 2 * mainScale + 6;
         const menuPos: [number, number] = [view.w / 2 - cornerInset, view.h / 2 - cornerInset];
-        const bx = view.w / 2 - Math.max(70, 57.5 * mainScale + 12);
-        const top = menuPos[1] - 46 * mainScale;
-        const menuStep = 39 * mainScale;
+        const bx = view.w / 2 - 57.5 * menuListScale - 12;
+        const top = menuPos[1] - 72 * mainScale;
+        const menuStep = 39 * menuListScale;
         const btnPos: Array<[number, number]> = [
             [bx, top], [bx, top - menuStep], [bx, top - menuStep * 2],
             [bx, top - menuStep * 3], [bx, top - menuStep * 4],
@@ -5943,7 +6445,7 @@ export class GameManager extends Component {
                 if (withTween && node.active) this.tweenTo(node, destination[0], destination[1]);
                 else {
                     node.setPosition(destination[0], destination[1]);
-                    node.setScale(this.mainMenuOpen ? mainScale : .001, this.mainMenuOpen ? mainScale : .001, 1);
+                    node.setScale(this.mainMenuOpen ? menuListScale : .001, this.mainMenuOpen ? menuListScale : .001, 1);
                 }
             }
             this.mainMenuBtn.angle = 0;
@@ -6011,12 +6513,14 @@ export class GameManager extends Component {
     /** 每 0.1s：按绝对重力方向吸附到最近 90°（实时校准，与启动朝向无关），带 55° 滞回防抖。 */
     private updateOrientation() {
         if (!this.calibrated) return;
+        if (this.uiLocked) return;
         const angle = this.correctedAngle();
         // 距当前吸附朝向的偏差；<55° 视为仍在当前朝向（滞回防抖，避免近 45° 摆动反复横跳）
         const diff = ((angle - this.currentSnapped + 540) % 360) - 180;
         if (Math.abs(diff) < 55) return;
         const snapped = this.absSnapped();
         if (snapped === this.currentSnapped) return;
+        if (!this.canFollowOrientation(snapped)) return;
         this.currentSnapped = snapped;
         const target = this.targetForSnapped(snapped);
         if (target === this.currentTarget) return;
@@ -6032,6 +6536,15 @@ export class GameManager extends Component {
         this.makePanelButton(message, '查看目录', width / 2 - 82, -31, 132, 34, () => NativeBridge.openExportDirectory(), new Color(42, 105, 72, 255));
         const opacity = message.addComponent(UIOpacity); opacity.opacity = 0; this.uiRoot.addChild(message); message.setPosition(0, 0); message.setSiblingIndex(this.uiRoot.children.length - 1);
         tween(opacity).to(.16, { opacity: 255 }).delay(5).to(.24, { opacity: 0 }).call(() => message.destroy()).start();
+    }
+
+    private showSuccessToast(text: string) {
+        this.uiRoot.getChildByName('SuccessToast')?.destroy(); const view = this.userViewport(false); const width = Math.min(430, Math.max(330, view.w * .22)); const height = 86; const margin = 26;
+        const toast = new Node('SuccessToast'); toast.layer = Layers.Enum.UI_2D; toast.addComponent(UITransform).setContentSize(width, height); const g = toast.addComponent(Graphics);
+        g.roundRect(-width / 2, -height / 2, width, height, 4); g.fillColor = new Color(80, 190, 116, 102); g.fill(); g.lineWidth = 4; g.strokeColor = new Color(15, 86, 47, 235); g.stroke();
+        const label = this.makeLabel('Text', text, 20, 28, new Color(255, 255, 255, 255), width - 34, height - 16); toast.addChild(label); this.uiRoot.addChild(toast); toast.setSiblingIndex(this.uiRoot.children.length - 1);
+        const shown = new Vec3(view.w / 2 - width / 2 - margin, -view.h / 2 + height / 2 + margin, 0); const border = new Vec3(view.w / 2, shown.y, 0); const hidden = new Vec3(view.w / 2 + width / 2 + margin, shown.y, 0); toast.setPosition(hidden);
+        tween(toast).to(.18, { position: border }, { easing: 'quadOut' }).to(.84, { position: shown }, { easing: 'quadOut' }).delay(.7).to(.84, { position: border }, { easing: 'quadIn' }).to(.18, { position: hidden }, { easing: 'quadIn' }).call(() => toast.destroy()).start();
     }
 
     private setInfo(text: string, color: Color) {

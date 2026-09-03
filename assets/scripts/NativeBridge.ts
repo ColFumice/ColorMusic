@@ -51,6 +51,8 @@ export const JS_CONFIRM_CALLBACK = '__colormusic_onConfirm';
 export const JS_AUDIO_FORMAT_CALLBACK = '__colormusic_onAudioFormat';
 export const JS_METRONOME_CALLBACK = '__colormusic_onMetronomeSettings';
 export const JS_MIX_EXPORT_CALLBACK = '__colormusic_onMixExport';
+export const JS_SAVE_ROOT_CALLBACK = '__colormusic_onSaveRootChosen';
+export const JS_TRACK_EXPORT_CALLBACK = '__colormusic_onTrackExport';
 
 export class NativeBridge {
     private static textCallbacks = new Map<string, (value: string) => void>();
@@ -58,6 +60,8 @@ export class NativeBridge {
     private static audioFormatCallbacks = new Map<string, (format: 'wav' | 'mp3' | '') => void>();
     private static metronomeCallbacks = new Map<string, (beats: number, unit: number, bpm: number) => void>();
     private static mixExportCallbacks = new Map<string, (path: string) => void>();
+    private static trackExportCallbacks = new Map<string, (value: { name: string; start: number; end: number } | null) => void>();
+    private static saveRootCallback: ((path: string) => void) | null = null;
     private static styleImportCallback: ((json: string) => void) | null = null;
     /** 当前是否运行在原生环境（本项目只构建 Android，isNative 即安卓）。 */
     static get isAndroidNative(): boolean {
@@ -108,6 +112,15 @@ export class NativeBridge {
             const cb = NativeBridge.mixExportCallbacks.get(requestId);
             NativeBridge.mixExportCallbacks.delete(requestId);
             if (cb) cb(String(path ?? ''));
+        };
+        g[JS_SAVE_ROOT_CALLBACK] = (path: string) => {
+            const cb = NativeBridge.saveRootCallback; NativeBridge.saveRootCallback = null;
+            if (cb) cb(String(path ?? ''));
+        };
+        g[JS_TRACK_EXPORT_CALLBACK] = (requestId: string, json: string) => {
+            const cb = NativeBridge.trackExportCallbacks.get(requestId); NativeBridge.trackExportCallbacks.delete(requestId);
+            if (!cb) return;
+            try { const value = json ? JSON.parse(json) : null; cb(value && !value.error ? value : null); } catch (e) { cb(null); }
         };
     }
 
@@ -169,6 +182,71 @@ export class NativeBridge {
 
     static openExportDirectory(): void {
         NativeBridge.call('openExportDirectory', '()V');
+    }
+
+    static chooseSaveRoot(cb: (path: string) => void): void {
+        NativeBridge.saveRootCallback = cb;
+        NativeBridge.call('chooseSaveRoot', '()V');
+    }
+
+    static getSaveRootLabel(): string {
+        if (!NativeBridge.isAndroidNative) return 'Neuro_Save';
+        try { return String(NativeBridge.reflection?.callStaticMethod(NATIVE_CLASS, 'getSaveRootLabel', '()Ljava/lang/String;') ?? 'Neuro_Save'); }
+        catch (e) { return 'Neuro_Save'; }
+    }
+
+    static listManagedEntries(category: 'style' | 'flow' | 'track' | 'audio'): any[] {
+        if (!NativeBridge.isAndroidNative) return [];
+        try { const raw = NativeBridge.reflection?.callStaticMethod(NATIVE_CLASS, 'listManagedEntries', '(Ljava/lang/String;)Ljava/lang/String;', category); const value = JSON.parse(String(raw ?? '[]')); return Array.isArray(value) ? value : []; }
+        catch (e) { console.error('[ColorMusic] listManagedEntries 失败:', e); return []; }
+    }
+
+    static saveManagedJson(category: 'style' | 'flow' | 'track', name: string, json: string): string {
+        if (!NativeBridge.isAndroidNative) return '';
+        try { return String(NativeBridge.reflection?.callStaticMethod(NATIVE_CLASS, 'saveManagedJson', '(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;', category, name, json) ?? ''); }
+        catch (e) { console.error('[ColorMusic] saveManagedJson 失败:', e); return ''; }
+    }
+
+    static updateManagedJson(key: string, json: string): boolean {
+        if (!NativeBridge.isAndroidNative) return false;
+        try { return !!NativeBridge.reflection?.callStaticMethod(NATIVE_CLASS, 'updateManagedJson', '(Ljava/lang/String;Ljava/lang/String;)Z', key, json); }
+        catch (e) { return false; }
+    }
+
+    static renameManagedEntry(key: string, name: string): string {
+        if (!NativeBridge.isAndroidNative) return '';
+        try { return String(NativeBridge.reflection?.callStaticMethod(NATIVE_CLASS, 'renameManagedEntry', '(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;', key, name) ?? ''); }
+        catch (e) { return ''; }
+    }
+
+    static deleteManagedEntry(key: string): boolean {
+        if (!NativeBridge.isAndroidNative) return false;
+        try { return !!NativeBridge.reflection?.callStaticMethod(NATIVE_CLASS, 'deleteManagedEntry', '(Ljava/lang/String;)Z', key); }
+        catch (e) { return false; }
+    }
+
+    static clearManagedCategory(category: 'style' | 'flow' | 'track' | 'audio'): number {
+        if (!NativeBridge.isAndroidNative) return 0;
+        try { return Number(NativeBridge.reflection?.callStaticMethod(NATIVE_CLASS, 'clearManagedCategory', '(Ljava/lang/String;)I', category)); }
+        catch (e) { return -1; }
+    }
+
+    static openManagedDirectory(category: 'style' | 'flow' | 'track' | 'audio'): void {
+        NativeBridge.call('openManagedDirectory', '(Ljava/lang/String;)V', category);
+    }
+
+    static promptTrackExport(defaultName: string, start: number, end: number, format: 'wav' | 'mp3', cb: (value: { name: string; start: number; end: number } | null) => void): void {
+        const requestId = `track_export_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+        NativeBridge.trackExportCallbacks.set(requestId, cb);
+        NativeBridge.call('promptTrackExport', '(Ljava/lang/String;Ljava/lang/String;IILjava/lang/String;)V', requestId, defaultName, Math.round(start), Math.round(end), format);
+    }
+
+    static playManagedAudio(path: string, startSeconds: number): void { NativeBridge.call('playManagedAudio', '(Ljava/lang/String;I)V', path, Math.max(0, Math.round(startSeconds * 1000))); }
+    static stopManagedAudio(): void { NativeBridge.call('stopManagedAudio', '()V'); }
+    static convertManagedAudio(path: string, name: string, format: 'wav' | 'mp3'): string {
+        if (!NativeBridge.isAndroidNative) return '';
+        try { return String(NativeBridge.reflection?.callStaticMethod(NATIVE_CLASS, 'convertManagedAudio', '(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;', path, name, format) ?? ''); }
+        catch (e) { return 'ERROR:音频转换失败'; }
     }
 
     static chooseAudioExportFormat(cb: (format: 'wav' | 'mp3' | '') => void): void {
@@ -291,6 +369,15 @@ export class NativeBridge {
             Math.max(20, Math.min(320, Math.round(bpm))));
     }
 
+    /** Physical display density used to keep touch effects at a real-world size. */
+    static displayPixelsPerCm(): number {
+        if (!NativeBridge.isAndroidNative) return 96 / 2.54;
+        try {
+            const value = Number(NativeBridge.reflection?.callStaticMethod(NATIVE_CLASS, 'getDisplayPixelsPerCm', '()F'));
+            return Number.isFinite(value) && value > 0 ? value : 96 / 2.54;
+        } catch (e) { return 96 / 2.54; }
+    }
+
     /** 播放一个 C5 测试音（验证 JS→原生 链路）。 */
     static playTestNote(): void {
         NativeBridge.call('playTestNote', '()V');
@@ -372,6 +459,14 @@ export class NativeBridge {
             console.error('[ColorMusic] saveSplashImage 失败:', e);
             return '';
         }
+    }
+
+    static saveInvertedSplashImage(b64: string): string {
+        if (!NativeBridge.isAndroidNative) return '';
+        try {
+            const out = NativeBridge.reflection?.callStaticMethod(NATIVE_CLASS, 'saveInvertedSplashImage', '(Ljava/lang/String;)Ljava/lang/String;', b64);
+            return typeof out === 'string' ? out : String(out ?? '');
+        } catch (e) { console.error('[ColorMusic] saveInvertedSplashImage failed:', e); return ''; }
     }
 }
 

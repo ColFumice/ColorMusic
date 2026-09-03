@@ -122,6 +122,7 @@ export class GridSettingsUI {
     private state: GridState;
     private onChanged: (state: GridState) => void;
     private onClose: () => void;
+    private onReset: () => void;
     private title: Node;
     private visibilityNode: Node;
     private toneInfoNode: Node;
@@ -136,10 +137,11 @@ export class GridSettingsUI {
     private buttons: Node[] = [];
     private soloSnapshot: Map<Node, boolean> | null = null;
 
-    constructor(parent: Node, state: GridState, onChanged: (state: GridState) => void, onClose: () => void) {
+    constructor(parent: Node, state: GridState, onChanged: (state: GridState) => void, onClose: () => void, onReset: () => void = () => {}) {
         this.state = sanitizeGridState(state);
         this.onChanged = onChanged;
         this.onClose = onClose;
+        this.onReset = onReset;
         const panel = new Node('GridSettingsPanel');
         panel.layer = Layers.Enum.UI_2D;
         this.panelTransform = panel.addComponent(UITransform);
@@ -201,7 +203,7 @@ export class GridSettingsUI {
             this.commitAndSync();
         });
 
-        this.buttons.push(this.makeButton('重置', () => { this.state = defaultGridState(); this.refresh(); this.commit(); }));
+        this.buttons.push(this.makeButton('重置', () => { this.state = defaultGridState(); this.refresh(); this.commit(); this.onReset(); }));
         this.buttons.push(this.makeButton('关闭', () => this.onClose()));
         panel.active = false;
     }

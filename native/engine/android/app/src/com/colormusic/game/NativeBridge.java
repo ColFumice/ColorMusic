@@ -3,17 +3,28 @@ package com.colormusic.game;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
+import android.content.ContentResolver;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.ColorMatrix;
+import android.graphics.ColorMatrixColorFilter;
+import android.graphics.Paint;
 import android.media.MediaPlayer;
+import android.media.MediaCodec;
+import android.media.MediaExtractor;
+import android.media.MediaFormat;
+import android.media.MediaMetadataRetriever;
 import android.net.Uri;
 import android.os.Handler;
+import android.os.Environment;
 import android.os.Looper;
 import android.provider.DocumentsContract;
 import android.util.Base64;
+import android.util.DisplayMetrics;
 import android.util.Log;
 import android.widget.EditText;
 import android.text.InputType;
@@ -30,9 +41,13 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -63,12 +78,18 @@ public class NativeBridge {
     private static final String TAG = "ColorMusicBridge";
     private static final int REQ_PICK_IMAGE = 0x4372; // "CM" 魔数
     private static final int REQ_IMPORT_STYLE = 0x4373;
+    private static final int REQ_CHOOSE_SAVE_ROOT = 0x4374;
+    private static final String SAVE_PREFS = "neuro_save_location";
+    private static final String SAVE_TREE_URI = "tree_uri";
+    private static final String SAVE_ROOT_DOCUMENT = "root_document";
+    private static final String SAVE_ROOT_NAME = "Neuro_Save";
     private static final int GRID_SIZE = 96;           // 颜色网格分辨率
     private static final int MAX_DIM = 1280;           // 显示/采样图片最长边限制（越小 payload 越小、加载越快）
 
     private static Activity sActivity;
     private static final AudioSynth sSynth = new AudioSynth();
     private static final List<MediaPlayer> sClipPlayers = new ArrayList<>();
+    private static MediaPlayer sManagedAudioPlayer;
     private static final Map<MediaPlayer, TimelinePlayerState> sTimelinePlayers = new HashMap<>();
     private static final Map<String, Boolean> sTimelineTrackAudible = new HashMap<>();
     private static final Handler sPlaybackHandler = new Handler(Looper.getMainLooper());
@@ -270,6 +291,56 @@ public class NativeBridge {
                 + org.json.JSONObject.quote(format == null ? "" : format) + ");");
     }
 
+    /** 轨道导出窗口：名称、起始拍和结束拍。 */
+    public static void promptTrackExport(String requestId, String defaultName, int startBeat, int endBeat, String format) {
+        if (sActivity == null) return;
+        sActivity.runOnUiThread(() -> {
+            LinearLayout root = new LinearLayout(sActivity); root.setOrientation(LinearLayout.VERTICAL); root.setPadding(36, 8, 36, 0);
+            EditText name = new EditText(sActivity); name.setSingleLine(true); name.setHint("音频名称"); name.setText(defaultName); root.addView(name);
+            EditText from = new EditText(sActivity); from.setSingleLine(true); from.setHint("从第几拍"); from.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL); from.setText(String.valueOf(startBeat)); root.addView(from);
+            EditText to = new EditText(sActivity); to.setSingleLine(true); to.setHint("到第几拍"); to.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL); to.setText(String.valueOf(endBeat)); root.addView(to);
+            Runnable cancel = () -> evalToJs("globalThis.__colormusic_onTrackExport && globalThis.__colormusic_onTrackExport("
+                    + org.json.JSONObject.quote(requestId) + ",'');");
+            new AlertDialog.Builder(sActivity).setTitle("导出 " + format.toUpperCase() + " 音频").setView(root)
+                    .setPositiveButton("开始导出", (dialog, which) -> {
+                        org.json.JSONObject value = new org.json.JSONObject();
+                        try { value.put("name", name.getText().toString().trim()); value.put("start", Double.parseDouble(from.getText().toString())); value.put("end", Double.parseDouble(to.getText().toString())); }
+                        catch (Exception error) { try { value.put("error", true); } catch (Exception ignored) { } }
+                        evalToJs("globalThis.__colormusic_onTrackExport && globalThis.__colormusic_onTrackExport("
+                                + org.json.JSONObject.quote(requestId) + "," + org.json.JSONObject.quote(value.toString()) + ");");
+                    }).setNegativeButton("取消", (dialog, which) -> cancel.run()).setOnCancelListener(dialog -> cancel.run()).show();
+        });
+    }
+
+    public static void playManagedAudio(String path, int startMs) {
+        if (sActivity == null || path == null) return;
+        sActivity.runOnUiThread(() -> {
+            stopManagedAudio();
+            try {
+                sManagedAudioPlayer = new MediaPlayer(); sManagedAudioPlayer.setDataSource(path); sManagedAudioPlayer.prepare();
+                sManagedAudioPlayer.seekTo(Math.max(0, Math.min(startMs, Math.max(0, sManagedAudioPlayer.getDuration() - 1))));
+                sManagedAudioPlayer.setOnCompletionListener(player -> stopManagedAudio()); sManagedAudioPlayer.start();
+            } catch (Exception error) { Log.e(TAG, "playManagedAudio failed", error); stopManagedAudio(); }
+        });
+    }
+
+    public static void stopManagedAudio() {
+        if (sManagedAudioPlayer != null) { try { sManagedAudioPlayer.stop(); } catch (Exception ignored) { } try { sManagedAudioPlayer.release(); } catch (Exception ignored) { } sManagedAudioPlayer = null; }
+    }
+
+    public static String convertManagedAudio(String sourcePath, String displayName, String targetFormat) {
+        if (sourcePath == null) return "ERROR:找不到音频";
+        String lower = sourcePath.toLowerCase();
+        if ("mp3".equalsIgnoreCase(targetFormat) && lower.endsWith(".wav")) return exportAudio(sourcePath, displayName, "mp3");
+        if ("wav".equalsIgnoreCase(targetFormat) && lower.endsWith(".mp3")) {
+            File wav = new File(sActivity.getCacheDir(), "decoded_" + System.nanoTime() + ".wav");
+            try { decodeAudioToWav(new File(sourcePath), wav); return publishManagedAudio(wav, sanitizeFileName(displayName) + ".wav"); }
+            catch (Exception error) { Log.e(TAG, "MP3 to WAV failed", error); return "ERROR:MP3 转 WAV 失败"; }
+            finally { wav.delete(); }
+        }
+        return "ERROR:只支持 WAV 与 MP3 互相转换";
+    }
+
     /** 选择一个已导出的数据包文件夹。 */
     public static void openStyleImporter() {
         if (sActivity == null) return;
@@ -290,37 +361,377 @@ public class NativeBridge {
         return panel == null ? "" : panel;
     }
 
-    /** 导出为文件夹数据包，manifest.json 内保存完整样式。 */
-    public static String exportStylePackage(String baseName, String json) {
+    private static String categoryFolder(String category) {
+        if ("style".equals(category)) return "Neuro_Style";
+        if ("flow".equals(category)) return "Neuro_Style_Flow";
+        if ("track".equals(category)) return "Neuro_Track";
+        return "Neuro_Music";
+    }
+
+    private static final class ManagedDirectory {
+        final File file;
+        final Uri treeUri;
+        final String documentId;
+        ManagedDirectory(File file, Uri treeUri, String documentId) {
+            this.file = file; this.treeUri = treeUri; this.documentId = documentId;
+        }
+        boolean isSaf() { return treeUri != null && documentId != null; }
+        Uri uri() { return isSaf() ? DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId) : Uri.fromFile(file); }
+    }
+
+    private static ManagedDirectory managedRoot(boolean create) {
+        if (sActivity == null) return null;
+        android.content.SharedPreferences prefs = sActivity.getSharedPreferences(SAVE_PREFS, Activity.MODE_PRIVATE);
+        String tree = prefs.getString(SAVE_TREE_URI, "");
+        String rootId = prefs.getString(SAVE_ROOT_DOCUMENT, "");
+        if (!tree.isEmpty() && !rootId.isEmpty()) return new ManagedDirectory(null, Uri.parse(tree), rootId);
+        File root = new File(sActivity.getExternalFilesDir(null), SAVE_ROOT_NAME);
+        if (create && !root.exists()) root.mkdirs();
+        return new ManagedDirectory(root, null, null);
+    }
+
+    private static ManagedDirectory managedCategory(String category, boolean create) {
+        ManagedDirectory root = managedRoot(create);
+        if (root == null) return null;
+        String name = categoryFolder(category);
+        if (!root.isSaf()) {
+            File folder = new File(root.file, name);
+            if (create && !folder.exists()) folder.mkdirs();
+            return new ManagedDirectory(folder, null, null);
+        }
+        try {
+            String id = findChildDocumentId(root.treeUri, root.documentId, name);
+            if (id == null && create) {
+                Uri created = DocumentsContract.createDocument(sActivity.getContentResolver(), root.uri(),
+                        DocumentsContract.Document.MIME_TYPE_DIR, name);
+                if (created != null) id = DocumentsContract.getDocumentId(created);
+            }
+            return id == null ? null : new ManagedDirectory(null, root.treeUri, id);
+        } catch (Exception error) {
+            Log.e(TAG, "managedCategory failed", error);
+            return null;
+        }
+    }
+
+    private static String findChildDocumentId(Uri treeUri, String parentId, String name) {
+        Cursor cursor = null;
+        try {
+            Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentId);
+            cursor = sActivity.getContentResolver().query(children,
+                    new String[]{DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME},
+                    null, null, null);
+            while (cursor != null && cursor.moveToNext()) {
+                if (name.equalsIgnoreCase(cursor.getString(1))) return cursor.getString(0);
+            }
+        } catch (Exception error) {
+            Log.w(TAG, "findChildDocumentId failed for " + name, error);
+        } finally { if (cursor != null) cursor.close(); }
+        return null;
+    }
+
+    private static Uri childUri(ManagedDirectory parent, String name) {
+        String id = findChildDocumentId(parent.treeUri, parent.documentId, name);
+        return id == null ? null : DocumentsContract.buildDocumentUriUsingTree(parent.treeUri, id);
+    }
+
+    private static Uri createUniqueDocument(ManagedDirectory parent, String name, String mimeType, boolean directory) throws IOException {
+        String clean = sanitizeFileName(name);
+        String extension = "";
+        String base = clean;
+        if (!directory) {
+            int dot = clean.lastIndexOf('.');
+            if (dot > 0) { base = clean.substring(0, dot); extension = clean.substring(dot); }
+        }
+        String candidate = clean;
+        int index = 2;
+        while (childUri(parent, candidate) != null) candidate = base + "_" + index++ + extension;
+        Uri created = DocumentsContract.createDocument(sActivity.getContentResolver(), parent.uri(),
+                directory ? DocumentsContract.Document.MIME_TYPE_DIR : mimeType, candidate);
+        if (created == null) throw new IOException("无法创建 " + candidate);
+        return created;
+    }
+
+    private static void writeUri(Uri uri, byte[] data) throws IOException {
+        try (OutputStream out = sActivity.getContentResolver().openOutputStream(uri, "wt")) {
+            if (out == null) throw new IOException("无法写入文件");
+            out.write(data); out.flush();
+        }
+    }
+
+    private static byte[] readUri(Uri uri) throws IOException {
+        try (InputStream in = sActivity.getContentResolver().openInputStream(uri);
+             java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream()) {
+            if (in == null) throw new IOException("无法读取文件");
+            byte[] buffer = new byte[16384]; int count;
+            while ((count = in.read(buffer)) >= 0) out.write(buffer, 0, count);
+            return out.toByteArray();
+        }
+    }
+
+    /** 选择 Neuro_Save 的保存位置，并持久化目录授权。 */
+    public static void chooseSaveRoot() {
+        if (sActivity == null) return;
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
+        sActivity.startActivityForResult(Intent.createChooser(intent, "选择 Neuro_Save 的保存位置"), REQ_CHOOSE_SAVE_ROOT);
+    }
+
+    public static String getSaveRootLabel() {
+        ManagedDirectory root = managedRoot(true);
+        if (root == null) return "Neuro_Save";
+        return root.isSaf() ? root.uri().toString() : root.file.getAbsolutePath();
+    }
+
+    public static String saveManagedJson(String category, String displayName, String json) {
         if (sActivity == null || json == null) return "";
         try {
-            File root = new File(sActivity.getExternalFilesDir(null), "ColorMusic");
-            if (!root.exists() && !root.mkdirs()) return "";
-            String base = sanitizeFileName(baseName == null ? "Neuro_Deta_Style" : baseName);
-            File folder = uniqueFile(root, base, "", true);
-            if (!folder.mkdirs()) return "";
-            File manifest = new File(folder, "manifest.json");
-            try (FileOutputStream out = new FileOutputStream(manifest)) {
-                out.write(json.getBytes(StandardCharsets.UTF_8));
+            ManagedDirectory categoryDir = managedCategory(category, true);
+            if (categoryDir == null) return "";
+            String name = sanitizeFileName(displayName == null ? "Untitled" : displayName);
+            if (!categoryDir.isSaf()) {
+                File packageDir = uniqueFile(categoryDir.file, name, "", false);
+                if (!packageDir.mkdirs()) return "";
+                try (FileOutputStream out = new FileOutputStream(new File(packageDir, "manifest.json"))) {
+                    out.write(json.getBytes(StandardCharsets.UTF_8));
+                }
+                if ("track".equals(category)) saveTrackAssetsToFilePackage(packageDir, json);
+                return Uri.fromFile(packageDir).toString();
             }
-            return folder.getAbsolutePath();
-        } catch (Exception e) {
-            Log.e(TAG, "exportStylePackage failed", e);
+            Uri packageUri = createUniqueDocument(categoryDir, name, DocumentsContract.Document.MIME_TYPE_DIR, true);
+            ManagedDirectory packageDir = new ManagedDirectory(null, categoryDir.treeUri, DocumentsContract.getDocumentId(packageUri));
+            Uri manifest = DocumentsContract.createDocument(sActivity.getContentResolver(), packageUri, "application/json", "manifest.json");
+            if (manifest == null) return "";
+            String storedJson = "track".equals(category) ? saveTrackAssetsToSafPackage(packageDir, json) : json;
+            writeUri(manifest, storedJson.getBytes(StandardCharsets.UTF_8));
+            return packageUri.toString();
+        } catch (Exception error) {
+            Log.e(TAG, "saveManagedJson failed", error);
             return "";
         }
     }
 
+    public static boolean updateManagedJson(String key, String json) {
+        if (sActivity == null || key == null || json == null) return false;
+        try {
+            Uri uri = Uri.parse(key);
+            if ("file".equalsIgnoreCase(uri.getScheme())) {
+                File folder = new File(uri.getPath());
+                try (FileOutputStream out = new FileOutputStream(new File(folder, "manifest.json"))) {
+                    out.write(json.getBytes(StandardCharsets.UTF_8));
+                }
+                return true;
+            }
+            String treeText = sActivity.getSharedPreferences(SAVE_PREFS, Activity.MODE_PRIVATE).getString(SAVE_TREE_URI, "");
+            if (treeText.isEmpty()) return false;
+            Uri tree = Uri.parse(treeText);
+            ManagedDirectory folder = new ManagedDirectory(null, tree, DocumentsContract.getDocumentId(uri));
+            Uri manifest = childUri(folder, "manifest.json");
+            if (manifest == null) return false;
+            writeUri(manifest, json.getBytes(StandardCharsets.UTF_8));
+            return true;
+        } catch (Exception error) { Log.e(TAG, "updateManagedJson failed", error); return false; }
+    }
+
+    public static String renameManagedEntry(String key, String newName) {
+        if (sActivity == null || key == null) return "";
+        try {
+            Uri uri = Uri.parse(key); String clean = sanitizeFileName(newName);
+            if ("file".equalsIgnoreCase(uri.getScheme())) {
+                File file = new File(uri.getPath());
+                String suffix = file.isFile() && file.getName().contains(".") ? file.getName().substring(file.getName().lastIndexOf('.')) : "";
+                File target = new File(file.getParentFile(), clean.toLowerCase().endsWith(suffix.toLowerCase()) ? clean : clean + suffix);
+                if (target.exists() || !file.renameTo(target)) return "";
+                return Uri.fromFile(target).toString();
+            }
+            Uri renamed = DocumentsContract.renameDocument(sActivity.getContentResolver(), uri, clean);
+            return renamed == null ? "" : renamed.toString();
+        } catch (Exception error) { Log.e(TAG, "renameManagedEntry failed", error); return ""; }
+    }
+
+    public static boolean deleteManagedEntry(String key) {
+        if (sActivity == null || key == null) return false;
+        try {
+            Uri uri = Uri.parse(key);
+            if ("file".equalsIgnoreCase(uri.getScheme())) return deleteRecursively(new File(uri.getPath()));
+            return DocumentsContract.deleteDocument(sActivity.getContentResolver(), uri);
+        } catch (Exception error) { Log.e(TAG, "deleteManagedEntry failed", error); return false; }
+    }
+
+    public static int clearManagedCategory(String category) {
+        ManagedDirectory dir = managedCategory(category, true);
+        if (dir == null) return -1;
+        int removed = 0;
+        try {
+            if (!dir.isSaf()) {
+                File[] files = dir.file.listFiles(); if (files == null) return 0;
+                for (File file : files) if (deleteRecursively(file)) removed++;
+                return removed;
+            }
+            for (org.json.JSONObject item : listDocumentChildren(dir)) {
+                Uri uri = Uri.parse(item.optString("uri"));
+                if (DocumentsContract.deleteDocument(sActivity.getContentResolver(), uri)) removed++;
+            }
+            return removed;
+        } catch (Exception error) { Log.e(TAG, "clearManagedCategory failed", error); return -1; }
+    }
+
+    private static List<org.json.JSONObject> listDocumentChildren(ManagedDirectory dir) throws Exception {
+        List<org.json.JSONObject> result = new ArrayList<>(); Cursor cursor = null;
+        try {
+            Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(dir.treeUri, dir.documentId);
+            cursor = sActivity.getContentResolver().query(children, new String[]{
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                    DocumentsContract.Document.COLUMN_MIME_TYPE, DocumentsContract.Document.COLUMN_LAST_MODIFIED}, null, null, null);
+            while (cursor != null && cursor.moveToNext()) {
+                org.json.JSONObject item = new org.json.JSONObject();
+                item.put("id", cursor.getString(0)); item.put("name", cursor.getString(1)); item.put("mime", cursor.getString(2)); item.put("modified", cursor.getLong(3));
+                item.put("uri", DocumentsContract.buildDocumentUriUsingTree(dir.treeUri, cursor.getString(0)).toString()); result.add(item);
+            }
+        } finally { if (cursor != null) cursor.close(); }
+        return result;
+    }
+
+    public static String listManagedEntries(String category) {
+        org.json.JSONArray result = new org.json.JSONArray();
+        try {
+            ManagedDirectory dir = managedCategory(category, true); if (dir == null) return "[]";
+            if (!dir.isSaf()) {
+                File[] entries = dir.file.listFiles(); if (entries == null) return "[]";
+                java.util.Arrays.sort(entries, (a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+                for (File entry : entries) appendManagedFile(result, category, entry);
+            } else {
+                List<org.json.JSONObject> entries = listDocumentChildren(dir);
+                Collections.sort(entries, (a, b) -> Long.compare(b.optLong("modified"), a.optLong("modified")));
+                for (org.json.JSONObject entry : entries) appendManagedDocument(result, category, dir, entry);
+            }
+        } catch (Exception error) { Log.e(TAG, "listManagedEntries failed", error); }
+        return result.toString();
+    }
+
+    private static void appendManagedFile(org.json.JSONArray result, String category, File entry) throws Exception {
+        if ("audio".equals(category)) {
+            if (!entry.isFile() || !(entry.getName().toLowerCase().endsWith(".wav") || entry.getName().toLowerCase().endsWith(".mp3"))) return;
+            org.json.JSONObject item = new org.json.JSONObject(); item.put("key", Uri.fromFile(entry).toString()); item.put("name", stripExtension(entry.getName()));
+            item.put("format", extensionOf(entry.getName())); item.put("path", entry.getAbsolutePath()); item.put("duration", audioDuration(entry.getAbsolutePath())); result.put(item); return;
+        }
+        File manifest = entry.isDirectory() ? new File(entry, "manifest.json") : entry;
+        if (!manifest.isFile()) return;
+        String json = new String(readAllBytes(manifest), StandardCharsets.UTF_8);
+        if ("track".equals(category) && entry.isDirectory()) json = hydrateTrackFilePackage(entry, json);
+        org.json.JSONObject item = new org.json.JSONObject(); item.put("key", Uri.fromFile(entry).toString()); item.put("name", entry.getName()); item.put("json", json); result.put(item);
+    }
+
+    private static void appendManagedDocument(org.json.JSONArray result, String category, ManagedDirectory parent, org.json.JSONObject entry) throws Exception {
+        String name = entry.optString("name"); Uri uri = Uri.parse(entry.optString("uri")); String mime = entry.optString("mime");
+        if ("audio".equals(category)) {
+            String lower = name.toLowerCase(); if (!(lower.endsWith(".wav") || lower.endsWith(".mp3"))) return;
+            File cached = cacheUriFile(uri, name); org.json.JSONObject item = new org.json.JSONObject(); item.put("key", uri.toString()); item.put("name", stripExtension(name));
+            item.put("format", extensionOf(name)); item.put("path", cached.getAbsolutePath()); item.put("duration", audioDuration(cached.getAbsolutePath())); result.put(item); return;
+        }
+        if (!DocumentsContract.Document.MIME_TYPE_DIR.equals(mime)) return;
+        ManagedDirectory packageDir = new ManagedDirectory(null, parent.treeUri, entry.optString("id")); Uri manifest = childUri(packageDir, "manifest.json"); if (manifest == null) return;
+        String json = new String(readUri(manifest), StandardCharsets.UTF_8);
+        if ("track".equals(category)) json = hydrateTrackSafPackage(packageDir, json);
+        org.json.JSONObject item = new org.json.JSONObject(); item.put("key", uri.toString()); item.put("name", name); item.put("json", json); result.put(item);
+    }
+
+    private static String stripExtension(String name) { int dot = name.lastIndexOf('.'); return dot > 0 ? name.substring(0, dot) : name; }
+    private static String extensionOf(String name) { int dot = name.lastIndexOf('.'); return dot >= 0 ? name.substring(dot + 1).toLowerCase() : ""; }
+    private static long audioDuration(String path) { MediaMetadataRetriever r = new MediaMetadataRetriever(); try { r.setDataSource(path); return Long.parseLong(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)) / 1000L; } catch (Exception ignored) { return 0; } finally { try { r.release(); } catch (Exception ignored) { } } }
+    private static File cacheUriFile(Uri uri, String name) throws IOException { File out = new File(sActivity.getCacheDir(), "managed_" + Integer.toHexString(uri.toString().hashCode()) + "_" + sanitizeFileName(name)); try (InputStream in = sActivity.getContentResolver().openInputStream(uri); OutputStream target = new FileOutputStream(out)) { if (in == null) throw new IOException("无法读取文件"); byte[] b = new byte[32768]; int n; while ((n = in.read(b)) >= 0) target.write(b, 0, n); } return out; }
+
+    private static void saveTrackAssetsToFilePackage(File packageDir, String json) throws Exception {
+        org.json.JSONObject root = new org.json.JSONObject(json); org.json.JSONArray clips = root.optJSONArray("clips");
+        if (clips != null) for (int i = 0; i < clips.length(); i++) {
+            org.json.JSONObject clip = clips.optJSONObject(i); if (clip == null) continue;
+            File source = new File(clip.optString("path", "")); if (!source.isFile()) continue;
+            String extension = source.getName().toLowerCase().endsWith(".mp3") ? ".mp3" : ".wav";
+            String asset = sanitizeFileName(clip.optString("id", "audio_" + i)) + extension;
+            File target = new File(packageDir, asset); copyFile(source, target); clip.put("assetFile", asset); clip.put("path", "");
+        }
+        try (FileOutputStream out = new FileOutputStream(new File(packageDir, "manifest.json"))) { out.write(root.toString().getBytes(StandardCharsets.UTF_8)); }
+    }
+
+    private static String saveTrackAssetsToSafPackage(ManagedDirectory packageDir, String json) throws Exception {
+        org.json.JSONObject root = new org.json.JSONObject(json); org.json.JSONArray clips = root.optJSONArray("clips");
+        if (clips != null) for (int i = 0; i < clips.length(); i++) {
+            org.json.JSONObject clip = clips.optJSONObject(i); if (clip == null) continue;
+            File source = new File(clip.optString("path", "")); if (!source.isFile()) continue;
+            String extension = source.getName().toLowerCase().endsWith(".mp3") ? ".mp3" : ".wav";
+            String asset = sanitizeFileName(clip.optString("id", "audio_" + i)) + extension;
+            Uri target = DocumentsContract.createDocument(sActivity.getContentResolver(), packageDir.uri(),
+                    ".mp3".equals(extension) ? "audio/mpeg" : "audio/wav", asset);
+            if (target == null) continue;
+            try (InputStream in = new FileInputStream(source); OutputStream out = sActivity.getContentResolver().openOutputStream(target, "wt")) {
+                if (out == null) continue; byte[] buffer = new byte[32768]; int count; while ((count = in.read(buffer)) >= 0) out.write(buffer, 0, count);
+            }
+            clip.put("assetFile", asset); clip.put("path", "");
+        }
+        return root.toString();
+    }
+
+    private static String hydrateTrackFilePackage(File packageDir, String json) {
+        try {
+            org.json.JSONObject root = new org.json.JSONObject(json); org.json.JSONArray clips = root.optJSONArray("clips");
+            if (clips != null) for (int i = 0; i < clips.length(); i++) {
+                org.json.JSONObject clip = clips.optJSONObject(i); if (clip == null) continue; String asset = clip.optString("assetFile", "");
+                if (!asset.isEmpty()) { File source = new File(packageDir, asset); if (source.isFile()) clip.put("path", source.getAbsolutePath()); }
+            }
+            return root.toString();
+        } catch (Exception ignored) { return json; }
+    }
+
+    private static String hydrateTrackSafPackage(ManagedDirectory packageDir, String json) {
+        try {
+            org.json.JSONObject root = new org.json.JSONObject(json); org.json.JSONArray clips = root.optJSONArray("clips");
+            if (clips != null) for (int i = 0; i < clips.length(); i++) {
+                org.json.JSONObject clip = clips.optJSONObject(i); if (clip == null) continue; String asset = clip.optString("assetFile", "");
+                if (!asset.isEmpty()) { Uri uri = childUri(packageDir, asset); if (uri != null) clip.put("path", cacheUriFile(uri, asset).getAbsolutePath()); }
+            }
+            return root.toString();
+        } catch (Exception ignored) { return json; }
+    }
+
+    public static void openManagedDirectory(String category) {
+        ManagedDirectory dir = managedCategory(category, true); if (dir == null) return;
+        if (!dir.isSaf()) {
+            Uri initial = externalStorageDocumentUri(dir.file);
+            if (initial != null) { launchDirectoryView(initial); return; }
+            sActivity.runOnUiThread(() -> { try { sActivity.startActivity(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)); } catch (Exception error) { Log.e(TAG, "Open managed directory failed", error); } });
+            return;
+        }
+        launchDirectoryView(dir.uri());
+    }
+
+    private static void launchDirectoryView(Uri directoryUri) {
+        if (sActivity == null) return;
+        sActivity.runOnUiThread(() -> {
+            try {
+                Intent view = new Intent(Intent.ACTION_VIEW);
+                view.setDataAndType(directoryUri, DocumentsContract.Document.MIME_TYPE_DIR);
+                view.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                        | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
+                sActivity.startActivity(view);
+            } catch (Exception error) {
+                Log.w(TAG, "Direct directory view failed", error);
+                // This vendor's DocumentsUI crashes when EXTRA_INITIAL_URI is
+                // supplied, so the fallback deliberately opens at its default.
+                launchSystemDirectoryPicker(null);
+            }
+        });
+    }
+
+    /** 导出为文件夹数据包，manifest.json 内保存完整样式。 */
+    public static String exportStylePackage(String baseName, String json) {
+        try { org.json.JSONObject value = new org.json.JSONObject(json); String category = "flow".equals(value.optString("kind")) ? "flow" : "style"; return saveManagedJson(category, value.optString("name", baseName), json); }
+        catch (Exception error) { Log.e(TAG, "exportStylePackage failed", error); return ""; }
+    }
+
     /** 清除游戏导出目录中的所有样式/样式流数据包，保留录音与导出的音频。 */
     public static int clearStylePackages() {
-        if (sActivity == null) return -1;
-        File root = new File(sActivity.getExternalFilesDir(null), "ColorMusic");
-        File[] entries = root.listFiles();
-        if (entries == null) return 0;
-        int removed = 0;
-        for (File entry : entries) {
-            if (entry.isDirectory() && entry.getName().startsWith("Neuro_Deta_Style") && deleteRecursively(entry)) removed++;
-        }
-        return removed;
+        int styles = clearManagedCategory("style"), flows = clearManagedCategory("flow");
+        return styles < 0 || flows < 0 ? -1 : styles + flows;
     }
 
     /** 优先借助内置的 MT 文件提供器授权 MT 直达导出目录；未安装 MT 时让玩家选择文件管理器。 */
@@ -411,15 +822,32 @@ public class NativeBridge {
     }
 
     private static void launchSystemDirectoryPicker(Uri directoryUri) {
+        sActivity.runOnUiThread(() -> {
+            try {
+                Intent tree = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                if (directoryUri != null && "content".equalsIgnoreCase(directoryUri.getScheme())) tree.putExtra(DocumentsContract.EXTRA_INITIAL_URI, directoryUri);
+                tree.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                        | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
+                sActivity.startActivity(tree);
+            } catch (Exception error) {
+                Log.e(TAG, "System directory picker failed", error);
+                // Some vendor document providers reject EXTRA_INITIAL_URI. Retry
+                // with a plain picker so this action can never take down the game.
+                try { sActivity.startActivity(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)); }
+                catch (Exception fallback) { Log.e(TAG, "Plain directory picker failed", fallback); }
+            }
+        });
+    }
+
+    private static Uri externalStorageDocumentUri(File directory) {
+        if (directory == null) return null;
         try {
-            Intent tree = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
-            tree.putExtra(DocumentsContract.EXTRA_INITIAL_URI, directoryUri);
-            tree.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                    | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
-            sActivity.startActivity(tree);
-        } catch (Exception error) {
-            Log.e(TAG, "System directory picker failed", error);
-        }
+            String root = Environment.getExternalStorageDirectory().getCanonicalPath();
+            String path = directory.getCanonicalPath();
+            if (!path.startsWith(root + "/")) return null;
+            String relative = path.substring(root.length() + 1).replace(File.separatorChar, '/');
+            return DocumentsContract.buildDocumentUri("com.android.externalstorage.documents", "primary:" + relative);
+        } catch (Exception error) { return null; }
     }
 
     private static void launchPackageHome(String packageName) {
@@ -439,23 +867,22 @@ public class NativeBridge {
         if (sActivity == null || wavPath == null) return "ERROR:无效音频";
         File source = new File(wavPath);
         if (!source.isFile()) return "ERROR:找不到录音文件";
-        File root = new File(sActivity.getExternalFilesDir(null), "ColorMusic");
-        if (!root.exists() && !root.mkdirs()) return "ERROR:无法创建导出目录";
         String baseName = sanitizeFileName(displayName == null ? "audio" : displayName);
         if ("wav".equalsIgnoreCase(requestedFormat)) {
-            File output = uniqueFile(root, baseName, ".wav", false);
+            File output = new File(sActivity.getCacheDir(), "export_" + System.nanoTime() + ".wav");
             try {
                 copyFile(source, output);
-                return output.getAbsolutePath();
+                return publishManagedAudio(output, baseName + ".wav");
             } catch (Exception error) {
                 Log.e(TAG, "WAV export failed", error);
-                output.delete();
                 return "ERROR:WAV 导出失败";
+            } finally {
+                output.delete();
             }
         }
         if (!"mp3".equalsIgnoreCase(requestedFormat)) return "ERROR:不支持的音频格式";
 
-        File output = uniqueFile(root, baseName, ".mp3", false);
+        File output = new File(sActivity.getCacheDir(), "export_" + System.nanoTime() + ".mp3");
         File raw = new File(sActivity.getCacheDir(), "wavtomp3_" + System.nanoTime() + ".raw");
         try (FileInputStream input = new FileInputStream(source); FileOutputStream rawOut = new FileOutputStream(raw)) {
             byte[] header = new byte[44];
@@ -479,14 +906,29 @@ public class NativeBridge {
             LameUtils converter = new LameUtils(1, sampleRate, 192);
             converter.raw2mp3(raw.getAbsolutePath(), output.getAbsolutePath());
             if (!output.isFile() || output.length() < 128) throw new IOException("LAME 编码器没有产生有效数据");
-            return output.getAbsolutePath();
+            return publishManagedAudio(output, baseName + ".mp3");
         } catch (Exception e) {
             Log.e(TAG, "AndroidLame MP3 export failed", e);
             output.delete();
             return "ERROR:MP3 转换失败，请改选 WAV";
         } finally {
             raw.delete();
+            output.delete();
         }
+    }
+
+    private static String publishManagedAudio(File source, String fileName) throws IOException {
+        ManagedDirectory dir = managedCategory("audio", true); if (dir == null) throw new IOException("无法创建 Neuro_Music");
+        if (!dir.isSaf()) {
+            String ext = fileName.toLowerCase().endsWith(".mp3") ? ".mp3" : ".wav";
+            File output = uniqueFile(dir.file, stripExtension(fileName), ext, false); copyFile(source, output); return output.getAbsolutePath();
+        }
+        String mime = fileName.toLowerCase().endsWith(".mp3") ? "audio/mpeg" : "audio/wav";
+        Uri output = createUniqueDocument(dir, fileName, mime, false);
+        try (InputStream in = new FileInputStream(source); OutputStream out = sActivity.getContentResolver().openOutputStream(output, "wt")) {
+            if (out == null) throw new IOException("无法写入 Neuro_Music"); byte[] buffer = new byte[32768]; int count; while ((count = in.read(buffer)) >= 0) out.write(buffer, 0, count);
+        }
+        return output.toString();
     }
 
     /** Mix enabled mixer rows with their trim/volume settings, then export the rendered bus. */
@@ -648,6 +1090,54 @@ public class NativeBridge {
         out.write(h);
     }
 
+    private static void decodeAudioToWav(File source, File target) throws Exception {
+        MediaExtractor extractor = new MediaExtractor(); MediaCodec codec = null;
+        File raw = new File(sActivity.getCacheDir(), "decode_" + System.nanoTime() + ".pcm");
+        int sampleRate = 44100, channels = 2;
+        try {
+            extractor.setDataSource(source.getAbsolutePath()); int track = -1; MediaFormat format = null;
+            for (int i = 0; i < extractor.getTrackCount(); i++) { MediaFormat candidate = extractor.getTrackFormat(i); String mime = candidate.getString(MediaFormat.KEY_MIME); if (mime != null && mime.startsWith("audio/")) { track = i; format = candidate; break; } }
+            if (track < 0 || format == null) throw new IOException("没有音频轨道");
+            extractor.selectTrack(track); sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE); channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT);
+            codec = MediaCodec.createDecoderByType(format.getString(MediaFormat.KEY_MIME)); codec.configure(format, null, null, 0); codec.start();
+            boolean inputDone = false, outputDone = false; MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+            try (BufferedOutputStream pcm = new BufferedOutputStream(new FileOutputStream(raw), 65536)) {
+                while (!outputDone) {
+                    if (!inputDone) {
+                        int inputIndex = codec.dequeueInputBuffer(10000);
+                        if (inputIndex >= 0) {
+                            ByteBuffer input = codec.getInputBuffer(inputIndex); int size = input == null ? -1 : extractor.readSampleData(input, 0);
+                            if (size < 0) { codec.queueInputBuffer(inputIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM); inputDone = true; }
+                            else { codec.queueInputBuffer(inputIndex, 0, size, extractor.getSampleTime(), 0); extractor.advance(); }
+                        }
+                    }
+                    int outputIndex = codec.dequeueOutputBuffer(info, 10000);
+                    if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) { MediaFormat out = codec.getOutputFormat(); sampleRate = out.getInteger(MediaFormat.KEY_SAMPLE_RATE); channels = out.getInteger(MediaFormat.KEY_CHANNEL_COUNT); }
+                    else if (outputIndex >= 0) {
+                        ByteBuffer output = codec.getOutputBuffer(outputIndex);
+                        if (output != null && info.size > 0) { byte[] bytes = new byte[info.size]; output.position(info.offset); output.limit(info.offset + info.size); output.get(bytes); pcm.write(bytes); }
+                        outputDone = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0; codec.releaseOutputBuffer(outputIndex, false);
+                    }
+                }
+            }
+            try (BufferedOutputStream wav = new BufferedOutputStream(new FileOutputStream(target), 65536); InputStream pcm = new FileInputStream(raw)) {
+                writePcmHeader(wav, sampleRate, channels, raw.length()); byte[] buffer = new byte[65536]; int count; while ((count = pcm.read(buffer)) >= 0) wav.write(buffer, 0, count);
+            }
+        } finally {
+            try { extractor.release(); } catch (Exception ignored) { }
+            if (codec != null) { try { codec.stop(); } catch (Exception ignored) { } try { codec.release(); } catch (Exception ignored) { } }
+            raw.delete();
+        }
+    }
+
+    private static void writePcmHeader(OutputStream out, int sampleRate, int channels, long dataBytes) throws IOException {
+        byte[] h = new byte[44]; h[0] = 'R'; h[1] = 'I'; h[2] = 'F'; h[3] = 'F'; putLittle32(h, 4, 36 + dataBytes);
+        h[8] = 'W'; h[9] = 'A'; h[10] = 'V'; h[11] = 'E'; h[12] = 'f'; h[13] = 'm'; h[14] = 't'; h[15] = ' ';
+        putLittle32(h, 16, 16); putLittle16(h, 20, 1); putLittle16(h, 22, channels); putLittle32(h, 24, sampleRate);
+        putLittle32(h, 28, sampleRate * channels * 2L); putLittle16(h, 32, channels * 2); putLittle16(h, 34, 16);
+        h[36] = 'd'; h[37] = 'a'; h[38] = 't'; h[39] = 'a'; putLittle32(h, 40, dataBytes); out.write(h);
+    }
+
     private static void putLittle16(byte[] b, int at, int value) { b[at] = (byte) value; b[at + 1] = (byte) (value >> 8); }
     private static void putLittle32(byte[] b, int at, long value) { b[at] = (byte) value; b[at + 1] = (byte) (value >> 8); b[at + 2] = (byte) (value >> 16); b[at + 3] = (byte) (value >> 24); }
 
@@ -690,6 +1180,14 @@ public class NativeBridge {
 
     public static void setMetronome(boolean enabled, int beatsPerBar, int beatUnit, int bpm) {
         sSynth.setMetronome(enabled, beatsPerBar, beatUnit, bpm);
+    }
+
+    public static float getDisplayPixelsPerCm() {
+        if (sActivity == null) return 96f / 2.54f;
+        DisplayMetrics metrics = sActivity.getResources().getDisplayMetrics();
+        float dpi = (metrics.xdpi > 0f && metrics.ydpi > 0f)
+                ? (metrics.xdpi + metrics.ydpi) * .5f : metrics.densityDpi;
+        return dpi > 0f ? dpi / 2.54f : 96f / 2.54f;
     }
 
     /** 播放 C5 测试音（验证 JS→原生→AudioTrack 链路）。 */
@@ -1007,10 +1505,41 @@ public class NativeBridge {
         }
     }
 
+    /** 保存逐像素反色的启动幕布，供导出进度从左向右揭示。 */
+    public static String saveInvertedSplashImage(String base64Data) {
+        if (sActivity == null || base64Data == null || base64Data.isEmpty()) return "";
+        try {
+            byte[] data = android.util.Base64.decode(base64Data, android.util.Base64.DEFAULT);
+            Bitmap source = BitmapFactory.decodeByteArray(data, 0, data.length);
+            if (source == null) return "";
+            Bitmap inverted = Bitmap.createBitmap(source.getWidth(), source.getHeight(), Bitmap.Config.ARGB_8888);
+            Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            paint.setColorFilter(new ColorMatrixColorFilter(new ColorMatrix(new float[]{
+                    -1, 0, 0, 0, 255,
+                    0, -1, 0, 0, 255,
+                    0, 0, -1, 0, 255,
+                    0, 0, 0, 1, 0
+            })));
+            new Canvas(inverted).drawBitmap(source, 0, 0, paint);
+            File file = new File(sActivity.getCacheDir(), "cm_splash_inverted.jpg");
+            FileOutputStream output = new FileOutputStream(file);
+            inverted.compress(Bitmap.CompressFormat.JPEG, 94, output); output.flush(); output.close();
+            source.recycle(); inverted.recycle(); return file.getAbsolutePath();
+        } catch (Exception error) { Log.e(TAG, "saveInvertedSplashImage failed", error); return ""; }
+    }
+
     /* ---------------- 图片选择结果（主线程回调） ---------------- */
 
     /** 由 AppActivity.onActivityResult 调用。 */
     public static void onActivityResult(Activity activity, int requestCode, int resultCode, Intent data) {
+        if (requestCode == REQ_CHOOSE_SAVE_ROOT) {
+            if (resultCode != Activity.RESULT_OK || data == null || data.getData() == null) {
+                evalToJs("globalThis.__colormusic_onSaveRootChosen && globalThis.__colormusic_onSaveRootChosen('');");
+                return;
+            }
+            handleSaveRootSelection(activity, data);
+            return;
+        }
         if (requestCode == REQ_IMPORT_STYLE) {
             if (resultCode != Activity.RESULT_OK || data == null || data.getData() == null) return;
             final Uri treeUri = data.getData();
@@ -1026,6 +1555,44 @@ public class NativeBridge {
         }
         final Uri uri = data.getData();
         new Thread(() -> handlePickedUri(uri), "ColorMusicImage").start();
+    }
+
+    private static void handleSaveRootSelection(Activity activity, Intent data) {
+        Uri treeUri = data.getData();
+        try {
+            int flags = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            activity.getContentResolver().takePersistableUriPermission(treeUri, flags);
+            String selectedId = DocumentsContract.getTreeDocumentId(treeUri);
+            String selectedName = documentDisplayName(DocumentsContract.buildDocumentUriUsingTree(treeUri, selectedId));
+            String rootId = selectedId;
+            if (!SAVE_ROOT_NAME.equalsIgnoreCase(selectedName)) {
+                rootId = findChildDocumentId(treeUri, selectedId, SAVE_ROOT_NAME);
+                if (rootId == null) {
+                    Uri created = DocumentsContract.createDocument(activity.getContentResolver(),
+                            DocumentsContract.buildDocumentUriUsingTree(treeUri, selectedId),
+                            DocumentsContract.Document.MIME_TYPE_DIR, SAVE_ROOT_NAME);
+                    if (created == null) throw new IOException("无法创建 Neuro_Save");
+                    rootId = DocumentsContract.getDocumentId(created);
+                }
+            }
+            activity.getSharedPreferences(SAVE_PREFS, Activity.MODE_PRIVATE).edit()
+                    .putString(SAVE_TREE_URI, treeUri.toString()).putString(SAVE_ROOT_DOCUMENT, rootId).apply();
+            managedCategory("style", true); managedCategory("flow", true); managedCategory("track", true); managedCategory("audio", true);
+            evalToJs("globalThis.__colormusic_onSaveRootChosen && globalThis.__colormusic_onSaveRootChosen("
+                    + org.json.JSONObject.quote(getSaveRootLabel()) + ");");
+        } catch (Exception error) {
+            Log.e(TAG, "handleSaveRootSelection failed", error);
+            evalToJs("globalThis.__colormusic_onSaveRootChosen && globalThis.__colormusic_onSaveRootChosen('');");
+        }
+    }
+
+    private static String documentDisplayName(Uri uri) {
+        Cursor cursor = null;
+        try {
+            cursor = sActivity.getContentResolver().query(uri, new String[]{DocumentsContract.Document.COLUMN_DISPLAY_NAME}, null, null, null);
+            return cursor != null && cursor.moveToFirst() ? cursor.getString(0) : "";
+        } catch (Exception ignored) { return ""; }
+        finally { if (cursor != null) cursor.close(); }
     }
 
     private static void handleStyleFolder(Uri treeUri) {
